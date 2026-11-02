@@ -52,25 +52,45 @@ public sealed class SyncRootRegistrar
         }
 
         var shellId = ShellSyncRootId(syncRootPath);
-        try
+        var failures = new List<string>();
+        for (var attempt = 1; attempt <= ShellRegisterAttempts; attempt++)
         {
-            RegisterWithShell(syncRootPath, shellId, BuildIdentity(syncRootId, providerId));
-            return new RegistrationResult(
-                true,
-                0,
-                $"Registered sync root '{syncRootPath}' with Explorer as '{shellId}'.",
-                ShellIntegrated: true);
-        }
-        catch (Exception ex)
-        {
-            var fallback = RegisterWithDriverOnly(syncRootPath, syncRootId, providerId);
-            return fallback with
+            try
             {
-                Message = $"{fallback.Message} Explorer integration unavailable " +
-                          $"(StorageProviderSyncRootManager.Register: {ex.Message.Trim()}).",
-            };
+                RegisterWithShell(syncRootPath, shellId, BuildIdentity(syncRootId, providerId));
+                var retried = failures.Count > 0
+                    ? $" Attempt {attempt}; earlier ones failed: {string.Join("; ", failures)}."
+                    : "";
+                return new RegistrationResult(
+                    true,
+                    0,
+                    $"Registered sync root '{syncRootPath}' with Explorer as '{shellId}'.{retried}",
+                    ShellIntegrated: true);
+            }
+            catch (Exception ex)
+            {
+                // Seen once on a fresh machine, where the first registrations
+                // also attach the Cloud Files filter to the volume. A failure
+                // here costs the drive its Explorer integration, so it is
+                // worth another try before falling back.
+                failures.Add(ex.Message.Trim());
+                if (attempt < ShellRegisterAttempts)
+                {
+                    Thread.Sleep(ShellRegisterRetryDelay * attempt);
+                }
+            }
         }
+
+        var fallback = RegisterWithDriverOnly(syncRootPath, syncRootId, providerId);
+        return fallback with
+        {
+            Message = $"{fallback.Message} Explorer integration unavailable " +
+                      $"(StorageProviderSyncRootManager.Register: {string.Join("; ", failures.Distinct())}).",
+        };
     }
+
+    private const int ShellRegisterAttempts = 3;
+    private static readonly TimeSpan ShellRegisterRetryDelay = TimeSpan.FromMilliseconds(500);
 
     /// <summary>
     /// The shell's id for a sync root: "provider!user SID!account". The

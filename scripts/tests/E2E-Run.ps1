@@ -207,3 +207,8 @@ Invoke-OpenCfDriveE2E `
     -SummaryLog $SummaryLog `
     -MountCheck $mountCheck `
     -KeepRegistration:$KeepRegistration
+
+# A failure throws above. Otherwise succeed explicitly: the last native
+# command (the final unregister, with nothing left to clear) leaves a non-zero
+# $LASTEXITCODE, which CI's PowerShell wrapper would report as the result.
+exit 0

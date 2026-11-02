@@ -35,3 +35,7 @@ Invoke-OpenCfDriveE2E `
     -RcPort $RcPort `
     -TempRoot $TempRoot `
     -SummaryLog $SummaryLog
+
+# A failure throws above. Otherwise succeed explicitly, whatever exit code the
+# last native command left in $LASTEXITCODE (see E2E-Run.ps1).
+exit 0
