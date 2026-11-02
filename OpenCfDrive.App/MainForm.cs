@@ -1,6 +1,7 @@
 using System.Globalization;
 using OpenCfDrive.Core.Configuration;
 using OpenCfDrive.Core.Control;
+using OpenCfDrive.Core.Storage;
 
 namespace OpenCfDrive.App;
 
@@ -31,6 +32,8 @@ internal sealed class MainForm : Form
     private readonly Label _rcUrl = ValueLabel();
     private readonly Label _rcloneState = ValueLabel();
     private readonly Label _rcloneRemote = ValueLabel();
+    private readonly Label _remoteKind = ValueLabel();
+    private readonly Label _remoteSpace = ValueLabel();
     private readonly Button _start = ActionButton("Start");
     private readonly Button _stop = ActionButton("Stop");
     private readonly Button _restart = ActionButton("Restart");
@@ -49,6 +52,8 @@ internal sealed class MainForm : Form
     private readonly ComboBox _remoteBox = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDown, AccessibleName = "rclone remote" };
     private readonly TextBox _rcUrlBox = new() { Dock = DockStyle.Fill, AccessibleName = "rclone remote control" };
     private readonly Label _rcTest = Hint("");
+    private readonly Label _remoteDetails = Hint("");
+    private readonly System.Windows.Forms.Timer _describeSoon = new() { Interval = 600 };
     private readonly TextBox _rcdCommand = new() { Dock = DockStyle.Fill, ReadOnly = true, BorderStyle = BorderStyle.None };
     private readonly CheckBox _signIn = new() { Text = "Start OpenCfDrive when I sign in to Windows", AutoSize = true };
     private readonly Label _overrides = new() { AutoSize = true, ForeColor = BusyColor, Visible = false };
@@ -74,8 +79,8 @@ internal sealed class MainForm : Form
         Text = "OpenCfDrive";
         Icon = AppIcon.Large;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(760, 620);
-        MinimumSize = new Size(620, 540);
+        ClientSize = new Size(760, 700);
+        MinimumSize = new Size(620, 600);
 
         _headline.Font = new Font(Font.FontFamily, 13f, FontStyle.Bold);
         _tabs.TabPages.Add(BuildStatusTab());
@@ -211,7 +216,9 @@ internal sealed class MainForm : Form
         var rclone = Grid(
             ("Remote control", _rcUrl),
             ("Status", _rcloneState),
-            ("Remote", _rcloneRemote));
+            ("Remote", _rcloneRemote),
+            ("Kind", _remoteKind),
+            ("Space", _remoteSpace));
 
         _activity.Columns.Add("Time", 70);
         _activity.Columns.Add("What happened", 400);
@@ -253,6 +260,19 @@ internal sealed class MainForm : Form
         _rcUrlBox.TextChanged += (_, _) => ShowRcdCommand();
         _signIn.CheckedChanged += (_, _) => ClearSaveResult();
         _rcTest.Visible = false; // until Test is pressed
+
+        // The chosen remote's details, once typing pauses.
+        foreach (var input in new Control[] { _remoteBox, _rcUrlBox })
+        {
+            input.TextChanged += (_, _) => DescribeSoon();
+        }
+
+        _remoteBox.SelectedIndexChanged += (_, _) => DescribeSoon();
+        _describeSoon.Tick += async (_, _) =>
+        {
+            _describeSoon.Stop();
+            await DescribeTypedRemoteAsync();
+        };
         _rcdCommand.BackColor = SystemColors.Control;
         _rcdCommand.Font = new Font(FontFamily.GenericMonospace, Font.SizeInPoints);
 
@@ -289,6 +309,7 @@ internal sealed class MainForm : Form
         Note(Hint("Where the drive appears in Explorer. Moving it needs a new or empty folder; the old one stays " +
                   "as an ordinary folder with the files already downloaded."));
         Row("rclone remote", _remoteBox, refresh);
+        Note(_remoteDetails);
         Note(Hint("A remote in rclone's config, optionally with a path: myremote: or myremote:backup. " +
                   "Another remote needs a new or empty drive folder."));
         Row("rclone remote control", _rcUrlBox, test);
@@ -387,6 +408,8 @@ internal sealed class MainForm : Form
     {
         var rclone = snapshot.Rclone;
         _rcUrl.Text = snapshot.Status?.RcUrl ?? snapshot.Settings.RcUrl.Value;
+        _remoteKind.Text = "-";
+        _remoteSpace.Text = "-";
         if (rclone is null)
         {
             _rcloneState.Text = "Checking...";
@@ -400,21 +423,23 @@ internal sealed class MainForm : Form
             : rclone.Problem ?? "Does not answer.";
         _rcloneState.ForeColor = rclone.Usable ? GoodColor : ProblemColor;
 
-        var remote = snapshot.Status?.Remote ?? snapshot.Settings.Remote.Value;
+        var remote = snapshot.Remote;
         var name = RcloneProbe.RemoteName(remote);
         if (!snapshot.Settings.HasRemote && snapshot.Status is null)
         {
             _rcloneRemote.Text = "None chosen yet";
             _rcloneRemote.ForeColor = SystemColors.ControlText;
+            return;
         }
-        else if (rclone.Remotes is null || name is null)
+
+        if (rclone.Remotes is null || name is null)
         {
             _rcloneRemote.Text = remote;
             _rcloneRemote.ForeColor = SystemColors.ControlText;
         }
         else if (rclone.Remotes.Contains(name))
         {
-            _rcloneRemote.Text = $"\"{name}\" is in rclone's config";
+            _rcloneRemote.Text = $"{remote} (\"{name}\" is in rclone's config)";
             _rcloneRemote.ForeColor = GoodColor;
         }
         else
@@ -423,7 +448,82 @@ internal sealed class MainForm : Form
                 ? $"\"{name}\" is not in rclone's config, which has no remotes"
                 : $"\"{name}\" is not in rclone's config, which has: {string.Join(", ", rclone.Remotes)}";
             _rcloneRemote.ForeColor = ProblemColor;
+            return;
         }
+
+        if (rclone.Usable)
+        {
+            (_remoteKind.Text, _remoteSpace.Text) = snapshot.RemoteInfo is { } info
+                ? (info.Kind ?? info.Problem ?? "-", info.Problem is null ? SpaceText(info) : "-")
+                : ("Asking rclone...", "Asking the server...");
+        }
+    }
+
+    /// <summary>"3.1 GB used, 6.9 GB free of 10 GB", or why there is no number.</summary>
+    private static string SpaceText(RemoteInfo info)
+    {
+        if (info.Space is not { } space || (space.Total, space.Used, space.Free) == (null, null, null))
+        {
+            return info.SpaceProblem ?? "Not reported by the server.";
+        }
+
+        var parts = new List<string>();
+        if (space.Used is { } used)
+        {
+            parts.Add($"{FormatBytes(used)} used");
+        }
+
+        if (space.Free is { } free)
+        {
+            parts.Add($"{FormatBytes(free)} free");
+        }
+
+        var text = string.Join(", ", parts);
+        return space.Total is { } total
+            ? text.Length == 0 ? $"{FormatBytes(total)} in all" : $"{text} of {FormatBytes(total)}"
+            : text;
+    }
+
+    private void DescribeSoon()
+    {
+        if (!_loading)
+        {
+            _describeSoon.Stop();
+            _describeSoon.Start();
+        }
+    }
+
+    /// <summary>Describes the remote typed in Settings, so it can be checked before saving.</summary>
+    private async Task DescribeTypedRemoteAsync()
+    {
+        var remote = _remoteBox.Text.Trim();
+        var rcUrl = _rcUrlBox.Text.Trim();
+        if (remote.Length == 0)
+        {
+            _remoteDetails.Text = "";
+            return;
+        }
+
+        var normalized = SyncStatePaths.NormalizeRemote(remote);
+        if (_snapshot?.RemoteInfo is { } known && known.Remote == normalized && rcUrl == _snapshot.Settings.RcUrl.Value)
+        {
+            ShowRemoteDetails(known);
+            return;
+        }
+
+        _remoteDetails.Text = "Asking rclone about it...";
+        _remoteDetails.ForeColor = SystemColors.GrayText;
+        var info = await RcloneProbe.DescribeAsync(rcUrl, normalized);
+        if (_remoteBox.Text.Trim() == remote && _rcUrlBox.Text.Trim() == rcUrl)
+        {
+            ShowRemoteDetails(info);
+        }
+    }
+
+    private void ShowRemoteDetails(RemoteInfo info)
+    {
+        _remoteDetails.Text = info.Problem ?? $"{info.Kind ?? info.Remote}. Space: {SpaceText(info)}";
+        _remoteDetails.ForeColor = info.Problem is null ? SystemColors.ControlText : ProblemColor;
     }
 
     private void ShowActivity(IReadOnlyList<ActivityEntry> entries)
@@ -530,6 +630,21 @@ internal sealed class MainForm : Form
 
             ShowRcdCommand();
             _loaded = FieldValues;
+
+            // What the monitor already knows about this remote, or ask once.
+            var remote = _remoteBox.Text.Trim();
+            if (remote.Length == 0)
+            {
+                _remoteDetails.Text = "";
+            }
+            else if (snapshot.RemoteInfo is { } info && info.Remote == SyncStatePaths.NormalizeRemote(remote))
+            {
+                ShowRemoteDetails(info);
+            }
+            else if (_remoteDetails.Text.Length == 0)
+            {
+                _describeSoon.Start();
+            }
         }
         finally
         {

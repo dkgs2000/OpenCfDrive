@@ -1,14 +1,24 @@
+using System.Security.Cryptography;
+using System.Text;
+using OpenCfDrive.Core.Configuration;
+
 namespace OpenCfDrive.App;
 
 /// <summary>
-/// One app per user session. A second start asks the running copy to show its
-/// window; the installer asks it to close.
+/// One app per settings file (so per drive) in a user session: a second start
+/// asks the running copy to show its window; the installer asks it to close.
+/// A copy with its own settings file (OPENCFDRIVE_SETTINGS, for a test) runs
+/// beside the user's.
 /// </summary>
 internal sealed class SingleInstance : IDisposable
 {
-    private const string MutexName = "Local\\OpenCfDrive.App";
-    private const string ShowEventName = "Local\\OpenCfDrive.App.Show";
-    private const string QuitEventName = "Local\\OpenCfDrive.App.Quit";
+    private static readonly string Name = "Local\\OpenCfDrive.App." + Hash(DriveSettingsFile.Path);
+    private static readonly string MutexName = Name;
+    private static readonly string ShowEventName = Name + ".Show";
+    private static readonly string QuitEventName = Name + ".Quit";
+
+    private static string Hash(string path) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(path).ToLowerInvariant())))[..16];
 
     private readonly Mutex _mutex;
     private readonly List<RegisteredWaitHandle> _waits = [];

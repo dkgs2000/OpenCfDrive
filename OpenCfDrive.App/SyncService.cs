@@ -11,7 +11,9 @@ internal static class SyncService
 
     /// <summary>
     /// Next to this app when installed. A build of this repository has it in
-    /// the service project's output for the same configuration instead.
+    /// the service project's output for the same configuration instead:
+    /// OpenCfDrive.App\bin\Release\&lt;framework&gt;\win-x64\ pairs with
+    /// OpenCfDrive.Service\bin\Release\&lt;framework&gt;\win-x64\.
     /// </summary>
     public static string? ExePath
     {
@@ -23,16 +25,19 @@ internal static class SyncService
                 return installed;
             }
 
-            // ...\OpenCfDrive.App\bin\<configuration>\<framework>\
-            var framework = new DirectoryInfo(AppContext.BaseDirectory);
-            var configuration = framework.Parent;
-            var repository = configuration?.Parent?.Parent?.Parent;
-            if (repository is null)
+            var bin = new DirectoryInfo(AppContext.BaseDirectory);
+            while (bin is not null && !string.Equals(bin.Name, "bin", StringComparison.OrdinalIgnoreCase))
+            {
+                bin = bin.Parent;
+            }
+
+            if (bin?.Parent?.Parent is not { } repository)
             {
                 return null;
             }
 
-            var built = Path.Combine(repository.FullName, "OpenCfDrive.Service", "bin", configuration!.Name, framework.Name, ExeName);
+            var output = Path.GetRelativePath(bin.FullName, AppContext.BaseDirectory);
+            var built = Path.Combine(repository.FullName, "OpenCfDrive.Service", "bin", output, ExeName);
             return File.Exists(built) ? built : null;
         }
     }
@@ -48,7 +53,7 @@ internal static class SyncService
         var exe = ExePath;
         if (exe is null)
         {
-            return $"{ExeName} was not found next to the app.";
+            return $"{ExeName} was not found next to the app, in {AppContext.BaseDirectory}";
         }
 
         Process process;

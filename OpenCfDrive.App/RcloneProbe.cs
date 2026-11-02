@@ -98,8 +98,122 @@ internal static class RcloneProbe
         return remote[..colon];
     }
 
-    private static Task<HttpResponseMessage> PostAsync(Uri baseUri, string command) =>
-        Http.PostAsync(
+    /// <summary>
+    /// What kind of remote it is, where it points, and how much space it has.
+    /// The space comes from the server itself, so this is asked for when a
+    /// remote is chosen or the window opens, not on every refresh.
+    /// </summary>
+    public static async Task<RemoteInfo> DescribeAsync(string rcUrl, string remote)
+    {
+        if (!Uri.TryCreate(rcUrl, UriKind.Absolute, out var baseUri))
+        {
+            return new RemoteInfo(remote, null, null, null, "rclone's address is not valid.");
+        }
+
+        string? kind = null;
+        string? problem = null;
+        if (RemoteName(remote) is { } name)
+        {
+            try
+            {
+                using var response = await PostAsync(baseUri, "config/get", new { name });
+                var config = await response.Content.ReadFromJsonAsync<JsonElement>();
+                if (!response.IsSuccessStatusCode || config.ValueKind != JsonValueKind.Object)
+                {
+                    problem = "rclone did not describe it.";
+                }
+                else if (!config.TryGetProperty("type", out var type))
+                {
+                    problem = $"\"{name}\" is not in rclone's config.";
+                }
+                else
+                {
+                    kind = Kind(type.GetString() ?? "", config);
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+            {
+                problem = "rclone did not answer.";
+            }
+        }
+
+        if (problem is not null)
+        {
+            return new RemoteInfo(remote, null, null, null, problem);
+        }
+
+        try
+        {
+            using var response = await PostAsync(baseUri, "operations/about", new { fs = remote }, SlowHttp);
+            var about = await response.Content.ReadFromJsonAsync<JsonElement>();
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = about.TryGetProperty("error", out var e) ? e.GetString() ?? "" : "";
+                var unsupported = error.Contains("doesn't support", StringComparison.OrdinalIgnoreCase) ||
+                                  error.Contains("not supported", StringComparison.OrdinalIgnoreCase);
+                return new RemoteInfo(remote, kind, null,
+                    unsupported ? "Not reported by this kind of remote." : $"rclone could not ask the server: {error}", null);
+            }
+
+            long? Number(string property) =>
+                about.TryGetProperty(property, out var value) && value.TryGetInt64(out var number) ? number : null;
+            return new RemoteInfo(remote, kind, new RemoteSpace(Number("total"), Number("used"), Number("free")), null, null);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            return new RemoteInfo(remote, kind, null, "The server did not say in time how much space it has.", null);
+        }
+    }
+
+    /// <summary>
+    /// "webdav (other) at https://dav.example.com/", "crypt over gdrive:secret".
+    /// Only these descriptive settings are shown. Passwords, keys and tokens
+    /// are in the same config (obscured or not) and never leave this method.
+    /// </summary>
+    private static string Kind(string type, JsonElement config)
+    {
+        string? Setting(string key) =>
+            config.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.String && value.GetString() is { Length: > 0 } text
+                ? text
+                : null;
+
+        var kind = new StringBuilder(type);
+        if ((Setting("provider") ?? Setting("vendor")) is { } maker)
+        {
+            kind.Append($" ({maker})");
+        }
+
+        if ((Setting("url") ?? Setting("endpoint") ?? Setting("host")) is { } address)
+        {
+            kind.Append($" at {address}");
+        }
+
+        if (Setting("region") is { } region)
+        {
+            kind.Append($", region {region}");
+        }
+
+        if ((Setting("remote") ?? Setting("upstreams")) is { } wrapped)
+        {
+            kind.Append($" over {wrapped}");
+        }
+
+        return kind.ToString();
+    }
+
+    private static readonly HttpClient SlowHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
+
+    private static Task<HttpResponseMessage> PostAsync(Uri baseUri, string command, object? body = null, HttpClient? http = null) =>
+        (http ?? Http).PostAsync(
             new Uri(baseUri.AbsoluteUri.TrimEnd('/') + "/" + command),
-            new StringContent("{}", Encoding.UTF8, "application/json"));
+            new StringContent(body is null ? "{}" : JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
 }
+
+/// <summary>What rclone says about the chosen remote.</summary>
+/// <param name="Kind">Its type and where it points, e.g. "s3 (AWS), region eu-west-1".</param>
+/// <param name="Space">How much space the server reports, if it does.</param>
+/// <param name="SpaceProblem">Why there is no space to show.</param>
+/// <param name="Problem">Why there is nothing to show at all.</param>
+internal sealed record RemoteInfo(string Remote, string? Kind, RemoteSpace? Space, string? SpaceProblem, string? Problem);
+
+internal sealed record RemoteSpace(long? Total, long? Used, long? Free);
