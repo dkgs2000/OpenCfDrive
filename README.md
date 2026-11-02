@@ -430,6 +430,9 @@ namespace up front, OpenCfDrive fills each folder on demand.
   - Registering an existing id updates it in place, which is how upgrades
     re-apply policies. Roots registered by earlier versions through
     `CfRegisterSyncRoot` alone are upgraded the same way.
+  - A failed registration is tried twice more (it failed once on a fresh
+    machine) before falling back to `CfRegisterSyncRoot` alone: the drive then
+    syncs, but has no Explorer entry until the next start.
   - Unregistering goes by that id: `GetSyncRootInformationForFolder` throws and
     `GetCurrentSyncRoots` does not list these roots. Registration state is read
     from `HKLM\...\Explorer\SyncRootManager\<id>`.

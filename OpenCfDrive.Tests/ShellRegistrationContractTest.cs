@@ -120,7 +120,9 @@ public class ShellRegistrationContractTest(ITestOutputHelper output)
 
         try
         {
-            Assert.True(registrar.Register(syncRoot, Guid.NewGuid(), Guid.NewGuid()).ShellIntegrated);
+            var registered = registrar.Register(syncRoot, Guid.NewGuid(), Guid.NewGuid());
+            output.WriteLine(registered.Message);
+            Assert.True(registered.ShellIntegrated, registered.Message);
             var created = new CloudPlaceholderService().CreatePlaceholders(syncRoot,
             [
                 new RcloneItemMetadata("d/", "d", 0, DateTimeOffset.UtcNow, IsDirectory: true),

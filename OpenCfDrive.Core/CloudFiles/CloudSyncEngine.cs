@@ -1272,16 +1272,18 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         _rc ??= new RcloneRcClient(_rcUrl);
 
         // A subfolder of a folder that is being deleted too: the parent's
-        // delete covers everything below it, including this folder. Mock mode
-        // keeps no folder rows, so a parent with rows below it counts too
-        // (this folder's own rows are left for the parent to find).
+        // delete covers everything below it, including this folder (this
+        // folder's own rows are left for the parent to find). Mock mode keeps
+        // no folder rows, but the watcher reports the parent's delete too, so
+        // a parent that is gone is enough; its rows are no sign, since the
+        // files' own deletes may have claimed them all by now.
         var slash = relativeDirectory.LastIndexOf('/');
         if (slash > 0)
         {
             var parent = relativeDirectory[..slash];
             var parentLocal = Path.Combine(_syncRootPath, parent.Replace('/', Path.DirectorySeparatorChar));
             if (!Directory.Exists(parentLocal) &&
-                (_store.GetByRemotePath(parent + "/") is { IsDirectory: true } || _store.GetTree(parent).Count > 0))
+                (IsSimulated || _store.GetByRemotePath(parent + "/") is { IsDirectory: true } || _store.GetTree(parent).Count > 0))
             {
                 return;
             }
