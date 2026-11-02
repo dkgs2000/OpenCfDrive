@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="OpenCfDrive.Core/OpenCfDrive.Core.csproj" />
+  <Project Path="OpenCfDrive.MockService/OpenCfDrive.MockService.csproj" />
+  <Project Path="OpenCfDrive.Service/OpenCfDrive.Service.csproj" />
+  <Project Path="OpenCfDrive.Tests/OpenCfDrive.Tests.csproj" />
+</Solution>

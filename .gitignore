@@ -1,0 +1,22 @@
+# Build output
+bin/
+obj/
+publish/
+TestResults/
+
+# Third-party binaries: install rclone separately (or drop rclone.exe here locally)
+rclone.exe
+
+# Local state and logs
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.log
+
+# Editors
+*.user
+*.suo
+.vs/
+.idea/
+.vscode/
