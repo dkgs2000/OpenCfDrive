@@ -140,7 +140,9 @@ internal sealed class TrayApp : ApplicationContext
         _timer.Interval = (int)(visible ? VisibleRefresh : HiddenRefresh).TotalMilliseconds;
         try
         {
-            await Monitor.RefreshAsync(probeRclone ? TimeSpan.Zero : visible ? TimeSpan.FromSeconds(5) : TimeSpan.FromMinutes(1));
+            await Monitor.RefreshAsync(
+                rcloneMaxAge: probeRclone ? TimeSpan.Zero : visible ? TimeSpan.FromSeconds(5) : TimeSpan.FromMinutes(1),
+                remoteMaxAge: probeRclone ? TimeSpan.Zero : TimeSpan.FromMinutes(5));
         }
         catch (Exception ex)
         {

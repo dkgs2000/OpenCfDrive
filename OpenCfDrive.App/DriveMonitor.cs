@@ -18,8 +18,12 @@ internal sealed record DriveSnapshot(
     EffectiveSettings Settings,
     bool Running,
     ServiceStatus? Status,
-    RcloneProbeResult? Rclone)
+    RcloneProbeResult? Rclone,
+    RemoteInfo? RemoteInfo)
 {
+    /// <summary>The remote the service syncs with, or would once started.</summary>
+    public string Remote => Status?.Remote ?? Settings.Remote.Value;
+
     /// <summary>One word for the tray and the window's header, and a sentence on it.</summary>
     public (Health Health, string Headline, string Detail) Summary
     {
@@ -70,7 +74,9 @@ internal sealed record DriveSnapshot(
 internal sealed class DriveMonitor
 {
     private bool _refreshing;
+    private bool _describing;
     private DateTime _rcloneCheckedAt;
+    private DateTime _remoteDescribedAt;
 
     public DriveSnapshot? Latest { get; private set; }
 
@@ -78,7 +84,8 @@ internal sealed class DriveMonitor
     public event Action<DriveSnapshot>? Updated;
 
     /// <param name="rcloneMaxAge">How old rclone's last answer may be before it is asked again.</param>
-    public async Task RefreshAsync(TimeSpan rcloneMaxAge)
+    /// <param name="remoteMaxAge">How old the remote's description (and space) may be.</param>
+    public async Task RefreshAsync(TimeSpan rcloneMaxAge, TimeSpan remoteMaxAge)
     {
         if (_refreshing)
         {
@@ -113,12 +120,45 @@ internal sealed class DriveMonitor
                 _rcloneCheckedAt = DateTime.UtcNow;
             }
 
-            Latest = new DriveSnapshot(saved, problem, settings, running, status, rclone);
+            var snapshot = new DriveSnapshot(saved, problem, settings, running, status, rclone, null);
+            var described = Latest?.RemoteInfo;
+            var known = (settings.HasRemote || running) && rclone.Usable;
+            Latest = snapshot with { RemoteInfo = known && described?.Remote == snapshot.Remote ? described : null };
             Updated?.Invoke(Latest);
+
+            if (known && (Latest.RemoteInfo is null || DateTime.UtcNow - _remoteDescribedAt >= remoteMaxAge))
+            {
+                _ = DescribeRemoteAsync(settings.RcUrl.Value, snapshot.Remote);
+            }
         }
         finally
         {
             _refreshing = false;
+        }
+    }
+
+    /// <summary>Asks rclone about the remote off to the side: the server may take a while to say its space.</summary>
+    private async Task DescribeRemoteAsync(string rcUrl, string remote)
+    {
+        if (_describing)
+        {
+            return;
+        }
+
+        _describing = true;
+        try
+        {
+            var info = await RcloneProbe.DescribeAsync(rcUrl, remote);
+            _remoteDescribedAt = DateTime.UtcNow;
+            if (Latest is { } latest && latest.Remote == remote)
+            {
+                Latest = latest with { RemoteInfo = info };
+                Updated?.Invoke(Latest);
+            }
+        }
+        finally
+        {
+            _describing = false;
         }
     }
 }

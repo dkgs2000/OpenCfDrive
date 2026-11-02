@@ -1741,11 +1741,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         _rc?.Dispose();
         _rc = null;
 
-        if (!IsSimulated)
-        {
-            _registrar.Unregister(_syncRootPath);
-        }
-
+        // The drive stays registered: stopping the service (the app's Stop,
+        // a restart to apply settings) is not removing the drive. Until the
+        // service is back, Explorer still lists it and downloaded files open;
+        // online-only ones wait for it. Unregistering is the uninstaller's
+        // and --unregister's job, and the app's when the drive moves.
         await Task.CompletedTask;
     }
 }

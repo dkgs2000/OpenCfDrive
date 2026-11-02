@@ -73,6 +73,10 @@ syncing, and shows the log. The Status tab shows:
   how much it downloaded;
 - rclone: whether its remote control answers (and its version), whether it lets
   OpenCfDrive in, and whether the chosen remote is in rclone's config;
+- the remote: what kind it is and where it points (for example
+  `s3 (AWS), region eu-west-1` or `crypt over gdrive:secret`, never a password,
+  key or token), and the space the server reports, if it does. The Settings
+  tab shows the same for a remote while you choose it;
 - the service's recent activity (uploads, downloads, deletes, warnings).
 
 The installed app starts when you sign in to Windows (a setting in the app),
