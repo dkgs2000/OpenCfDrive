@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="14 13 228 228" width="256" height="256">
+  <title>OpenCfDrive</title>
+  <defs>
+    <linearGradient id="cloud" x1="40" y1="48" x2="216" y2="208" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#0F766E"/>
+    </linearGradient>
+  </defs>
+  <!-- The cloud: three circles, the side ones resting on one flat bottom
+       (y=206) and joined by the base, one gradient across all. -->
+  <g fill="url(#cloud)">
+    <circle cx="76" cy="150" r="56"/>
+    <circle cx="130" cy="112" r="64"/>
+    <circle cx="186" cy="156" r="50"/>
+    <rect x="76" y="150" width="110" height="56"/>
+  </g>
+  <!-- The drive slot, with its status light. -->
+  <rect x="64" y="156" width="128" height="32" rx="16" fill="#FFFFFF"/>
+  <circle cx="172" cy="172" r="7" fill="#F59E0B"/>
+</svg>
