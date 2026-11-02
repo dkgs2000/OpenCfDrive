@@ -1,0 +1,139 @@
+using System.Text.Json;
+using OpenCfDrive.Core.Storage;
+
+namespace OpenCfDrive.Core.Configuration;
+
+/// <summary>
+/// What the user chose in the OpenCfDrive app, kept in
+/// %LOCALAPPDATA%\OpenCfDrive\settings.json. A null value was never set and
+/// falls back to its default. The service reads this at startup; environment
+/// variables still win over it (scripts and tests rely on that).
+/// </summary>
+public sealed record DriveSettings
+{
+    /// <summary>The drive folder.</summary>
+    public string? SyncRoot { get; init; }
+
+    /// <summary>The rclone remote spec, e.g. "myremote:" or "myremote:backup".</summary>
+    public string? Remote { get; init; }
+
+    /// <summary>The base URL of rclone's remote control (rclone rcd).</summary>
+    public string? RcUrl { get; init; }
+
+    /// <summary>Whether the app starts when the user signs in to Windows.</summary>
+    public bool? StartAtSignIn { get; init; }
+}
+
+public enum SettingSource
+{
+    Default,
+    SettingsFile,
+    Environment,
+}
+
+/// <summary>A setting's value in effect, and where it came from.</summary>
+public sealed record EffectiveSetting(string Value, SettingSource Source, string EnvironmentVariable);
+
+/// <summary>The settings the service runs with.</summary>
+public sealed record EffectiveSettings(EffectiveSetting SyncRoot, EffectiveSetting Remote, EffectiveSetting RcUrl)
+{
+    /// <summary>A remote was chosen; without one the service has nothing to sync.</summary>
+    public bool HasRemote => Remote.Source != SettingSource.Default;
+}
+
+public static class DriveSettingsFile
+{
+    public const string SyncRootVariable = "OPENCFDRIVE_ROOT";
+    public const string RemoteVariable = "RCLONE_FS";
+    public const string RcUrlVariable = "RCLONE_RC_URL";
+
+    /// <summary>Points the service and the app at another settings file (tests, side-by-side runs).</summary>
+    public const string PathVariable = "OPENCFDRIVE_SETTINGS";
+
+    /// <summary>Used when no remote is configured; the demo setup script creates it.</summary>
+    public const string DefaultRemote = "e2e:";
+
+    public const string DefaultRcUrl = "http://127.0.0.1:5572";
+
+    private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
+
+    /// <summary>%LOCALAPPDATA%\OpenCfDrive\settings.json, unless OPENCFDRIVE_SETTINGS says otherwise.</summary>
+    public static string Path
+    {
+        get
+        {
+            var overridden = Environment.GetEnvironmentVariable(PathVariable);
+            return string.IsNullOrWhiteSpace(overridden)
+                ? System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SyncStatePaths.StateRoot)!, "settings.json")
+                : overridden;
+        }
+    }
+
+    /// <summary>The saved settings; empty when there is no file yet.</summary>
+    /// <exception cref="InvalidDataException">The file is not valid settings JSON.</exception>
+    public static DriveSettings Load(string? path = null)
+    {
+        path ??= Path;
+        if (!File.Exists(path))
+        {
+            return new DriveSettings();
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<DriveSettings>(File.ReadAllText(path), Json) ?? new DriveSettings();
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException($"'{path}' is not a valid settings file: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>Writes the settings in one step, so the service never reads half a file.</summary>
+    public static void Save(DriveSettings settings, string? path = null)
+    {
+        path ??= Path;
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
+        var temp = path + ".tmp";
+        File.WriteAllText(temp, JsonSerializer.Serialize(settings, Json));
+        File.Move(temp, path, overwrite: true);
+    }
+
+    /// <summary>Each setting from the environment, else the settings file, else its default.</summary>
+    public static EffectiveSettings Resolve(DriveSettings saved, Func<string, string?>? environment = null)
+    {
+        environment ??= Environment.GetEnvironmentVariable;
+
+        EffectiveSetting Pick(string variable, string? fromFile, string fallback)
+        {
+            var fromEnvironment = environment(variable);
+            if (!string.IsNullOrWhiteSpace(fromEnvironment))
+            {
+                return new EffectiveSetting(fromEnvironment.Trim(), SettingSource.Environment, variable);
+            }
+
+            return string.IsNullOrWhiteSpace(fromFile)
+                ? new EffectiveSetting(fallback, SettingSource.Default, variable)
+                : new EffectiveSetting(fromFile.Trim(), SettingSource.SettingsFile, variable);
+        }
+
+        var remote = Pick(RemoteVariable, saved.Remote, DefaultRemote);
+        return new EffectiveSettings(
+            Pick(SyncRootVariable, saved.SyncRoot, SyncStatePaths.DefaultSyncRoot),
+            remote with { Value = SyncStatePaths.NormalizeRemote(remote.Value) },
+            Pick(RcUrlVariable, saved.RcUrl, DefaultRcUrl));
+    }
+
+    /// <summary>The settings the service runs with right now (a broken file counts as empty).</summary>
+    public static EffectiveSettings Current()
+    {
+        try
+        {
+            return Resolve(Load());
+        }
+        catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
+        {
+            return Resolve(new DriveSettings());
+        }
+    }
+}

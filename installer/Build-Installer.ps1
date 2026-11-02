@@ -2,8 +2,9 @@
 #   OpenCfDrive-<version>-x64.msi        the Windows Installer package
 #   OpenCfDrive-<version>-x64-setup.exe  a bootstrapper that installs the MSI
 #
-# The service is published self-contained (no .NET install needed) as a
-# single file, then packaged with WiX v5, which the build restores from NuGet.
+# The app (OpenCfDrive.exe) and the service (OpenCfDrive.Service.exe) are each
+# published self-contained (no .NET install needed) as a single file, then
+# packaged with WiX v5, which the build restores from NuGet.
 # Both install per user into %LOCALAPPDATA%\Programs\OpenCfDrive, with no
 # administrator rights.
 #
@@ -33,14 +34,19 @@ function Invoke-Dotnet([string[]]$Arguments) {
 Remove-Item -LiteralPath $OutputDir -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-Write-Host "Publishing OpenCfDrive.Service $Version (win-x64, self-contained, single file)..." -ForegroundColor Cyan
-Invoke-Dotnet @(
-    "publish", (Join-Path $repoRoot "OpenCfDrive.Service\OpenCfDrive.Service.csproj"),
-    "-c", "Release", "-r", "win-x64", "--self-contained", "true",
-    "-p:PublishSingleFile=true", "-p:IncludeNativeLibrariesForSelfExtract=true",
-    "-p:DebugType=None", "-p:DebugSymbols=false",
-    "-p:Version=$Version", "-o", $publishDir, "-nologo"
-)
+foreach ($project in "OpenCfDrive.Service", "OpenCfDrive.App") {
+    Write-Host "Publishing $project $Version (win-x64, self-contained, single file)..." -ForegroundColor Cyan
+    Invoke-Dotnet @(
+        "publish", (Join-Path $repoRoot "$project\$project.csproj"),
+        "-c", "Release", "-r", "win-x64", "--self-contained", "true",
+        "-p:PublishSingleFile=true", "-p:IncludeNativeLibrariesForSelfExtract=true",
+        # Each exe carries its own .NET; compressed, the two take about 100 MB
+        # on disk instead of about 240, for a fraction of a second at start.
+        "-p:EnableCompressionInSingleFile=true",
+        "-p:DebugType=None", "-p:DebugSymbols=false",
+        "-p:Version=$Version", "-o", $publishDir, "-nologo"
+    )
+}
 
 Write-Host "Building the MSI..." -ForegroundColor Cyan
 Invoke-Dotnet @(

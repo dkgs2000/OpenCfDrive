@@ -147,6 +147,22 @@ public sealed class SyncRootRegistrar
         return key is not null;
     }
 
+    /// <summary>
+    /// Whether the folder is a drive: registered with the Cloud Files driver
+    /// or with Explorer. Neither check lists the folder, so it never asks a
+    /// provider to fill it.
+    /// </summary>
+    public static bool IsSyncRoot(string folder)
+    {
+        if (!CloudFilesCapability.Current.IsSupported || !Directory.Exists(folder))
+        {
+            return false;
+        }
+
+        return CfApi.Succeeded(CfApi.CfGetSyncRootInfoByPath(folder, 0, out _, sizeof(long), out _)) ||
+               IsShellRegistered(ShellSyncRootId(folder));
+    }
+
     private static string DisplayNameFor(string syncRootPath)
     {
         // The default folder (%USERPROFILE%\OpenCfDrive) shows as just the

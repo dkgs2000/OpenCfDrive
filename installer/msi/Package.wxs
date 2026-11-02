@@ -31,6 +31,10 @@
         <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
         <RemoveFolder Id="RemoveUserProgramsFolder" Directory="UserProgramsFolder" On="uninstall" />
       </Component>
+      <Component Id="AppExe" Guid="0104E994-C75C-4AD7-9081-2B3EF74B9E03">
+        <File Id="AppExe" Source="$(var.PublishDir)OpenCfDrive.exe" KeyPath="no" />
+        <RegistryValue Root="HKCU" Key="Software\OpenCfDrive" Name="App" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
       <Component Id="AppSettings" Guid="781E880C-0B24-494A-BFFF-00B974ABEE8E">
         <File Source="$(var.PublishDir)appsettings.json" KeyPath="no" />
         <RegistryValue Root="HKCU" Key="Software\OpenCfDrive" Name="AppSettings" Type="integer" Value="1" KeyPath="yes" />
@@ -46,8 +50,8 @@
       <Component Id="StartMenuShortcut">
         <Shortcut Id="OpenCfDriveShortcut"
                   Name="OpenCfDrive"
-                  Description="Start the OpenCfDrive cloud drive"
-                  Target="[INSTALLFOLDER]OpenCfDrive.Service.exe"
+                  Description="OpenCfDrive settings and status"
+                  Target="[INSTALLFOLDER]OpenCfDrive.exe"
                   WorkingDirectory="INSTALLFOLDER"
                   Icon="OpenCfDrive.ico" />
         <RegistryValue Root="HKCU" Key="Software\OpenCfDrive" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
@@ -60,19 +64,32 @@
     </Feature>
 
     <!--
-      Before the files go: stop the running copy. On a real uninstall (not the
-      old version's removal during an upgrade) also unregister the drive, which
+      Before the files go: close the app and stop the running service. On a
+      real uninstall (not the old version's removal during an upgrade) the app
+      also stops starting at sign-in, and the drive is unregistered, which
       removes its Explorer entry and leaves an ordinary folder.
     -->
+    <CustomAction Id="QuitApp" FileRef="AppExe" ExeCommand="--quit"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+    <CustomAction Id="UninstallApp" FileRef="AppExe" ExeCommand="--uninstall"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
     <CustomAction Id="StopOpenCfDrive" FileRef="ServiceExe" ExeCommand="--stop"
                   Execute="deferred" Impersonate="yes" Return="ignore" />
     <CustomAction Id="UnregisterOpenCfDrive" FileRef="ServiceExe" ExeCommand="--stop --unregister"
                   Execute="deferred" Impersonate="yes" Return="ignore" />
+    <!-- After an interactive install or upgrade the app opens, to set up the drive. -->
+    <CustomAction Id="LaunchApp" FileRef="AppExe" ExeCommand="" Return="asyncNoWait" />
     <InstallExecuteSequence>
+      <Custom Action="QuitApp" Before="StopOpenCfDrive"
+              Condition="REMOVE=&quot;ALL&quot; AND UPGRADINGPRODUCTCODE" />
+      <Custom Action="UninstallApp" Before="UnregisterOpenCfDrive"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="StopOpenCfDrive" Before="RemoveFiles"
               Condition="REMOVE=&quot;ALL&quot; AND UPGRADINGPRODUCTCODE" />
       <Custom Action="UnregisterOpenCfDrive" Before="RemoveFiles"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="LaunchApp" After="InstallFinalize"
+              Condition="NOT REMOVE AND UILevel &gt;= 4" />
     </InstallExecuteSequence>
   </Package>
 </Wix>

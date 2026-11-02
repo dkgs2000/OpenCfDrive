@@ -1,12 +1,13 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using OpenCfDrive.Core.CloudFiles;
-using OpenCfDrive.Core.Storage;
+using OpenCfDrive.Core.Configuration;
+using OpenCfDrive.Core.Control;
 using OpenCfDrive.Service;
 
 ConsoleOutput.Connect();
 
-var syncRoot = Environment.GetEnvironmentVariable("OPENCFDRIVE_ROOT") ?? SyncStatePaths.DefaultSyncRoot;
+var syncRoot = DriveSettingsFile.Current().SyncRoot.Value;
 
 // --stop: ends the other running copies of this same exe (the installer runs
 // it before replacing or removing the files). Copies elsewhere are left alone.
@@ -30,10 +31,20 @@ if (args.Contains("--unregister", StringComparer.OrdinalIgnoreCase))
 
 // One provider per drive: a second start (the Start Menu shortcut clicked
 // twice) would connect to the same sync root and upload everything twice.
-using var instance = new Mutex(
-    initiallyOwned: true,
-    "Local\\" + Path.GetFileNameWithoutExtension(SyncStatePaths.DatabasePath(syncRoot)),
-    out var firstInstance);
+// Owned, not just created: the app opens the mutex for a moment to see whether
+// the drive's service runs, so its existence alone proves nothing. The wait
+// covers such a moment.
+using var instance = new Mutex(initiallyOwned: false, ServiceControl.InstanceMutexName(syncRoot));
+bool firstInstance;
+try
+{
+    firstInstance = instance.WaitOne(TimeSpan.FromSeconds(2));
+}
+catch (AbandonedMutexException)
+{
+    firstInstance = true; // the previous copy ended without releasing it
+}
+
 if (!firstInstance)
 {
     Console.WriteLine($"OpenCfDrive is already running for '{syncRoot}'.");
@@ -41,6 +52,9 @@ if (!firstInstance)
 }
 
 var builder = Host.CreateApplicationBuilder(args);
+var activity = new ActivityLog();
+builder.Logging.AddProvider(activity);
+builder.Services.AddSingleton(activity);
 builder.Services.AddHostedService<SyncWorker>();
 
 var host = builder.Build();
