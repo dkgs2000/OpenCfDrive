@@ -1,0 +1,16 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <!--
+    The MSI: a per-user, 64-bit install of the published service.
+    Built by installer\Build-Installer.ps1, which passes Version and PublishDir.
+  -->
+  <PropertyGroup>
+    <Version Condition="'$(Version)' == ''">0.0.0</Version>
+    <OutputName>OpenCfDrive-$(Version)-x64</OutputName>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\'))</RepoRoot>
+    <DefineConstants>Version=$(Version);PublishDir=$(PublishDir);RepoRoot=$(RepoRoot)</DefineConstants>
+    <!-- ICE91 warns that per-user files are not copied to every profile in a
+         per-machine install. This package is per user only. -->
+    <SuppressIces>ICE91</SuppressIces>
+  </PropertyGroup>
+</Project>

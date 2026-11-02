@@ -1,0 +1,19 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <!-- Installs the per-user MSI, so the bundle is per-user too. -->
+  <Bundle Name="OpenCfDrive"
+          Manufacturer="OpenCfDrive contributors"
+          Version="$(var.Version)"
+          UpgradeCode="A32BF1AF-1BAB-4799-96DA-792F84CD0EDC"
+          IconSourceFile="$(var.RepoRoot)assets\opencfdrive.ico">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
+                                              LicenseUrl="https://unlicense.org/"
+                                              LogoFile="$(var.RepoRoot)assets\logo-64.png" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <MsiPackage SourceFile="$(var.MsiPath)" />
+    </Chain>
+  </Bundle>
+</Wix>

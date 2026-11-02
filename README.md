@@ -36,15 +36,48 @@ affiliated with or endorsed by the rclone project.
 - .NET 10 SDK (the projects target `net10.0-windows10.0.19041.0` for the
   Windows storage provider APIs)
 - rclone, on `PATH` (or `rclone.exe` dropped in the repository root; it is
-  git-ignored)
-- Docker, for the end-to-end tests and the demo backend
+  git-ignored). The tests and the demo backend also use it as their server.
+
+## Install
+
+Download the 64-bit installer from the GitHub release: either
+`OpenCfDrive-<version>-x64-setup.exe` or `OpenCfDrive-<version>-x64.msi`
+(the `.exe` installs that same MSI). Both install for the current user only,
+into `%LOCALAPPDATA%\Programs\OpenCfDrive`, without administrator rights, and
+add an "OpenCfDrive" Start Menu entry. .NET is included, so nothing else is
+needed except rclone. The installers are not code-signed yet, so Windows
+SmartScreen may warn before running them.
+
+Before starting it, point it at your rclone remote with user environment
+variables (see [Configuration](#configuration)), and run rclone's remote
+control:
+
+```powershell
+[Environment]::SetEnvironmentVariable("RCLONE_FS", "myremote:", "User")
+[Environment]::SetEnvironmentVariable("RCLONE_RC_URL", "http://127.0.0.1:5572", "User")
+rclone rcd --rc-serve --rc-no-auth --rc-addr 127.0.0.1:5572
+```
+
+Then start "OpenCfDrive" from the Start Menu. It runs in the background with no
+window; the drive appears in Explorer's navigation pane, and its log is in
+`%LOCALAPPDATA%\OpenCfDrive\logs\OpenCfDrive.log`. Starting it again while it
+runs does nothing.
+
+Uninstalling (Settings > Apps) stops it and unregisters the drive, which
+removes it from Explorer and leaves `%USERPROFILE%\OpenCfDrive` as an ordinary
+folder with whatever was downloaded. An upgrade keeps the registration.
 
 ## Build
 
 ```powershell
 dotnet build .\OpenCfDrive.slnx
 dotnet test .\OpenCfDrive.slnx
+.\installer\Build-Installer.ps1 -Version 1.2.3   # both installers, into .\artifacts
 ```
+
+The installers use the WiX Toolset v5 (MS-RL license), which the build restores
+from NuGet. `assets\logo.svg` is the source of the icon; after changing it, run
+`.\scripts\assets\Build-Icon.ps1`.
 
 ## Run
 
@@ -53,6 +86,12 @@ dotnet run --project .\OpenCfDrive.Service\OpenCfDrive.Service.csproj
 ```
 
 The service registers `%USERPROFILE%\OpenCfDrive` as the sync root, shown in Explorer as "OpenCfDrive", and fills each folder from the configured rclone remote when it is opened. Run it as the user who owns the drive: the registration is per user. It does not need an elevated shell. Without the Cloud Files API it logs why and syncs nothing; it never falls back to downloading the remote into a plain folder.
+
+It is a Windows app without a console window. Its log goes to the console it
+was started from, to a redirected output, or, with neither (the Start Menu),
+to `%LOCALAPPDATA%\OpenCfDrive\logs\OpenCfDrive.log`. One copy runs per drive.
+Two command-line options are for the installer and scripts: `--stop` ends a
+running copy of the same exe, and `--unregister` unregisters the drive.
 
 ### Configuration
 
@@ -110,6 +149,26 @@ Known limits of this first version:
 A better conflict policy is planned, for example keeping the local version as
 a separate conflict copy, or conditional uploads that close the window above.
 
+## Continuous integration
+
+Two GitHub Actions workflows, both on Windows runners:
+
+- **Test** (`.github/workflows/test.yml`), on every push to `main`, every pull
+  request, and by hand. It runs the unit and contract tests, and the E2E suite
+  in all four combinations (cloud and mock mode, WebDAV and S3) with the servers
+  as local processes. Each job keeps its logs as an artifact.
+- **Release** (`.github/workflows/release.yml`), when a version tag is pushed,
+  or by hand with a version. It runs every test first, then builds both 64-bit
+  installers and publishes a GitHub release with them attached:
+
+  ```powershell
+  git tag v1.2.3
+  git push origin v1.2.3
+  ```
+
+`.github/actions/setup` installs the .NET SDK and a pinned rclone release for
+both.
+
 ## E2E tests
 
 The end-to-end tests live in `scripts\tests`. All runs share one implementation
@@ -119,10 +178,15 @@ two things:
 - **Mode:** a real Cloud Files sync root registered with Explorer
   (`E2E-Run.ps1`), or the engine in mock mode over a plain folder
   (`E2E-Run-Mock.ps1`).
-- **Backend:** `-Backend webdav` (default, `bytemark/webdav`) or `-Backend s3`
-  (a plain S3 server, `rclone serve s3` from the `rclone/rclone` image, with a
-  bucket mapped to the drive). `E2E-Run-S3.ps1` is the shortcut for the cloud
-  run on S3.
+- **Backend:** `-Backend webdav` (default) or `-Backend s3` (a plain S3
+  server with a bucket mapped to the drive). `E2E-Run-S3.ps1` is the shortcut
+  for the cloud run on S3.
+
+The server is rclone's own: `rclone serve webdav` or `rclone serve s3` over a
+folder under the run's temp folder, in a process of its own. It is not the
+client's rclone; the client reaches it only over HTTP, through its own rclone,
+as it would any server. So the tests need nothing but the .NET SDK and rclone,
+the same on a developer machine and on CI.
 
 ```powershell
 .\scripts\tests\E2E-Run.ps1                  # cloud mode, WebDAV
@@ -131,11 +195,11 @@ two things:
 .\scripts\tests\E2E-Run.ps1 -Only "S0*,C11"  # only some scenarios
 ```
 
-No elevation is needed. Docker must be running.
+No elevation is needed.
 
 ### What every run does
 
-1. Builds the solution and starts a disposable backend container and a private
+1. Builds the solution and starts a disposable server process and a private
    `rclone rcd --rc-serve` (the client's rclone).
 2. Seeds the server, starts the service, and waits for the namespace.
 3. Reads and edits `alpha.txt` and `docs\readme.txt` and checks the bytes on
@@ -182,7 +246,7 @@ F5, and expects the local side to match:
 - "Always keep on this device" on a 300 MB server file: one request for the
   whole file, streamed in 4 MB chunks, byte-exact, and the service's memory
   stays far below the file size
-- offline (the server container is paused, so requests hang as on a lost
+- offline (the server process is paused, so requests hang as on a lost
   network): an opened folder still lists its local entries and a downloaded
   file still opens, a folder never opened is empty, both answer well inside the
   platform's 60 s limit, and back online the unopened folder lists the server
@@ -443,10 +507,12 @@ file with default icons rather than a cloud badge.
 | `OpenCfDrive.Service` | The background service that registers and serves the sync root |
 | `OpenCfDrive.MockService` | Test host: same engine in mock mode over a plain folder |
 | `OpenCfDrive.Tests` | Unit and contract tests (interop layout, Cloud Files behaviour, SQLite, rclone API) |
-| `scripts\drive` | Using the drive: `Install-`, `Start-` and `Uninstall-OpenCfDrive.ps1`, plus `Setup-OpenCfDrive-Environment.ps1` (optional local demo backend: Docker WebDAV + `rclone rcd`) |
+| `scripts\drive` | Using the drive: `Install-`, `Start-` and `Uninstall-OpenCfDrive.ps1`, plus `Setup-OpenCfDrive-Environment.ps1` (optional local demo backend: `rclone serve webdav` + `rclone rcd`) |
 | `scripts\tests` | End-to-end tests: `E2E-Run.ps1`, `E2E-Run-S3.ps1`, `E2E-Run-Mock.ps1`, with the shared harness `E2E-Common.ps1` and scenario matrix `E2E-Scenarios.ps1` |
-| `assets` | The logo (`logo.svg`, the source) and `opencfdrive.ico`, the service's icon, which Explorer also shows for the drive |
-| `scripts\assets` | `Build-Icon.ps1`: rebuilds `opencfdrive.ico` from `logo.svg` (rendered by Microsoft Edge) |
+| `assets` | The logo (`logo.svg`, the source), `opencfdrive.ico` (the service's icon, which Explorer also shows for the drive), and `logo-64.png` (the `.exe` installer's logo) |
+| `scripts\assets` | `Build-Icon.ps1`: rebuilds `opencfdrive.ico` and `logo-64.png` from `logo.svg` (rendered by Microsoft Edge) |
+| `installer` | `Build-Installer.ps1`, the WiX projects for the MSI (`msi`) and the `.exe` bootstrapper (`bundle`), and the third-party notices installed with the app |
+| `.github` | The Test and Release workflows and their shared setup step |
 
 ## Using it
 
@@ -462,7 +528,7 @@ the drive.
 
 ```powershell
 .\scripts\drive\Install-OpenCfDrive.ps1              # build + publish -> .\publish, create the sync root
-.\scripts\drive\Setup-OpenCfDrive-Environment.ps1    # optional: demo backend (Docker WebDAV + rclone rcd)
+.\scripts\drive\Setup-OpenCfDrive-Environment.ps1    # optional: demo backend (rclone WebDAV server + rclone rcd)
 .\scripts\drive\Start-OpenCfDrive.ps1                # launch the service, wait for "Mode: cloud"
 # open %USERPROFILE%\OpenCfDrive in Explorer, read/write files
 .\scripts\drive\Uninstall-OpenCfDrive.ps1            # stop the service, unregister the sync root
@@ -480,11 +546,13 @@ What each script does and does not do:
 
 - **Install** builds the solution, publishes `OpenCfDrive.Service` to
   `.\publish`, and creates the sync-root folder. It writes nothing else.
-- **Setup** starts the `bytemark/webdav` container (remote content lives in the
-  named volume `opencfdrive-webdav-data`, so it survives re-runs), writes the
-  rclone config to `%TEMP%\opencfdrive-setup\rclone.conf` with an obscured
-  password, and starts `rclone rcd --rc-serve` on port 5572. It only replaces an
-  rcd it started itself; other rclone processes are left alone.
+- **Setup** starts a WebDAV server, `rclone serve webdav` on port 5573 (user
+  `demo`, password `demo`), over `%LOCALAPPDATA%\OpenCfDrive\demo-server`, so
+  the "server" files survive re-runs. It writes the rclone config to
+  `%TEMP%\opencfdrive-setup\rclone.conf` with an obscured password, and starts
+  `rclone rcd --rc-serve` on port 5572. Both keep running in the background. A
+  re-run replaces only the two rclone processes it started itself; other rclone
+  processes are left alone.
 - **Start** passes `OPENCFDRIVE_ROOT`, `RCLONE_FS` and `RCLONE_RC_URL` to the
   service **process only** (Process scope, never machine scope), writes the
   service log to `%TEMP%\opencfdrive-service\`, and waits for the
@@ -530,12 +598,14 @@ installed or downloaded separately and keeps its own license:
 
 - **rclone** ([MIT license](https://github.com/rclone/rclone/blob/master/COPYING)).
   OpenCfDrive runs it as a separate program and talks to it over its HTTP
-  Remote Control API; no rclone code is included. The tests also pull the
-  `rclone/rclone` Docker image.
+  Remote Control API; no rclone code is included. The tests and the demo
+  backend also run it as their WebDAV or S3 server.
 - **NuGet packages** listed in the project files (`Microsoft.Data.Sqlite`,
   `SQLitePCLRaw`, `Microsoft.Extensions.Hosting`, and the xunit test packages),
   restored at build time.
 
-Anyone who ships a build together with these (for example a zip with
-`rclone.exe`, or the published DLLs) must include their license notices, such
-as rclone's `COPYING` file.
+Anyone who ships a build together with these must include their license
+notices. The installers do: the app is self-contained (the .NET runtime and
+these packages are inside it), and `installer\THIRD-PARTY-NOTICES.txt` is
+installed next to it. They do not include rclone; a package that bundled
+`rclone.exe` would also need rclone's `COPYING` file.

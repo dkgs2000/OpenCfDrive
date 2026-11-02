@@ -9,7 +9,7 @@
 #   .\scripts\drive\Install-OpenCfDrive.ps1
 #
 # After installing, run:
-#   1. .\scripts\drive\Setup-OpenCfDrive-Environment.ps1   (optional demo backend: Docker WebDAV + rclone RC)
+#   1. .\scripts\drive\Setup-OpenCfDrive-Environment.ps1   (optional demo backend: rclone WebDAV server + rclone RC)
 #   2. .\scripts\drive\Start-OpenCfDrive.ps1              (launches the service)
 #   3. Open Explorer to the sync root
 
@@ -86,7 +86,7 @@ Write-Host "State database location: %LOCALAPPDATA%\OpenCfDrive\state\opencfdriv
 Write-Host "(Engine state never lives inside the sync root; that folder is user data.)" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Cyan
-Write-Host "  1. Start Docker and run: .\scripts\drive\Setup-OpenCfDrive-Environment.ps1"
+Write-Host "  1. Optional demo backend: .\scripts\drive\Setup-OpenCfDrive-Environment.ps1"
 Write-Host "  2. Run: .\scripts\drive\Start-OpenCfDrive.ps1 -SyncRoot `"$SyncRoot`""
 Write-Host "  3. Open Explorer to: $SyncRoot"
 Write-Host ""

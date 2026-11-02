@@ -1,0 +1,18 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <!--
+    The .exe installer: a 64-bit WiX bootstrapper that installs the MSI.
+    Built by installer\Build-Installer.ps1, which passes Version and MsiPath.
+  -->
+  <PropertyGroup>
+    <OutputType>Bundle</OutputType>
+    <Version Condition="'$(Version)' == ''">0.0.0</Version>
+    <OutputName>OpenCfDrive-$(Version)-x64-setup</OutputName>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\'))</RepoRoot>
+    <DefineConstants>Version=$(Version);MsiPath=$(MsiPath);RepoRoot=$(RepoRoot)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Bal.wixext" Version="5.0.2" />
+  </ItemGroup>
+</Project>

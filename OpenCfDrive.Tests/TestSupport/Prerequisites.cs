@@ -1,21 +1,15 @@
-using System.Diagnostics;
 using OpenCfDrive.Core.CloudFiles;
 
 namespace OpenCfDrive.Tests.TestSupport;
 
 public static class Prerequisites
 {
-    public const string WebDavImage = "bytemark/webdav";
-
     private static readonly Lazy<string> RclonePath = new(FindRclone, isThreadSafe: true);
-    private static readonly Lazy<bool> DockerReady = new(ProbeDocker, isThreadSafe: true);
     private static readonly Lazy<bool> CfApiReady = new(
         () => CloudFilesCapability.Current.IsSupported,
         isThreadSafe: true);
 
     public static string RcloneExe => RclonePath.Value;
-
-    public static bool DockerAvailable => DockerReady.Value;
 
     public static bool RcloneAvailable => !string.IsNullOrEmpty(RclonePath.Value);
 
@@ -23,7 +17,11 @@ public static class Prerequisites
 
     public static string CloudFilesReason => CloudFilesCapability.Current.Reason;
 
-    public static bool RcloneEnvironmentAvailable => DockerAvailable && RcloneAvailable;
+    /// <summary>
+    /// The rclone contract tests need only rclone: it is both the client's
+    /// rclone and, as a separate process, the WebDAV server.
+    /// </summary>
+    public static bool RcloneEnvironmentAvailable => RcloneAvailable;
 
     private static string FindRclone()
     {
@@ -63,35 +61,5 @@ public static class Prerequisites
         }
 
         return string.Empty;
-    }
-
-    private static bool ProbeDocker()
-    {
-        try
-        {
-            using var process = Process.Start(new ProcessStartInfo
-            {
-                FileName = "docker",
-                ArgumentList = { "version", "--format", "{{.Server.Version}}" },
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-            });
-
-            if (process is null)
-            {
-                return false;
-            }
-
-            process.StandardOutput.ReadToEnd();
-            process.StandardError.ReadToEnd();
-            process.WaitForExit(15000);
-            return process.ExitCode == 0;
-        }
-        catch
-        {
-            return false;
-        }
     }
 }

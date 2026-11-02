@@ -3,6 +3,10 @@
     <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- No console window: the installed copy runs in the background (see ConsoleOutput). -->
+    <OutputType>WinExe</OutputType>
+    <!-- Also the drive's icon in Explorer: the sync root registers this exe's icon. -->
+    <ApplicationIcon>..\assets\opencfdrive.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

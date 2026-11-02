@@ -8,14 +8,15 @@ namespace OpenCfDrive.Tests;
 /// <summary>
 /// Pins the rclone RC/serve contract our sync engine depends on. If rclone
 /// changes these behaviours, these tests fail before the mount tests do.
-/// Requires Docker + the local rclone binary; skipped otherwise.
+/// Requires the rclone binary (it also serves the WebDAV server); skipped
+/// otherwise.
 /// </summary>
 public class RcloneContractTests
 {
     [SkippableFact]
     public void OperationsList_RequiresFsAndRemote_AndReturnsSeededFiles()
     {
-        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "Docker or rclone.exe unavailable.");
+        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "rclone.exe unavailable.");
 
         using var env = RcloneTestEnvironment.Start(new Dictionary<string, byte[]>
         {
@@ -46,7 +47,7 @@ public class RcloneContractTests
     [SkippableFact]
     public void OperationsList_DoesNotRecurse_WhenOptRecurseIsAbsent()
     {
-        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "Docker or rclone.exe unavailable.");
+        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "rclone.exe unavailable.");
 
         using var env = RcloneTestEnvironment.Start(new Dictionary<string, byte[]>
         {
@@ -72,7 +73,7 @@ public class RcloneContractTests
     [SkippableFact]
     public void RcServe_HonoursByteRanges()
     {
-        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "Docker or rclone.exe unavailable.");
+        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "rclone.exe unavailable.");
 
         using var env = RcloneTestEnvironment.Start(new Dictionary<string, byte[]>
         {
@@ -90,7 +91,7 @@ public class RcloneContractTests
     [SkippableFact]
     public void RcServe_OpenEndedRange_StartsAtOffset()
     {
-        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "Docker or rclone.exe unavailable.");
+        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "rclone.exe unavailable.");
 
         using var env = RcloneTestEnvironment.Start(new Dictionary<string, byte[]>
         {
@@ -108,7 +109,7 @@ public class RcloneContractTests
     [SkippableFact]
     public void UploadFile_Multipart_LandsOnRemote()
     {
-        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "Docker or rclone.exe unavailable.");
+        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "rclone.exe unavailable.");
 
         using var env = RcloneTestEnvironment.Start();
 
@@ -124,7 +125,7 @@ public class RcloneContractTests
     [SkippableFact]
     public void RcServe_ReturnsAllSeededBytes()
     {
-        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "Docker or rclone.exe unavailable.");
+        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "rclone.exe unavailable.");
 
         var payload = new byte[64 * 1024];
         Random.Shared.NextBytes(payload);

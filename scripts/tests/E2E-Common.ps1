@@ -9,9 +9,10 @@
 #                     plain directory (no Cloud Files registration).
 #   E2E-Run-S3.ps1    E2E-Run.ps1 against an S3 backend instead of WebDAV.
 #
-# All of them take -Backend webdav|s3. The backend is only a container plus an
-# rclone remote, and the same scenarios run against each, which shows the
-# client depends on rclone only, not on a particular protocol.
+# All of them take -Backend webdav|s3. The backend is only a server process
+# (rclone serve webdav / s3) plus an rclone remote, and the same scenarios run
+# against each, which shows the client depends on rclone only, not on a
+# particular protocol. Nothing but rclone and the .NET SDK is needed.
 #
 # Server-side changes (seed, add, update, delete, rename) are made the way
 # another user or app would make them: through a *separate* rclone process
@@ -65,14 +66,16 @@ function Invoke-Native {
         [switch]$PassThruOutput
     )
 
-    # Native tools (rclone, docker, dotnet) routinely write NOTICEs to stderr.
+    # Native tools (rclone, dotnet) routinely write NOTICEs to stderr.
     # Under $ErrorActionPreference='Stop' Windows PowerShell turns those into a
     # terminating NativeCommandError, so relax it for the call and judge the
     # result by $LASTEXITCODE instead.
     $previous = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $output = & $FilePath @Arguments 2>&1
+        # Piped: PowerShell captures a Windows (no console) app's output only
+        # when it goes into a pipeline, not straight into a variable.
+        $output = & $FilePath @Arguments 2>&1 | ForEach-Object { $_ }
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
@@ -323,53 +326,41 @@ function Test-RcloneHealthy {
 
 # --- backends ----------------------------------------------------------------
 
+# Pauses and resumes the server process (see Suspend-E2EBackend).
+if (-not ("OpenCfDriveE2E.ProcessControl" -as [type])) {
+    Add-Type -Namespace OpenCfDriveE2E -Name ProcessControl -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("ntdll.dll")]
+public static extern int NtSuspendProcess(System.IntPtr processHandle);
+[System.Runtime.InteropServices.DllImport("ntdll.dll")]
+public static extern int NtResumeProcess(System.IntPtr processHandle);
+'@
+}
+
+# The server: rclone's own WebDAV or S3 server ("rclone serve webdav" /
+# "rclone serve s3") over a folder under the temp root, in a process of its
+# own. It is not the client's rclone: the client reaches it only over HTTP,
+# through its own rclone and an rclone remote, as it would any server.
 function Start-E2EBackend {
     param(
         [Parameter(Mandatory = $true)][ValidateSet("webdav", "s3")][string]$Backend,
-        [Parameter(Mandatory = $true)][string]$ContainerName,
         [Parameter(Mandatory = $true)][string]$RclonePath,
         [Parameter(Mandatory = $true)][string]$RcloneConf,
         [Parameter(Mandatory = $true)][string]$RemoteName
     )
 
-    try { Invoke-Native -FilePath "docker" -Arguments @("rm", "-f", $ContainerName) | Out-Null } catch { }
-
-    switch ($Backend) {
-        "webdav" {
-            $runArgs = @("run", "-d", "--name", $ContainerName, "-p", "127.0.0.1::80",
-                         "-e", "USERNAME=demo", "-e", "PASSWORD=demo", "bytemark/webdav")
-            $containerPort = "80/tcp"
-        }
-        "s3" {
-            # A real S3-protocol server (rclone's own, so no extra image is
-            # needed). The client side only sees an S3 endpoint and bucket.
-            $runArgs = @("run", "-d", "--name", $ContainerName, "-p", "127.0.0.1::8080",
-                         "rclone/rclone:latest", "serve", "s3", "/data",
-                         "--addr", ":8080", "--auth-key", "e2ekey,e2esecret")
-            $containerPort = "8080/tcp"
-        }
+    $data = Join-Path $script:E2ETempRoot "server-data"
+    New-Item -ItemType Directory -Path $data -Force | Out-Null
+    $port = Get-FreeTcpPort
+    $serveArgs = switch ($Backend) {
+        "webdav" { @("serve", "webdav", "`"$data`"", "--addr", "127.0.0.1:$port", "--user", "demo", "--pass", "demo") }
+        "s3"     { @("serve", "s3", "`"$data`"", "--addr", "127.0.0.1:$port", "--auth-key", "e2ekey,e2esecret") }
     }
+    $serveArgs += @("--log-file", "`"$(Join-Path $script:E2ETempRoot 'server.log')`"", "--log-level", "INFO")
 
-    Write-E2ELog "Starting $Backend container $ContainerName"
-    $dockerRun = Invoke-Native -FilePath "docker" -Arguments $runArgs -PassThruOutput
-    if ($dockerRun.ExitCode -ne 0) {
-        throw "docker run failed for ${ContainerName}: $($dockerRun.Output -join ' ')"
-    }
+    Write-E2ELog "Starting the $Backend server (rclone serve $Backend)"
+    $script:E2EBackendProcess = Start-Process -FilePath $RclonePath -ArgumentList $serveArgs -WindowStyle Hidden -PassThru
+    $script:E2EBackendUrl = "http://127.0.0.1:$port/"
 
-    $mappedPort = $null
-    for ($i = 0; $i -lt 120; $i++) {
-        $portResult = Invoke-Native -FilePath "docker" -Arguments @("port", $ContainerName, $containerPort) -PassThruOutput
-        $portInfo = (@($portResult.Output) -join "`n").Trim()
-        if ($portInfo -match ":(\d+)$") {
-            $mappedPort = $matches[1]
-            break
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    if (-not $mappedPort) { throw "$Backend container did not expose $containerPort." }
-
-    $script:E2EBackendUrl = "http://127.0.0.1:$mappedPort/"
-    $script:E2EBackendContainer = $ContainerName
     Write-E2ELog "$Backend endpoint: $script:E2EBackendUrl"
     if (-not (Wait-ForCondition { Test-HttpReady $script:E2EBackendUrl } -TimeoutSeconds 60)) {
         throw "$Backend did not become ready at $script:E2EBackendUrl"
@@ -402,15 +393,21 @@ function Start-E2EBackend {
     }
 }
 
-# Takes the server offline the way a lost network does: the container is
+function Stop-E2EBackend {
+    if ($null -ne $script:E2EBackendProcess -and -not $script:E2EBackendProcess.HasExited) {
+        try { Stop-Process -Id $script:E2EBackendProcess.Id -Force -ErrorAction Stop } catch { }
+    }
+}
+
+# Takes the server offline the way a lost network does: its process is
 # paused, so connections hang instead of being refused, while the client's
 # rclone keeps running.
 function Suspend-E2EBackend {
-    Invoke-Native -FilePath "docker" -Arguments @("pause", $script:E2EBackendContainer) | Out-Null
+    [void][OpenCfDriveE2E.ProcessControl]::NtSuspendProcess($script:E2EBackendProcess.Handle)
 }
 
 function Resume-E2EBackend {
-    Invoke-Native -FilePath "docker" -Arguments @("unpause", $script:E2EBackendContainer) | Out-Null
+    [void][OpenCfDriveE2E.ProcessControl]::NtResumeProcess($script:E2EBackendProcess.Handle)
 }
 
 # Starts the service (or the mock) and waits for its ready line. Returns the process.
@@ -461,10 +458,11 @@ function Invoke-ServiceUnregister([string]$ServiceExe, [string]$SyncRoot) {
     try {
         $env:OPENCFDRIVE_ROOT = $SyncRoot
         $result = Invoke-Native -FilePath $ServiceExe -Arguments @("--unregister") -PassThruOutput
+        $message = (@($result.Output) -join ' ').Trim()
         if ($result.ExitCode -eq 0) {
-            Write-E2ELog "Cleared the previous sync root registration."
+            Write-E2ELog "Cleared the sync root registration: $message"
         } else {
-            Write-E2ELog "No previous registration to clear."
+            Write-E2ELog "No registration to clear: $message"
         }
     } finally {
         $env:OPENCFDRIVE_ROOT = $previous
@@ -509,12 +507,12 @@ function Invoke-OpenCfDriveE2E {
     $script:E2ETempRoot = $TempRoot
     $script:E2ERcPort = if ($RcPort -gt 0) { $RcPort } else { Get-FreeTcpPort }
     $script:E2EBackendUrl = ""
+    $script:E2EBackendProcess = $null
 
     $serviceDir = if ($isCloud) { "OpenCfDrive.Service" } else { "OpenCfDrive.MockService" }
     $serviceExeName = if ($isCloud) { "OpenCfDrive.Service.exe" } else { "OpenCfDrive.MockService.exe" }
     $serviceExe = Join-Path $script:E2ERoot "$serviceDir\bin\Debug\net10.0-windows10.0.19041.0\$serviceExeName"
 
-    $containerName = "opencfdrive-e2e-$Mode-$Backend"
     $readyPattern = if ($isCloud) { "Mode: cloud" } else { "MOCK: READY" }
     $failurePattern = if ($isCloud) { "Sync engine initialisation failed" } else { "MOCK: FAILED" }
 
@@ -552,13 +550,6 @@ function Invoke-OpenCfDriveE2E {
         }
 
         # --- prerequisites -------------------------------------------------
-        $docker = Invoke-Native -FilePath "docker" `
-            -Arguments @("version", "--format", "{{.Server.Version}}") -PassThruOutput
-        if ($docker.ExitCode -ne 0) {
-            throw "Docker is not available: $($docker.Output -join ' ')"
-        }
-        Write-E2ELog "Docker server: $((@($docker.Output) -join ' ').Trim())"
-
         $rclonePath = Resolve-RclonePath
 
         # --- clean slate ---------------------------------------------------
@@ -589,8 +580,7 @@ function Invoke-OpenCfDriveE2E {
 
         # --- backend + rclone RC (--rc-serve) -----------------------------
         $rcloneConf = Join-Path $TempRoot "rclone.conf"
-        Start-E2EBackend -Backend $Backend -ContainerName $containerName -RclonePath $rclonePath `
-            -RcloneConf $rcloneConf -RemoteName $RemoteName
+        Start-E2EBackend -Backend $Backend -RclonePath $rclonePath -RcloneConf $rcloneConf -RemoteName $RemoteName
 
         # DEBUG logs every RC call the client makes; the scenario audit counts them.
         Write-E2ELog "Starting rclone RC on http://127.0.0.1:$script:E2ERcPort"
@@ -819,9 +809,9 @@ function Invoke-OpenCfDriveE2E {
         }
 
         Stop-StaleProcesses
-        try { Invoke-Native -FilePath "docker" -Arguments @("rm", "-f", $containerName) | Out-Null } catch { }
+        Stop-E2EBackend
 
-        Write-E2ELog "Cleanup complete: service, rclone and $Backend container stopped."
+        Write-E2ELog "Cleanup complete: service, rclone and the $Backend server stopped."
         Write-E2ELog "Artifacts preserved under: $TempRoot"
     }
 }

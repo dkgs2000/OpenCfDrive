@@ -2,9 +2,9 @@
 #
 # Exactly E2E-Run.ps1 -Backend s3: the same mount checks and the same
 # server-side and client-side scenarios, against a plain S3-protocol server
-# (rclone serve s3 in Docker, a bucket mapped to the drive). Nothing in the
-# client changes; it only sees a different rclone remote. Passing on both
-# backends is what shows the client depends on rclone only.
+# (rclone serve s3, a bucket mapped to the drive). Nothing in the client
+# changes; it only sees a different rclone remote. Passing on both backends is
+# what shows the client depends on rclone only.
 
 param(
     [string]$Only = "",

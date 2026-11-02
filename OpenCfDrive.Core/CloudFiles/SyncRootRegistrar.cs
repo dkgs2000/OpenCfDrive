@@ -282,7 +282,7 @@ public sealed class SyncRootRegistrar
         }
 
         var cleaned = 0;
-        if (Directory.Exists(syncRootPath) && HasPlaceholdersWithoutLocalData(syncRootPath) &&
+        if (Directory.Exists(syncRootPath) && ContainsPlaceholders(syncRootPath) &&
             RegisterWithDriverOnly(syncRootPath, Guid.NewGuid(), Guid.NewGuid()).Success)
         {
             cleaned = DeletePlaceholdersWithoutLocalData(syncRootPath);
@@ -306,21 +306,75 @@ public sealed class SyncRootRegistrar
     private static bool IsWithoutLocalData(string file) =>
         (File.GetAttributes(file) & (RecallOnDataAccessAttribute | System.IO.FileAttributes.Offline)) != 0;
 
-    private static bool HasPlaceholdersWithoutLocalData(string syncRootPath)
+    /// <summary>
+    /// True if anything under the folder is still a placeholder (a reparse
+    /// point). Placeholders are seen but never entered: a folder placeholder
+    /// that was not fully listed cannot be opened with no provider connected
+    /// ("The cloud file provider exited unexpectedly").
+    /// </summary>
+    private static bool ContainsPlaceholders(string directory)
     {
         try
         {
-            return Directory.EnumerateFiles(syncRootPath, "*", SearchOption.AllDirectories).Any(IsWithoutLocalData);
+            foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos("*", new EnumerationOptions { AttributesToSkip = 0 }))
+            {
+                if ((entry.Attributes & System.IO.FileAttributes.ReparsePoint) != 0)
+                {
+                    return true;
+                }
+
+                if (entry is DirectoryInfo && ContainsPlaceholders(entry.FullName))
+                {
+                    return true;
+                }
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return false;
+            // Unreadable: assume placeholders, the cleanup is harmless.
+            return true;
         }
+
+        return false;
     }
 
+    /// <summary>
+    /// With a throwaway provider connected, deletes the files that have no
+    /// local data. The provider acknowledges the deletes, and answers every
+    /// folder listing with nothing new, so folders that were never fully
+    /// listed can be walked too.
+    /// </summary>
     private static int DeletePlaceholdersWithoutLocalData(string syncRootPath)
     {
         var deleted = 0;
+        CF_CALLBACK answerListing = (infoPtr, _) =>
+        {
+            try
+            {
+                var info = Marshal.PtrToStructure<CF_CALLBACK_INFO>(infoPtr);
+                var opInfo = new CF_OPERATION_INFO
+                {
+                    StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
+                    Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS,
+                    ConnectionKey = info.ConnectionKey,
+                    TransferKey = info.TransferKey,
+                };
+                var opParams = new CF_OPERATION_PARAMETERS_PLACEHOLDERS
+                {
+                    ParamSize = 8 + (uint)Marshal.SizeOf<CF_OPERATION_TRANSFER_PLACEHOLDERS>(),
+                    TransferPlaceholders = new CF_OPERATION_TRANSFER_PLACEHOLDERS
+                    {
+                        Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS.CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
+                    },
+                };
+                CfApi.CfExecute(ref opInfo, ref opParams);
+            }
+            catch
+            {
+                // never throw across the native boundary
+            }
+        };
+
         CF_CALLBACK acknowledgeDelete = (infoPtr, _) =>
         {
             try
@@ -344,6 +398,11 @@ public sealed class SyncRootRegistrar
 
         var table = new[]
         {
+            new CF_CALLBACK_REGISTRATION
+            {
+                Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS,
+                Callback = Marshal.GetFunctionPointerForDelegate(answerListing),
+            },
             new CF_CALLBACK_REGISTRATION
             {
                 Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NOTIFY_DELETE,
@@ -379,6 +438,7 @@ public sealed class SyncRootRegistrar
                 CfApi.CfDisconnectSyncRoot(key);
             }
 
+            GC.KeepAlive(answerListing);
             GC.KeepAlive(acknowledgeDelete);
         }
 
