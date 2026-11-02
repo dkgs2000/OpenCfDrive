@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" width="128" height="128" alt="OpenCfDrive logo: a cloud with a drive slot">
+</p>
+
 # OpenCfDrive
 
 **An Explorer cloud drive for any rclone remote.**
@@ -441,6 +445,8 @@ file with default icons rather than a cloud badge.
 | `OpenCfDrive.Tests` | Unit and contract tests (interop layout, Cloud Files behaviour, SQLite, rclone API) |
 | `scripts\drive` | Using the drive: `Install-`, `Start-` and `Uninstall-OpenCfDrive.ps1`, plus `Setup-OpenCfDrive-Environment.ps1` (optional local demo backend: Docker WebDAV + `rclone rcd`) |
 | `scripts\tests` | End-to-end tests: `E2E-Run.ps1`, `E2E-Run-S3.ps1`, `E2E-Run-Mock.ps1`, with the shared harness `E2E-Common.ps1` and scenario matrix `E2E-Scenarios.ps1` |
+| `assets` | The logo (`logo.svg`, the source) and `opencfdrive.ico`, the service's icon, which Explorer also shows for the drive |
+| `scripts\assets` | `Build-Icon.ps1`: rebuilds `opencfdrive.ico` from `logo.svg` (rendered by Microsoft Edge) |
 
 ## Using it
 
