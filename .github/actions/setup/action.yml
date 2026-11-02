@@ -15,11 +15,13 @@ runs:
 
     - name: Install rclone ${{ inputs.rclone-version }}
       shell: powershell
+      # Not RCLONE_VERSION: rclone reads every RCLONE_<NAME> variable as the
+      # flag --<name>, so that one makes it fail as an invalid --version.
       env:
-        RCLONE_VERSION: ${{ inputs.rclone-version }}
+        WANTED_VERSION: ${{ inputs.rclone-version }}
       run: |
         $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
-        $url = "https://downloads.rclone.org/$env:RCLONE_VERSION/rclone-$env:RCLONE_VERSION-windows-amd64.zip"
+        $url = "https://downloads.rclone.org/$env:WANTED_VERSION/rclone-$env:WANTED_VERSION-windows-amd64.zip"
         Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
         $target = Join-Path $env:RUNNER_TEMP "rclone"
         Expand-Archive -Path $zip -DestinationPath $target -Force
