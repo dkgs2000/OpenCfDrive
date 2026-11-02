@@ -6,18 +6,19 @@ using System.Net.Sockets;
 namespace OpenCfDrive.Tests.TestSupport;
 
 /// <summary>
-/// Starts an isolated WebDAV container plus a dedicated <c>rclone rcd</c>
-/// instance on ephemeral ports. Nothing is shared with the developer's
-/// environment: temp config, temp sync roots, random container name.
+/// Starts an isolated WebDAV server (<c>rclone serve webdav</c> over a temp
+/// folder, in its own process) plus a dedicated <c>rclone rcd</c> instance on
+/// ephemeral ports. Nothing is shared with the developer's environment: temp
+/// config, temp folders. Needs nothing but rclone.
 /// </summary>
 public sealed class RcloneTestEnvironment : IDisposable
 {
     private readonly Process _rcd;
-    private readonly string _containerName;
+    private readonly Process _server;
 
     private RcloneTestEnvironment(
         Process rcd,
-        string containerName,
+        Process server,
         string tempRoot,
         string rcUrl,
         string webDavUrl,
@@ -25,7 +26,7 @@ public sealed class RcloneTestEnvironment : IDisposable
         string remoteName)
     {
         _rcd = rcd;
-        _containerName = containerName;
+        _server = server;
         TempRoot = tempRoot;
         RcUrl = rcUrl;
         WebDavUrl = webDavUrl;
@@ -48,13 +49,17 @@ public sealed class RcloneTestEnvironment : IDisposable
     public static RcloneTestEnvironment Start(IReadOnlyDictionary<string, byte[]>? seedFiles = null)
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), "opencfdrive-e2e", Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(tempRoot);
+        var serverData = Path.Combine(tempRoot, "server-data");
+        Directory.CreateDirectory(serverData);
 
-        var containerName = "opencfdrive-e2e-" + Guid.NewGuid().ToString("N")[..10];
-        Run("docker", "run", "-d", "--name", containerName, "-p", "127.0.0.1::80",
-            "-e", "USERNAME=demo", "-e", "PASSWORD=demo", Prerequisites.WebDavImage);
+        var webDavPort = GetFreePort();
+        var server = StartRclone(
+            "serve", "webdav", serverData,
+            "--addr", $"127.0.0.1:{webDavPort}",
+            "--user", "demo", "--pass", "demo",
+            "--log-file", Path.Combine(tempRoot, "server.log"));
 
-        var webDavUrl = $"http://127.0.0.1:{GetMappedPort(containerName)}/";
+        var webDavUrl = $"http://127.0.0.1:{webDavPort}/";
         WaitForHttp(webDavUrl, TimeSpan.FromSeconds(60));
 
         foreach (var (name, bytes) in seedFiles ?? new Dictionary<string, byte[]>())
@@ -67,30 +72,38 @@ public sealed class RcloneTestEnvironment : IDisposable
             "e2e", "webdav", $"url={webDavUrl}", "user=demo", "pass=demo", "vendor=other");
 
         var rcPort = GetFreePort();
-        var logPath = Path.Combine(tempRoot, "rcd.log");
-        var rcd = Process.Start(new ProcessStartInfo
-        {
-            FileName = Prerequisites.RcloneExe,
-            ArgumentList =
-            {
-                "--config", configPath,
-                "rcd",
-                "--rc-addr", $"127.0.0.1:{rcPort}",
-                "--rc-no-auth",
-                "--rc-serve",
-                "--log-file", logPath,
-                "--log-level", "INFO",
-            },
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        }) ?? throw new InvalidOperationException("Failed to start rclone rcd.");
+        var rcd = StartRclone(
+            "--config", configPath,
+            "rcd",
+            "--rc-addr", $"127.0.0.1:{rcPort}",
+            "--rc-no-auth",
+            "--rc-serve",
+            "--log-file", Path.Combine(tempRoot, "rcd.log"),
+            "--log-level", "INFO");
 
         var rcUrl = $"http://127.0.0.1:{rcPort}";
         WaitForRcloneRc(rcUrl, TimeSpan.FromSeconds(60));
 
-        return new RcloneTestEnvironment(rcd, containerName, tempRoot, rcUrl, webDavUrl, rcPort, "e2e");
+        return new RcloneTestEnvironment(rcd, server, tempRoot, rcUrl, webDavUrl, rcPort, "e2e");
+    }
+
+    private static Process StartRclone(params string[] arguments)
+    {
+        var info = new ProcessStartInfo
+        {
+            FileName = Prerequisites.RcloneExe,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+
+        foreach (var argument in arguments)
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        return Process.Start(info) ?? throw new InvalidOperationException($"Failed to start rclone {arguments[0]}.");
     }
 
     public static void PutFile(string webDavUrl, string relativePath, byte[] content)
@@ -159,13 +172,6 @@ public sealed class RcloneTestEnvironment : IDisposable
         return true;
     }
 
-    private static int GetMappedPort(string containerName)
-    {
-        var output = Run("docker", "port", containerName, "80/tcp").Trim();
-        var lastColon = output.LastIndexOf(':');
-        return int.Parse(output[(lastColon + 1)..]);
-    }
-
     private static void WaitForHttp(string url, TimeSpan timeout)
     {
         using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
@@ -185,7 +191,7 @@ public sealed class RcloneTestEnvironment : IDisposable
             }
             catch
             {
-                // container still booting
+                // server still starting
             }
 
             Thread.Sleep(500);
@@ -267,30 +273,24 @@ public sealed class RcloneTestEnvironment : IDisposable
 
     public void Dispose()
     {
-        try
+        foreach (var process in new[] { _rcd, _server })
         {
-            if (!_rcd.HasExited)
+            try
             {
-                _rcd.Kill(entireProcessTree: true);
-                _rcd.WaitForExit(5000);
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                    process.WaitForExit(5000);
+                }
             }
-        }
-        catch
-        {
-            // ignored
-        }
-        finally
-        {
-            _rcd.Dispose();
-        }
-
-        try
-        {
-            Run("docker", "rm", "-f", _containerName);
-        }
-        catch
-        {
-            // ignored
+            catch
+            {
+                // ignored
+            }
+            finally
+            {
+                process.Dispose();
+            }
         }
 
         try

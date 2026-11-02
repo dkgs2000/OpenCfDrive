@@ -1,5 +1,6 @@
 # Builds assets\opencfdrive.ico (the service's application icon, which
-# Explorer also shows for the drive) from assets\logo.svg.
+# Explorer also shows for the drive) and assets\logo-64.png (the logo in the
+# .exe installer) from assets\logo.svg.
 #
 # Microsoft Edge renders the SVG once at 1024 px (headless, transparent
 # background); each icon size is scaled down from that. As usual for .ico
@@ -90,6 +91,10 @@ try {
         $graphics.Dispose()
 
         $bytes = if ($size -ge 256) { ConvertTo-PngBytes $bitmap } else { ConvertTo-IconDib $bitmap }
+        if ($size -eq 64) {
+            # The logo in the .exe installer's window.
+            $bitmap.Save((Join-Path $repoRoot "assets\logo-64.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+        }
         $bitmap.Dispose()
         [pscustomobject]@{ Size = $size; Bytes = $bytes }
     }

@@ -2,6 +2,7 @@
 bin/
 obj/
 publish/
+artifacts/
 TestResults/
 
 # Third-party binaries: install rclone separately (or drop rclone.exe here locally)

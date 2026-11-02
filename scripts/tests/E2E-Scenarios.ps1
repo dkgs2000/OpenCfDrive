@@ -646,6 +646,7 @@ function Invoke-E2EScenarios {
     $script:E2EServiceProcess = $ServiceProcess
     $filters = @($Only -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $results = New-Object System.Collections.Generic.List[object]
+    $quiet = $false
 
     Write-E2ELog "--- scenarios ---"
     foreach ($scenario in Get-E2EScenarios) {
@@ -658,8 +659,9 @@ function Invoke-E2EScenarios {
             continue
         }
 
-        # Start from a quiet client so the previous scenario's work is not counted here.
-        Wait-ServiceQuiet
+        # Start from a quiet client so earlier work is not counted here. After
+        # the first scenario it already is: each one ends by waiting for quiet.
+        if (-not $quiet) { Wait-ServiceQuiet }
         $serviceStart = Get-LogLength $script:E2EServiceLog
         $rcloneStart = Get-LogLength $script:E2ERcloneLog
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -672,6 +674,7 @@ function Invoke-E2EScenarios {
         $ms = $clock.ElapsedMilliseconds
 
         Wait-ServiceQuiet
+        $quiet = $true
         $activity = Measure-ServiceActivity `
             (Read-LogSlice $script:E2EServiceLog $serviceStart (Get-LogLength $script:E2EServiceLog)) `
             (Read-LogSlice $script:E2ERcloneLog $rcloneStart (Get-LogLength $script:E2ERcloneLog))

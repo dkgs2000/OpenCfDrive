@@ -1,0 +1,76 @@
+name: Test
+
+# Every kind of test: the unit and contract tests, and the end-to-end suite in
+# both modes (a real Cloud Files drive, and mock mode) on both servers (WebDAV
+# and S3). The servers are local processes (rclone serve webdav / s3), so
+# nothing but .NET and rclone is needed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit and contract tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - name: Test
+        shell: powershell
+        run: dotnet test OpenCfDrive.slnx --logger trx --results-directory TestResults
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-results
+          path: TestResults
+
+  e2e:
+    name: E2E (${{ matrix.mode }}, ${{ matrix.backend }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [cloud, mock]
+        backend: [webdav, s3]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - name: Show the Cloud Files driver
+        if: matrix.mode == 'cloud'
+        shell: powershell
+        run: fltmc filters
+
+      - name: Run
+        shell: powershell
+        env:
+          MODE: ${{ matrix.mode }}
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          $script = if ($env:MODE -eq "cloud") { "E2E-Run.ps1" } else { "E2E-Run-Mock.ps1" }
+          & ".\scripts\tests\$script" -Backend $env:BACKEND -TempRoot (Join-Path $env:RUNNER_TEMP "opencfdrive-e2e")
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-${{ matrix.mode }}-${{ matrix.backend }}-logs
+          path: |
+            ${{ runner.temp }}/opencfdrive-e2e/*.log
+            ${{ runner.temp }}/opencfdrive-e2e/*.err

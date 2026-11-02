@@ -1,6 +1,6 @@
 # Cloud E2E: a real Cloud Files sync root, registered with Explorer.
 #
-# Runs the same flow as E2E-Run-Mock.ps1 (Docker backend -> rclone rcd
+# Runs the same flow as E2E-Run-Mock.ps1 (server process -> rclone rcd
 # --rc-serve -> sync engine -> download / edit / upload -> the server-side and
 # client-side scenario matrix in E2E-Scenarios.ps1) and adds the part that
 # needs Cloud Files: the service registers a real sync root, Explorer shows it,

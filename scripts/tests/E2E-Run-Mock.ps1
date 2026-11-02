@@ -1,6 +1,6 @@
 # Mock E2E: the same end-to-end flow, without a Cloud Files mount.
 #
-# Identical to E2E-Run.ps1 (Docker backend -> rclone rcd --rc-serve -> sync
+# Identical to E2E-Run.ps1 (server process -> rclone rcd --rc-serve -> sync
 # engine -> download / edit / upload -> scenario matrix, state isolation
 # checks) except that it launches OpenCfDrive.MockService, which runs the
 # engine in forced mock mode: no sync root registration, and the sync root is

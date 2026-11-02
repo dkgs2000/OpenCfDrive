@@ -1,0 +1,28 @@
+name: Set up the build
+description: Installs the .NET SDK and, for the tests, rclone (added to PATH).
+
+inputs:
+  rclone-version:
+    description: The rclone release the tests run against.
+    default: v1.75.2
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Install rclone ${{ inputs.rclone-version }}
+      shell: powershell
+      env:
+        RCLONE_VERSION: ${{ inputs.rclone-version }}
+      run: |
+        $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+        $url = "https://downloads.rclone.org/$env:RCLONE_VERSION/rclone-$env:RCLONE_VERSION-windows-amd64.zip"
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+        $target = Join-Path $env:RUNNER_TEMP "rclone"
+        Expand-Archive -Path $zip -DestinationPath $target -Force
+        $folder = (Get-ChildItem -Path $target -Directory | Select-Object -First 1).FullName
+        [System.IO.File]::AppendAllText($env:GITHUB_PATH, "$folder`n")
+        & (Join-Path $folder "rclone.exe") version

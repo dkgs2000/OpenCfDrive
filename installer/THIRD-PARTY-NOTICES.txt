@@ -1,0 +1,26 @@
+OpenCfDrive is released into the public domain (see LICENSE.txt).
+
+The installed program is self-contained, so it also includes the following
+third-party components, each under its own license:
+
+- .NET runtime: MIT
+  https://github.com/dotnet/runtime/blob/main/LICENSE.TXT
+  and its own notices:
+  https://github.com/dotnet/runtime/blob/main/THIRD-PARTY-NOTICES.TXT
+- Microsoft.Extensions.Hosting and its dependencies: MIT
+  https://github.com/dotnet/runtime/blob/main/LICENSE.TXT
+- Microsoft.Data.Sqlite: MIT
+  https://github.com/dotnet/efcore/blob/main/LICENSE.txt
+- SQLitePCLRaw: Apache License 2.0
+  https://github.com/ericsink/SQLitePCL.raw/blob/master/LICENSE.TXT
+- SQLite (e_sqlite3): public domain
+  https://www.sqlite.org/copyright.html
+- C#/WinRT runtime (WinRT.Runtime): MIT
+  https://github.com/microsoft/CsWinRT/blob/master/LICENSE
+- Windows SDK projections (Microsoft.Windows.SDK.NET): Microsoft Windows SDK
+  license
+  https://aka.ms/WinSDKLicenseURL
+
+rclone is not included. OpenCfDrive works with an rclone you install
+separately (MIT license: https://github.com/rclone/rclone/blob/master/COPYING).
+OpenCfDrive is not affiliated with or endorsed by the rclone project.

@@ -1,0 +1,69 @@
+name: Release
+
+# Builds the 64-bit installers (.msi and .exe) and publishes them as a GitHub
+# release, after every test has passed. Runs when a version tag is pushed
+# (git tag v1.2.3, git push origin v1.2.3), or by hand with a version, which
+# then tags the current commit.
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to release, for example 1.2.3 (tagged v1.2.3)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  release:
+    name: Build the installers and publish the release
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Version
+        id: version
+        shell: powershell
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $version = if ($env:EVENT -eq "push") { $env:TAG } else { $env:INPUT_VERSION }
+          $version = $version.Trim().TrimStart("v")
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "A version looks like 1.2.3, not '$version'." }
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$version`n")
+
+      - name: Build the installers
+        shell: powershell
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: .\installer\Build-Installer.ps1 -Version $env:VERSION -OutputDir artifacts
+
+      - name: Keep the installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: installers
+          path: artifacts/*
+
+      - name: Publish the release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $files = @(Get-ChildItem -Path artifacts -File | ForEach-Object { $_.FullName })
+          gh release create "v$env:VERSION" @files --title "OpenCfDrive $env:VERSION" --generate-notes --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
