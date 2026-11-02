@@ -7,6 +7,10 @@ third-party components, each under its own license:
   https://github.com/dotnet/runtime/blob/main/LICENSE.TXT
   and its own notices:
   https://github.com/dotnet/runtime/blob/main/THIRD-PARTY-NOTICES.TXT
+- Windows Forms (the .NET Windows Desktop runtime, used by the app): MIT
+  https://github.com/dotnet/winforms/blob/main/LICENSE.TXT
+  and its own notices:
+  https://github.com/dotnet/winforms/blob/main/THIRD-PARTY-NOTICES.TXT
 - Microsoft.Extensions.Hosting and its dependencies: MIT
   https://github.com/dotnet/runtime/blob/main/LICENSE.TXT
 - Microsoft.Data.Sqlite: MIT

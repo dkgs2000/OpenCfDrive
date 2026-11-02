@@ -12,6 +12,9 @@
                                               LogoFile="$(var.RepoRoot)assets\logo-64.png" />
     </BootstrapperApplication>
 
+    <!-- The success page's Launch button opens the app, to set up the drive. -->
+    <Variable Name="LaunchTarget" Value="[LocalAppDataFolder]Programs\OpenCfDrive\OpenCfDrive.exe" />
+
     <Chain>
       <MsiPackage SourceFile="$(var.MsiPath)" />
     </Chain>

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- The app people open: settings, status, and the notification area icon. -->
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>OpenCfDrive</AssemblyName>
+    <RootNamespace>OpenCfDrive.App</RootNamespace>
+    <ApplicationIcon>..\assets\opencfdrive.ico</ApplicationIcon>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationVisualStyles>true</ApplicationVisualStyles>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\OpenCfDrive.Core\OpenCfDrive.Core.csproj" />
+    <EmbeddedResource Include="..\assets\opencfdrive.ico" LogicalName="OpenCfDrive.ico" />
+  </ItemGroup>
+</Project>

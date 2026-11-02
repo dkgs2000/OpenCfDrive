@@ -341,6 +341,15 @@ public sealed class SqliteMetadataStore
 
     public string? GetFileIdByRemotePath(string remotePath) => GetByRemotePath(remotePath)?.FileId.ToString();
 
+    /// <summary>How many files and folders the drive tracks.</summary>
+    public int Count()
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM Files;";
+        return Convert.ToInt32(command.ExecuteScalar());
+    }
+
     public IReadOnlyList<FileRecord> GetAll()
     {
         using var connection = Open();

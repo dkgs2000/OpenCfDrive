@@ -18,6 +18,9 @@ internal static class ConsoleOutput
     public static string LogPath =>
         Path.Combine(Path.GetDirectoryName(SyncStatePaths.StateRoot)!, "logs", "OpenCfDrive.log");
 
+    /// <summary>The log file the output goes to, or null when it goes to a console or stream.</summary>
+    public static string? ActiveLogPath { get; private set; }
+
     public static void Connect()
     {
         // Not Console.IsOutputRedirected: a Windows app started without any
@@ -41,6 +44,7 @@ internal static class ConsoleOutput
             };
             Console.SetOut(writer);
             Console.SetError(writer);
+            ActiveLogPath = LogPath;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

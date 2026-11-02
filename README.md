@@ -29,6 +29,8 @@ affiliated with or endorsed by the rclone project.
   [Conflicts](#conflicts).
 - The folder is registered with Explorer (navigation pane entry) through
   `StorageProviderSyncRootManager`.
+- The OpenCfDrive app, behind an icon in the notification area, sets it up and
+  shows what the sync service and rclone are doing.
 
 ## Prerequisites
 
@@ -48,24 +50,40 @@ add an "OpenCfDrive" Start Menu entry. .NET is included, so nothing else is
 needed except rclone. The installers are not code-signed yet, so Windows
 SmartScreen may warn before running them.
 
-Before starting it, point it at your rclone remote with user environment
-variables (see [Configuration](#configuration)), and run rclone's remote
-control:
+OpenCfDrive talks to the server through rclone's remote control, which you run
+yourself (OpenCfDrive does not start rclone):
 
 ```powershell
-[Environment]::SetEnvironmentVariable("RCLONE_FS", "myremote:", "User")
-[Environment]::SetEnvironmentVariable("RCLONE_RC_URL", "http://127.0.0.1:5572", "User")
 rclone rcd --rc-serve --rc-no-auth --rc-addr 127.0.0.1:5572
 ```
 
-Then start "OpenCfDrive" from the Start Menu. It runs in the background with no
-window; the drive appears in Explorer's navigation pane, and its log is in
-`%LOCALAPPDATA%\OpenCfDrive\logs\OpenCfDrive.log`. Starting it again while it
-runs does nothing.
+After installing, the OpenCfDrive app opens. In its Settings tab, choose the
+rclone remote (the list comes from rclone's config, and a path is allowed, as
+in `myremote:backup`), check the remote control address, and press Save: the
+sync service starts and the drive appears in Explorer's navigation pane, at
+`%USERPROFILE%\OpenCfDrive` unless you chose another folder.
 
-Uninstalling (Settings > Apps) stops it and unregisters the drive, which
-removes it from Explorer and leaves `%USERPROFILE%\OpenCfDrive` as an ordinary
-folder with whatever was downloaded. An upgrade keeps the registration.
+The app then lives in the notification area, behind the arrow next to the
+clock (drag its icon onto the taskbar to keep it in view). Clicking the icon
+opens the app; its menu opens the drive folder, starts, stops or restarts
+syncing, and shows the log. The Status tab shows:
+
+- the sync service: whether it runs, since when, its version, and whether the
+  drive is registered with Explorer and connected; how many items it tracks and
+  how much it downloaded;
+- rclone: whether its remote control answers (and its version), whether it lets
+  OpenCfDrive in, and whether the chosen remote is in rclone's config;
+- the service's recent activity (uploads, downloads, deletes, warnings).
+
+The installed app starts when you sign in to Windows (a setting in the app),
+and starts the sync service when a remote is chosen. Closing the app's window
+only hides it; Exit in the icon's menu closes the app, and syncing continues.
+The service's log is `%LOCALAPPDATA%\OpenCfDrive\logs\OpenCfDrive.log`.
+
+Uninstalling (Settings > Apps) closes the app, stops the service, removes the
+sign-in start, and unregisters the drive, which removes it from Explorer and
+leaves `%USERPROFILE%\OpenCfDrive` as an ordinary folder with whatever was
+downloaded. An upgrade keeps the registration and the settings.
 
 ## Build
 
@@ -82,8 +100,13 @@ from NuGet. `assets\logo.svg` is the source of the icon; after changing it, run
 ## Run
 
 ```powershell
-dotnet run --project .\OpenCfDrive.Service\OpenCfDrive.Service.csproj
+dotnet run --project .\OpenCfDrive.App\OpenCfDrive.App.csproj       # the app, which starts the service
+dotnet run --project .\OpenCfDrive.Service\OpenCfDrive.Service.csproj  # or the service alone
 ```
+
+A build of the app finds the service in the service project's output for the
+same configuration (installed, they sit side by side). A build never adds
+itself to the sign-in start; only the installed app does, on its first start.
 
 The service registers `%USERPROFILE%\OpenCfDrive` as the sync root, shown in Explorer as "OpenCfDrive", and fills each folder from the configured rclone remote when it is opened. Run it as the user who owns the drive: the registration is per user. It does not need an elevated shell. Without the Cloud Files API it logs why and syncs nothing; it never falls back to downloading the remote into a plain folder.
 
@@ -95,13 +118,33 @@ running copy of the same exe, and `--unregister` unregisters the drive.
 
 ### Configuration
 
-Settings are read from the SQLite state database, with environment variables taking precedence:
+The app saves the settings in `%LOCALAPPDATA%\OpenCfDrive\settings.json`, and
+the service reads them when it starts. An environment variable, when set, wins
+over the file (scripts and tests rely on that); the app then says which ones
+are set.
 
-| Setting | Environment variable | Config key |
-| --- | --- | --- |
-| Sync root folder | `OPENCFDRIVE_ROOT` | `OpenCfDriveRoot` |
-| rclone remote spec | `RCLONE_FS` | `RcloneFs` |
-| rclone RC base URL | `RCLONE_RC_URL` | `RcloneRcUrl` |
+| Setting | `settings.json` | Environment variable | Default |
+| --- | --- | --- | --- |
+| Drive folder | `SyncRoot` | `OPENCFDRIVE_ROOT` | `%USERPROFILE%\OpenCfDrive` |
+| rclone remote | `Remote` | `RCLONE_FS` | none (the service then uses `e2e:`, the demo backend's) |
+| rclone remote control | `RcUrl` | `RCLONE_RC_URL` | `http://127.0.0.1:5572` |
+| Start at sign-in | `StartAtSignIn` | | on for the installed app |
+
+`OPENCFDRIVE_SETTINGS` points both the app and the service at another
+settings file.
+
+A drive folder belongs to one remote: its placeholders and state describe that
+remote's files. So the app only moves the drive to a folder that is new or
+empty (or that was this same remote's drive before), and switching to another
+remote needs such a folder too. Otherwise the client would take the old
+remote's files for server-side deletes, or the downloaded ones for new local
+files. A move unregisters the old folder, which stays as an ordinary folder
+with the files already downloaded.
+
+The app asks the running service for its status through a named pipe,
+`opencfdrive-<hash>` (the same hash as the state database), which only the
+same user can open. A request is one line, `status` or `stop`; the answer is
+one line of JSON.
 
 ### State location
 
@@ -506,13 +549,14 @@ file with default icons rather than a cloud badge.
 
 | Project / file | Purpose |
 | --- | --- |
-| `OpenCfDrive.Core` | Cloud Files interop, rclone clients, sync engine, SQLite metadata |
+| `OpenCfDrive.Core` | Cloud Files interop, rclone clients, sync engine, SQLite metadata, settings, and the status channel |
+| `OpenCfDrive.App` | The app (`OpenCfDrive.exe`): settings and status, behind a notification area icon; starts and stops the service |
 | `OpenCfDrive.Service` | The background service that registers and serves the sync root |
 | `OpenCfDrive.MockService` | Test host: same engine in mock mode over a plain folder |
 | `OpenCfDrive.Tests` | Unit and contract tests (interop layout, Cloud Files behaviour, SQLite, rclone API) |
 | `scripts\drive` | Using the drive: `Install-`, `Start-` and `Uninstall-OpenCfDrive.ps1`, plus `Setup-OpenCfDrive-Environment.ps1` (optional local demo backend: `rclone serve webdav` + `rclone rcd`) |
 | `scripts\tests` | End-to-end tests: `E2E-Run.ps1`, `E2E-Run-S3.ps1`, `E2E-Run-Mock.ps1`, with the shared harness `E2E-Common.ps1` and scenario matrix `E2E-Scenarios.ps1` |
-| `assets` | The logo (`logo.svg`, the source), `opencfdrive.ico` (the service's icon, which Explorer also shows for the drive), and `logo-64.png` (the `.exe` installer's logo) |
+| `assets` | The logo (`logo.svg`, the source), `opencfdrive.ico` (the app's and the service's icon, which Explorer also shows for the drive), and `logo-64.png` (the `.exe` installer's logo) |
 | `scripts\assets` | `Build-Icon.ps1`: rebuilds `opencfdrive.ico` and `logo-64.png` from `logo.svg` (rendered by Microsoft Edge) |
 | `installer` | `Build-Installer.ps1`, the WiX projects for the MSI (`msi`) and the `.exe` bootstrapper (`bundle`), and the third-party notices installed with the app |
 | `.github` | The Test and Release workflows and their shared setup step |
