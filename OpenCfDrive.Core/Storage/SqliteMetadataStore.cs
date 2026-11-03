@@ -13,6 +13,15 @@ public sealed class SqliteMetadataStore
 
     public string DbPath => _dbPath;
 
+    /// <summary>Deletes a state database and its SQLite side files.</summary>
+    public static void Delete(string dbPath)
+    {
+        foreach (var path in new[] { dbPath, dbPath + "-journal", dbPath + "-wal", dbPath + "-shm" })
+        {
+            File.Delete(path);
+        }
+    }
+
     public void Initialize()
     {
         var dir = Path.GetDirectoryName(_dbPath);

@@ -1,36 +1,100 @@
+using System.ComponentModel;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using OpenCfDrive.Core.Configuration;
+using OpenCfDrive.Core.Services;
 
 namespace OpenCfDrive.App;
 
-/// <summary>What rclone's remote control answered.</summary>
-/// <param name="Answers">Something answered at the URL.</param>
-/// <param name="Usable">The service can use it: it answers and lets OpenCfDrive in.</param>
+/// <summary>
+/// How the app reaches rclone: through the rclone program OpenCfDrive runs
+/// (the default; the app runs it directly, so this works before the service
+/// starts), or through a remote control the user runs at <paramref name="RcUrl"/>.
+/// </summary>
+internal sealed record RcloneAccess(bool Managed, string? ChosenProgram, string? ConfigPath, string RcUrl)
+{
+    public static RcloneAccess From(EffectiveSettings settings) =>
+        new(settings.ManageRclone, settings.RclonePath, settings.RcloneConfig, settings.RcUrl.Value);
+
+    /// <summary>Two probes with the same key asked the same rclone.</summary>
+    public string Key => Managed ? $"run|{ChosenProgram}|{ConfigPath}" : $"url|{RcUrl}";
+}
+
+/// <summary>What rclone answered.</summary>
+/// <param name="Answers">The program runs, or something answered at the URL.</param>
+/// <param name="Usable">The service can use it: it runs and reads its config, or answers and lets OpenCfDrive in.</param>
 /// <param name="Remotes">The remotes in rclone's config, when it listed them.</param>
+/// <param name="Program">The rclone program OpenCfDrive would run, and how it was found.</param>
+/// <param name="ConfigFile">The config file that program reads.</param>
 internal sealed record RcloneProbeResult(
-    string RcUrl,
+    string Key,
     bool Answers,
     bool Usable,
     string? Version,
     string? Problem,
-    IReadOnlyList<string>? Remotes);
+    IReadOnlyList<string>? Remotes,
+    RcloneProgram? Program = null,
+    string? ConfigFile = null);
 
 /// <summary>
-/// Asks rclone's remote control what the service needs: that it answers, and
-/// which remotes its config has. The app never starts rclone; whoever runs
-/// rclone rcd does.
+/// Asks rclone what the service needs: that it runs, and which remotes its
+/// config has; and, for one remote, what it is and how much space it has.
 /// </summary>
 internal static class RcloneProbe
 {
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(3) };
+    private static readonly HttpClient SlowHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
 
-    public static async Task<RcloneProbeResult> CheckAsync(string rcUrl)
+    public static Task<RcloneProbeResult> CheckAsync(RcloneAccess access) =>
+        access.Managed ? CheckProgramAsync(access) : CheckRemoteControlAsync(access);
+
+    private static async Task<RcloneProbeResult> CheckProgramAsync(RcloneAccess access)
     {
+        var program = RcloneLocator.Find(access.ChosenProgram);
+        if (program is null)
+        {
+            return new RcloneProbeResult(access.Key, false, false, null,
+                access.ChosenProgram is null
+                    ? "rclone was not found: it is not on PATH, and none was downloaded."
+                    : $"There is no rclone at '{access.ChosenProgram}'.",
+                null);
+        }
+
+        var cli = new RcloneCli(program.Path, access.ConfigPath);
+        try
+        {
+            var version = await cli.VersionAsync();
+            if (version is null)
+            {
+                return new RcloneProbeResult(access.Key, false, false, null, $"'{program.Path}' does not run as rclone.", null, program);
+            }
+
+            var configFile = await cli.ConfigFileAsync();
+            try
+            {
+                return new RcloneProbeResult(access.Key, true, true, version, null, await cli.ListRemotesAsync(), program, configFile);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return new RcloneProbeResult(access.Key, true, false, version,
+                    $"rclone cannot read its config: {ex.Message}", null, program, configFile);
+            }
+        }
+        catch (Win32Exception ex)
+        {
+            return new RcloneProbeResult(access.Key, false, false, null, $"'{program.Path}' does not run: {ex.Message}", null, program);
+        }
+    }
+
+    private static async Task<RcloneProbeResult> CheckRemoteControlAsync(RcloneAccess access)
+    {
+        var rcUrl = access.RcUrl;
+        var key = access.Key;
         if (!Uri.TryCreate(rcUrl, UriKind.Absolute, out var baseUri) || baseUri.Scheme is not ("http" or "https"))
         {
-            return new RcloneProbeResult(rcUrl, false, false, null, "This is not an http:// or https:// address.", null);
+            return new RcloneProbeResult(key, false, false, null, "This is not an http:// or https:// address.", null);
         }
 
         string? version;
@@ -39,13 +103,13 @@ internal static class RcloneProbe
             using var response = await PostAsync(baseUri, "core/version");
             if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
             {
-                return new RcloneProbeResult(rcUrl, true, false, null,
+                return new RcloneProbeResult(key, true, false, null,
                     "rclone asks for a login, which OpenCfDrive does not send. Run rclone rcd with --rc-no-auth.", null);
             }
 
             if (!response.IsSuccessStatusCode)
             {
-                return new RcloneProbeResult(rcUrl, true, false, null,
+                return new RcloneProbeResult(key, true, false, null,
                     $"It answered {(int)response.StatusCode} {response.ReasonPhrase}; is this rclone's remote control?", null);
             }
 
@@ -53,12 +117,11 @@ internal static class RcloneProbe
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
         {
-            return new RcloneProbeResult(rcUrl, false, false, null,
-                "Nothing answers there. Is rclone rcd running?", null);
+            return new RcloneProbeResult(key, false, false, null, "Nothing answers there. Is rclone rcd running?", null);
         }
         catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
         {
-            return new RcloneProbeResult(rcUrl, true, false, null, "It answered, but not like rclone does.", null);
+            return new RcloneProbeResult(key, true, false, null, "It answered, but not like rclone does.", null);
         }
 
         // Listing remotes needs the same access as syncing: rclone allows it
@@ -70,18 +133,18 @@ internal static class RcloneProbe
             if (!response.IsSuccessStatusCode)
             {
                 var error = body.TryGetProperty("error", out var e) ? e.GetString() : response.ReasonPhrase;
-                return new RcloneProbeResult(rcUrl, true, false, version,
+                return new RcloneProbeResult(key, true, false, version,
                     $"rclone refuses OpenCfDrive's requests ({error}). Run rclone rcd with --rc-no-auth.", null);
             }
 
             var remotes = body.TryGetProperty("remotes", out var list) && list.ValueKind == JsonValueKind.Array
                 ? list.EnumerateArray().Select(r => r.GetString() ?? "").Where(r => r.Length > 0).ToList()
                 : [];
-            return new RcloneProbeResult(rcUrl, true, true, version, null, remotes);
+            return new RcloneProbeResult(key, true, true, version, null, remotes);
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
-            return new RcloneProbeResult(rcUrl, true, false, version, $"Listing rclone's remotes failed: {ex.Message}", null);
+            return new RcloneProbeResult(key, true, false, version, $"Listing rclone's remotes failed: {ex.Message}", null);
         }
     }
 
@@ -103,7 +166,42 @@ internal static class RcloneProbe
     /// The space comes from the server itself, so this is asked for when a
     /// remote is chosen or the window opens, not on every refresh.
     /// </summary>
-    public static async Task<RemoteInfo> DescribeAsync(string rcUrl, string remote)
+    public static Task<RemoteInfo> DescribeAsync(RcloneAccess access, string remote) =>
+        access.Managed ? DescribeWithProgramAsync(access, remote) : DescribeWithRemoteControlAsync(access.RcUrl, remote);
+
+    private static async Task<RemoteInfo> DescribeWithProgramAsync(RcloneAccess access, string remote)
+    {
+        if (RcloneLocator.Find(access.ChosenProgram) is not { } program)
+        {
+            return new RemoteInfo(remote, null, null, null, "rclone was not found.");
+        }
+
+        var cli = new RcloneCli(program.Path, access.ConfigPath);
+        string? kind = null;
+        try
+        {
+            if (RemoteName(remote) is { } name)
+            {
+                if (await cli.RemoteConfigAsync(name) is not { } config || !config.TryGetProperty("type", out var type))
+                {
+                    return new RemoteInfo(remote, null, null, null, $"\"{name}\" is not in rclone's config.");
+                }
+
+                kind = Kind(type.GetString() ?? "", config);
+            }
+
+            var (about, error) = await cli.AboutAsync(remote);
+            return about is { } space
+                ? new RemoteInfo(remote, kind, SpaceOf(space), null, null)
+                : new RemoteInfo(remote, kind, null, SpaceProblem(error ?? ""), null);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or JsonException)
+        {
+            return new RemoteInfo(remote, kind, null, null, $"rclone could not describe it: {ex.Message}");
+        }
+    }
+
+    private static async Task<RemoteInfo> DescribeWithRemoteControlAsync(string rcUrl, string remote)
     {
         if (!Uri.TryCreate(rcUrl, UriKind.Absolute, out var baseUri))
         {
@@ -149,21 +247,29 @@ internal static class RcloneProbe
             if (!response.IsSuccessStatusCode)
             {
                 var error = about.TryGetProperty("error", out var e) ? e.GetString() ?? "" : "";
-                var unsupported = error.Contains("doesn't support", StringComparison.OrdinalIgnoreCase) ||
-                                  error.Contains("not supported", StringComparison.OrdinalIgnoreCase);
-                return new RemoteInfo(remote, kind, null,
-                    unsupported ? "Not reported by this kind of remote." : $"rclone could not ask the server: {error}", null);
+                return new RemoteInfo(remote, kind, null, SpaceProblem(error), null);
             }
 
-            long? Number(string property) =>
-                about.TryGetProperty(property, out var value) && value.TryGetInt64(out var number) ? number : null;
-            return new RemoteInfo(remote, kind, new RemoteSpace(Number("total"), Number("used"), Number("free")), null, null);
+            return new RemoteInfo(remote, kind, SpaceOf(about), null, null);
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
             return new RemoteInfo(remote, kind, null, "The server did not say in time how much space it has.", null);
         }
     }
+
+    private static RemoteSpace SpaceOf(JsonElement about)
+    {
+        long? Number(string property) =>
+            about.TryGetProperty(property, out var value) && value.TryGetInt64(out var number) ? number : null;
+        return new RemoteSpace(Number("total"), Number("used"), Number("free"));
+    }
+
+    private static string SpaceProblem(string error) =>
+        error.Contains("doesn't support", StringComparison.OrdinalIgnoreCase) ||
+        error.Contains("not supported", StringComparison.OrdinalIgnoreCase)
+            ? "Not reported by this kind of remote."
+            : $"rclone could not ask the server: {error}";
 
     /// <summary>
     /// "webdav (other) at https://dav.example.com/", "crypt over gdrive:secret".
@@ -200,8 +306,6 @@ internal static class RcloneProbe
 
         return kind.ToString();
     }
-
-    private static readonly HttpClient SlowHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
 
     private static Task<HttpResponseMessage> PostAsync(Uri baseUri, string command, object? body = null, HttpClient? http = null) =>
         (http ?? Http).PostAsync(

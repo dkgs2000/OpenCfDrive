@@ -1,3 +1,5 @@
+using OpenCfDrive.Core.Services;
+
 namespace OpenCfDrive.App;
 
 /// <summary>
@@ -22,6 +24,7 @@ internal static class Program
             if (Has(args, "--uninstall"))
             {
                 SignInStartup.Disable();
+                RemoveDownloadedRclone();
             }
 
             return 0;
@@ -42,4 +45,25 @@ internal static class Program
     }
 
     private static bool Has(string[] args, string option) => args.Contains(option, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The rclone OpenCfDrive downloaded goes with it (the installer stops the
+    /// service, and the rclone it runs, first). Settings, state and logs stay.
+    /// </summary>
+    private static void RemoveDownloadedRclone()
+    {
+        // Windows may take a moment to end the rclone the stopped service ran.
+        for (var attempt = 1; attempt <= 10 && Directory.Exists(RcloneLocator.DownloadFolder); attempt++)
+        {
+            try
+            {
+                Directory.Delete(RcloneLocator.DownloadFolder, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Still in use; harmless if it stays, it is only a program.
+                Thread.Sleep(500);
+            }
+        }
+    }
 }

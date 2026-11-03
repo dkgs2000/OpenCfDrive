@@ -1,6 +1,7 @@
 using System.Globalization;
 using OpenCfDrive.Core.Configuration;
 using OpenCfDrive.Core.Control;
+using OpenCfDrive.Core.Services;
 using OpenCfDrive.Core.Storage;
 
 namespace OpenCfDrive.App;
@@ -29,6 +30,8 @@ internal sealed class MainForm : Form
     private readonly LinkLabel _folder = new() { AutoSize = true, Margin = ValueMargin };
     private readonly Label _remote = ValueLabel();
     private readonly Label _items = ValueLabel();
+    private readonly Label _rcloneRunBy = ValueLabel();
+    private readonly Label _rcloneProgram = ValueLabel();
     private readonly Label _rcUrl = ValueLabel();
     private readonly Label _rcloneState = ValueLabel();
     private readonly Label _rcloneRemote = ValueLabel();
@@ -38,6 +41,7 @@ internal sealed class MainForm : Form
     private readonly Button _stop = ActionButton("Stop");
     private readonly Button _restart = ActionButton("Restart");
     private readonly Button _viewLog = ActionButton("View log");
+    private readonly Button _viewRcloneLog = ActionButton("rclone's log");
     private readonly ListView _activity = new()
     {
         Dock = DockStyle.Fill,
@@ -51,6 +55,27 @@ internal sealed class MainForm : Form
     private readonly TextBox _folderBox = new() { Dock = DockStyle.Fill, AccessibleName = "Drive folder" };
     private readonly ComboBox _remoteBox = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDown, AccessibleName = "rclone remote" };
     private readonly TextBox _rcUrlBox = new() { Dock = DockStyle.Fill, AccessibleName = "rclone remote control" };
+    private readonly RadioButton _manageRclone = new() { Text = "OpenCfDrive runs it", AutoSize = true, Checked = true };
+    private readonly RadioButton _ownRclone = new() { Text = "I run rclone rcd myself", AutoSize = true };
+    private readonly TextBox _programBox = new()
+    {
+        Dock = DockStyle.Fill,
+        AccessibleName = "rclone program",
+        PlaceholderText = "Find it: on PATH, else the copy downloaded from rclone.org",
+    };
+    private readonly TextBox _configBox = new()
+    {
+        Dock = DockStyle.Fill,
+        AccessibleName = "rclone config file",
+        PlaceholderText = "rclone's own default",
+    };
+    private readonly Label _programNote = Hint("");
+    private readonly Label _configNote = Hint("");
+    private readonly Button _download = ActionButton("Download rclone from rclone.org");
+    private readonly Button _test = ActionButton("Test");
+    private readonly Label _downloadProgress = new() { AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = SystemColors.GrayText };
+    private readonly Label _rcdHint = Hint("Where your rclone rcd listens. Run it with --rc-serve and --rc-no-auth, for example:");
+    private readonly System.Windows.Forms.Timer _checkSoon = new() { Interval = 800 };
     private readonly Label _rcTest = Hint("");
     private readonly Label _remoteDetails = Hint("");
     private readonly System.Windows.Forms.Timer _describeSoon = new() { Interval = 600 };
@@ -64,7 +89,7 @@ internal sealed class MainForm : Form
 
     private DriveSnapshot? _snapshot;
     private string? _busy;
-    private (string Folder, string Remote, string RcUrl, bool SignIn)? _loaded;
+    private FieldSet? _loaded;
     private bool _loading;
     private bool _exiting;
     private (int Count, DateTimeOffset Last) _shownActivity;
@@ -199,9 +224,10 @@ internal sealed class MainForm : Form
         _stop.Click += async (_, _) => await _app.StopAsync();
         _restart.Click += async (_, _) => await _app.RestartAsync();
         _viewLog.Click += (_, _) => _app.OpenLog();
+        _viewRcloneLog.Click += (_, _) => _app.OpenRcloneLog();
 
         var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top, Margin = new Padding(0, 6, 0, 0), WrapContents = false };
-        buttons.Controls.AddRange([_start, _stop, _restart, _viewLog]);
+        buttons.Controls.AddRange([_start, _stop, _restart, _viewLog, _viewRcloneLog]);
 
         var service = Grid(
             ("Service", _service),
@@ -214,6 +240,8 @@ internal sealed class MainForm : Form
         serviceBox.Controls.Add(buttons);
 
         var rclone = Grid(
+            ("Run by", _rcloneRunBy),
+            ("Program", _rcloneProgram),
             ("Remote control", _rcUrl),
             ("Status", _rcloneState),
             ("Remote", _rcloneRemote),
@@ -241,8 +269,7 @@ internal sealed class MainForm : Form
         browse.Click += (_, _) => BrowseForFolder();
         var refresh = ActionButton("Refresh list");
         refresh.Click += async (_, _) => await TestRcloneAsync(fillRemotes: true);
-        var test = ActionButton("Test");
-        test.Click += async (_, _) => await TestRcloneAsync(fillRemotes: true);
+        _test.Click += async (_, _) => await TestRcloneAsync(fillRemotes: true);
         _save.Click += async (_, _) => await SaveAsync();
         _discard.Click += (_, _) =>
         {
@@ -252,26 +279,48 @@ internal sealed class MainForm : Form
             }
         };
 
-        foreach (var input in new Control[] { _folderBox, _remoteBox, _rcUrlBox })
+        var browseProgram = ActionButton("Browse...");
+        browseProgram.Click += (_, _) => BrowseForFile(_programBox, "Choose rclone.exe", "rclone|rclone.exe|Programs|*.exe");
+        var browseConfig = ActionButton("Browse...");
+        browseConfig.Click += (_, _) => BrowseForFile(_configBox, "Choose rclone's config file", "rclone config|*.conf|All files|*.*");
+        _download.Click += async (_, _) => await DownloadRcloneAsync();
+
+        foreach (var input in new Control[] { _folderBox, _remoteBox, _rcUrlBox, _programBox, _configBox })
         {
             input.TextChanged += (_, _) => ClearSaveResult();
         }
 
         _rcUrlBox.TextChanged += (_, _) => ShowRcdCommand();
         _signIn.CheckedChanged += (_, _) => ClearSaveResult();
+        _manageRclone.CheckedChanged += (_, _) =>
+        {
+            ClearSaveResult();
+            ShowRcloneMode();
+        };
         _rcTest.Visible = false; // until Test is pressed
 
-        // The chosen remote's details, once typing pauses.
-        foreach (var input in new Control[] { _remoteBox, _rcUrlBox })
+        // The chosen remote's details, and the chosen rclone, once typing pauses.
+        foreach (var input in new Control[] { _remoteBox, _rcUrlBox, _programBox, _configBox })
         {
             input.TextChanged += (_, _) => DescribeSoon();
         }
 
+        foreach (var input in new Control[] { _rcUrlBox, _programBox, _configBox })
+        {
+            input.TextChanged += (_, _) => CheckSoon();
+        }
+
+        _manageRclone.CheckedChanged += (_, _) => CheckSoon();
         _remoteBox.SelectedIndexChanged += (_, _) => DescribeSoon();
         _describeSoon.Tick += async (_, _) =>
         {
             _describeSoon.Stop();
             await DescribeTypedRemoteAsync();
+        };
+        _checkSoon.Tick += async (_, _) =>
+        {
+            _checkSoon.Stop();
+            await TestRcloneAsync(fillRemotes: true);
         };
         _rcdCommand.BackColor = SystemColors.Control;
         _rcdCommand.Font = new Font(FontFamily.GenericMonospace, Font.SizeInPoints);
@@ -305,26 +354,61 @@ internal sealed class MainForm : Form
             row++;
         }
 
+        var mode = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 3, 0, 3) };
+        mode.Controls.AddRange([_manageRclone, _ownRclone]);
+        var download = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 0, 0, 6) };
+        download.Controls.AddRange([_download, _downloadProgress]);
+
         Row("Drive folder", _folderBox, browse);
         Note(Hint("Where the drive appears in Explorer. Moving it needs a new or empty folder; the old one stays " +
                   "as an ordinary folder with the files already downloaded."));
+        Row("rclone", mode, new Label { AutoSize = true });
+        Row("rclone program", _programBox, browseProgram);
+        Note(_programNote);
+        Note(download);
+        Row("rclone config", _configBox, browseConfig);
+        Note(_configNote);
+        Row("Remote control", _rcUrlBox, _test);
+        Note(_rcTest);
+        Note(_rcdHint);
+        Note(_rcdCommand);
         Row("rclone remote", _remoteBox, refresh);
         Note(_remoteDetails);
         Note(Hint("A remote in rclone's config, optionally with a path: myremote: or myremote:backup. " +
-                  "Another remote needs a new or empty drive folder."));
-        Row("rclone remote control", _rcUrlBox, test);
-        Note(_rcTest);
-        Note(Hint("Where rclone rcd listens. OpenCfDrive does not start rclone; run it yourself, for example:"));
-        Note(_rcdCommand);
+                  "Another remote needs a new or empty drive folder. Create remotes with: rclone config"));
         Note(_signIn);
         Note(_overrides);
         Note(_settingsFile);
 
-        var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Bottom, WrapContents = false };
+        var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0, 8, 0, 0) };
         buttons.Controls.AddRange([_save, _discard, _saveResult]);
 
-        _settingsTab.Controls.Add(grid);
-        _settingsTab.Controls.Add(buttons);
+        // The fields scroll; Save stays in view.
+        var fields = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
+        fields.Controls.Add(grid);
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.Controls.Add(fields, 0, 0);
+        layout.Controls.Add(buttons, 0, 1);
+        _settingsTab.Controls.Add(layout);
+        ShowRcloneMode();
+    }
+
+    /// <summary>The fields that matter for the chosen way of running rclone.</summary>
+    private void ShowRcloneMode()
+    {
+        var managed = _manageRclone.Checked;
+        _programBox.Enabled = managed;
+        _configBox.Enabled = managed;
+        _download.Enabled = managed && _busy is null;
+        _rcUrlBox.Enabled = !managed;
+        _test.Enabled = !managed;
+        _rcdHint.Visible = !managed;
+        _rcdCommand.Visible = !managed;
+        _programNote.Visible = managed;
+        _configNote.Visible = managed;
+        _rcTest.Visible = !managed && _rcTest.Text.Length > 0;
     }
 
     // --- showing the state -------------------------------------------------
@@ -364,6 +448,7 @@ internal sealed class MainForm : Form
         _stop.Enabled = idle && snapshot.Running;
         _restart.Enabled = idle && snapshot.Running;
         _save.Enabled = idle;
+        _download.Enabled = idle && _manageRclone.Checked;
 
         if (!Edited)
         {
@@ -407,21 +492,53 @@ internal sealed class MainForm : Form
     private void ShowRclone(DriveSnapshot snapshot)
     {
         var rclone = snapshot.Rclone;
-        _rcUrl.Text = snapshot.Status?.RcUrl ?? snapshot.Settings.RcUrl.Value;
         _remoteKind.Text = "-";
         _remoteSpace.Text = "-";
+
+        // The rclone the running service runs, else the one it would run.
+        var own = snapshot.Status?.Rclone;
+        if (own?.Managed ?? snapshot.Settings.ManageRclone)
+        {
+            _rcloneRunBy.Text = own?.ProcessId is { } pid ? $"OpenCfDrive (process {pid})" : "OpenCfDrive, while the service runs";
+            var program = own?.Program ?? rclone?.Program?.Path;
+            var source = own?.Source ?? rclone?.Program?.Source.ToString();
+            var version = own?.Version ?? rclone?.Version;
+            _rcloneProgram.Text = program is null
+                ? rclone?.Problem ?? "Not found."
+                : $"{program} ({SourceText(source)}{(version is null ? "" : $", {version}")})";
+            _rcloneProgram.ForeColor = program is null && rclone is not null ? ProblemColor : SystemColors.ControlText;
+            _rcUrl.Text = own is { Url.Length: > 0 } ? own.Url : "-";
+            (_rcloneState.Text, _rcloneState.ForeColor) = own is not null
+                ? (own.Detail, own.State switch
+                {
+                    "Running" => GoodColor,
+                    "Starting" or "Restarting" => BusyColor,
+                    _ => ProblemColor,
+                })
+                : rclone is null
+                    ? ("Checking...", SystemColors.ControlText)
+                    : rclone.Usable
+                        ? ("Not running: the sync service starts it.", SystemColors.ControlText)
+                        : (rclone.Problem ?? "Does not run.", ProblemColor);
+        }
+        else
+        {
+            _rcloneRunBy.Text = "You (rclone rcd)";
+            _rcloneProgram.Text = "-";
+            _rcloneProgram.ForeColor = SystemColors.ControlText;
+            _rcUrl.Text = own?.Url ?? snapshot.Settings.RcUrl.Value;
+            (_rcloneState.Text, _rcloneState.ForeColor) = rclone is null
+                ? ("Checking...", SystemColors.ControlText)
+                : rclone.Usable
+                    ? ($"Answers (rclone {rclone.Version})", GoodColor)
+                    : (rclone.Problem ?? "Does not answer.", ProblemColor);
+        }
+
         if (rclone is null)
         {
-            _rcloneState.Text = "Checking...";
-            _rcloneState.ForeColor = SystemColors.ControlText;
             _rcloneRemote.Text = "-";
             return;
         }
-
-        _rcloneState.Text = rclone.Usable
-            ? $"Answers (rclone {rclone.Version})"
-            : rclone.Problem ?? "Does not answer.";
-        _rcloneState.ForeColor = rclone.Usable ? GoodColor : ProblemColor;
 
         var remote = snapshot.Remote;
         var name = RcloneProbe.RemoteName(remote);
@@ -484,6 +601,14 @@ internal sealed class MainForm : Form
             : text;
     }
 
+    private static string SourceText(string? source) => source switch
+    {
+        nameof(RcloneSource.Chosen) => "chosen in Settings",
+        nameof(RcloneSource.Path) => "found on PATH",
+        nameof(RcloneSource.Downloaded) => "downloaded from rclone.org",
+        _ => "found",
+    };
+
     private void DescribeSoon()
     {
         if (!_loading)
@@ -493,11 +618,29 @@ internal sealed class MainForm : Form
         }
     }
 
+    private void CheckSoon()
+    {
+        if (!_loading)
+        {
+            _checkSoon.Stop();
+            _checkSoon.Start();
+        }
+    }
+
+    /// <summary>The rclone the Settings fields describe, before they are saved.</summary>
+    private RcloneAccess FormAccess() => new(
+        _manageRclone.Checked,
+        Blank(_programBox.Text),
+        Blank(_configBox.Text),
+        _rcUrlBox.Text.Trim());
+
+    private static string? Blank(string text) => string.IsNullOrWhiteSpace(text) ? null : text.Trim();
+
     /// <summary>Describes the remote typed in Settings, so it can be checked before saving.</summary>
     private async Task DescribeTypedRemoteAsync()
     {
         var remote = _remoteBox.Text.Trim();
-        var rcUrl = _rcUrlBox.Text.Trim();
+        var access = FormAccess();
         if (remote.Length == 0)
         {
             _remoteDetails.Text = "";
@@ -505,7 +648,8 @@ internal sealed class MainForm : Form
         }
 
         var normalized = SyncStatePaths.NormalizeRemote(remote);
-        if (_snapshot?.RemoteInfo is { } known && known.Remote == normalized && rcUrl == _snapshot.Settings.RcUrl.Value)
+        if (_snapshot?.RemoteInfo is { } known && known.Remote == normalized &&
+            access == RcloneAccess.From(_snapshot.Settings))
         {
             ShowRemoteDetails(known);
             return;
@@ -513,8 +657,8 @@ internal sealed class MainForm : Form
 
         _remoteDetails.Text = "Asking rclone about it...";
         _remoteDetails.ForeColor = SystemColors.GrayText;
-        var info = await RcloneProbe.DescribeAsync(rcUrl, normalized);
-        if (_remoteBox.Text.Trim() == remote && _rcUrlBox.Text.Trim() == rcUrl)
+        var info = await RcloneProbe.DescribeAsync(access, normalized);
+        if (_remoteBox.Text.Trim() == remote && FormAccess() == access)
         {
             ShowRemoteDetails(info);
         }
@@ -622,6 +766,10 @@ internal sealed class MainForm : Form
             _folderBox.Text = saved.SyncRoot ?? snapshot.Settings.SyncRoot.Value;
             _remoteBox.Text = saved.Remote ?? "";
             _rcUrlBox.Text = saved.RcUrl ?? DriveSettingsFile.DefaultRcUrl;
+            _manageRclone.Checked = saved.ManageRclone != false;
+            _ownRclone.Checked = saved.ManageRclone == false;
+            _programBox.Text = saved.RclonePath ?? "";
+            _configBox.Text = saved.RcloneConfig ?? "";
             _signIn.Checked = SignInStartup.IsEnabled;
             if (snapshot.Rclone?.Remotes is { } remotes)
             {
@@ -629,6 +777,12 @@ internal sealed class MainForm : Form
             }
 
             ShowRcdCommand();
+            ShowRcloneMode();
+            if (snapshot.Rclone is { } probe && probe.Key == FormAccess().Key)
+            {
+                ShowRcloneCheck(probe);
+            }
+
             _loaded = FieldValues;
 
             // What the monitor already knows about this remote, or ask once.
@@ -652,8 +806,12 @@ internal sealed class MainForm : Form
         }
     }
 
-    private (string Folder, string Remote, string RcUrl, bool SignIn) FieldValues =>
-        (_folderBox.Text, _remoteBox.Text, _rcUrlBox.Text, _signIn.Checked);
+    /// <summary>What the Settings fields hold, to tell whether the user changed any.</summary>
+    private sealed record FieldSet(
+        string Folder, string Remote, string RcUrl, bool SignIn, bool ManageRclone, string Program, string Config);
+
+    private FieldSet FieldValues => new(
+        _folderBox.Text, _remoteBox.Text, _rcUrlBox.Text, _signIn.Checked, _manageRclone.Checked, _programBox.Text, _configBox.Text);
 
     /// <summary>The fields differ from what was loaded into them: the user is editing.</summary>
     private bool Edited => _loaded is { } loaded && loaded != FieldValues;
@@ -701,20 +859,73 @@ internal sealed class MainForm : Form
         }
     }
 
+    private void BrowseForFile(TextBox box, string title, string filter)
+    {
+        using var dialog = new OpenFileDialog { Title = title, Filter = filter, CheckFileExists = true };
+        if (File.Exists(box.Text.Trim()))
+        {
+            dialog.InitialDirectory = Path.GetDirectoryName(box.Text.Trim());
+        }
+
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            box.Text = dialog.FileName;
+        }
+    }
+
+    /// <summary>Checks the rclone the Settings fields describe, and lists its remotes.</summary>
     private async Task TestRcloneAsync(bool fillRemotes)
     {
-        _rcTest.Visible = true;
-        _rcTest.Text = "Asking rclone...";
-        _rcTest.ForeColor = SystemColors.GrayText;
-        var result = await RcloneProbe.CheckAsync(_rcUrlBox.Text.Trim());
-        _rcTest.Text = result.Usable
-            ? $"rclone {result.Version} answers, with {result.Remotes!.Count} remote(s) in its config."
-            : result.Problem;
-        _rcTest.ForeColor = result.Usable ? GoodColor : ProblemColor;
+        var access = FormAccess();
+        var note = access.Managed ? _programNote : _rcTest;
+        note.Visible = true;
+        note.Text = access.Managed ? "Looking for rclone..." : "Asking rclone...";
+        note.ForeColor = SystemColors.GrayText;
+        var result = await RcloneProbe.CheckAsync(access);
+        if (FormAccess() != access)
+        {
+            return; // the fields changed meanwhile; their own check follows
+        }
+
+        ShowRcloneCheck(result);
         if (fillRemotes && result.Remotes is { } remotes)
         {
             FillRemotes(remotes);
         }
+    }
+
+    private void ShowRcloneCheck(RcloneProbeResult result)
+    {
+        if (_manageRclone.Checked)
+        {
+            _programNote.Text = result.Program is { } program
+                ? result.Usable
+                    ? $"Runs {program.Path} ({SourceText(program.Source.ToString())}, {result.Version}), with " +
+                      $"{result.Remotes!.Count} remote(s) in its config."
+                    : result.Problem
+                : $"{result.Problem} Install rclone, choose rclone.exe, or download it here.";
+            _programNote.ForeColor = result.Usable ? GoodColor : ProblemColor;
+            _configNote.Text = result.ConfigFile is { } file ? $"rclone reads {file}" : "";
+            return;
+        }
+
+        _rcTest.Visible = true;
+        _rcTest.Text = result.Usable
+            ? $"rclone {result.Version} answers, with {result.Remotes!.Count} remote(s) in its config."
+            : result.Problem;
+        _rcTest.ForeColor = result.Usable ? GoodColor : ProblemColor;
+    }
+
+    private async Task DownloadRcloneAsync()
+    {
+        _download.Enabled = false;
+        var progress = new Progress<string>(line => _downloadProgress.Text = line);
+        var problem = await _app.DownloadRcloneAsync(progress);
+        _downloadProgress.Text = problem ?? $"Downloaded into {RcloneLocator.DownloadFolder}.";
+        _downloadProgress.ForeColor = problem is null ? GoodColor : ProblemColor;
+        _downloadProgress.MaximumSize = new Size(Math.Max(200, _settingsTab.ClientSize.Width - _download.Width - 80), 0);
+        _download.Enabled = _manageRclone.Checked;
+        await TestRcloneAsync(fillRemotes: true);
     }
 
     private async Task SaveAsync()
@@ -727,6 +938,9 @@ internal sealed class MainForm : Form
         var root = _folderBox.Text.Trim();
         var remote = _remoteBox.Text.Trim();
         var rcUrl = _rcUrlBox.Text.Trim();
+        var managed = _manageRclone.Checked;
+        var program = Blank(_programBox.Text);
+        var config = Blank(_configBox.Text);
 
         string? invalid = null;
         if (!Path.IsPathFullyQualified(root))
@@ -737,7 +951,15 @@ internal sealed class MainForm : Form
         {
             invalid = "Choose an rclone remote, like myremote:.";
         }
-        else if (!Uri.TryCreate(rcUrl, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+        else if (managed && program is not null && !File.Exists(program))
+        {
+            invalid = $"There is no rclone program at {program}.";
+        }
+        else if (managed && config is not null && !File.Exists(config))
+        {
+            invalid = $"There is no rclone config file at {config}.";
+        }
+        else if (!managed && (!Uri.TryCreate(rcUrl, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https")))
         {
             invalid = "The remote control address must be an http:// address, like http://127.0.0.1:5572.";
         }
@@ -753,6 +975,9 @@ internal sealed class MainForm : Form
             SyncRoot = root,
             Remote = remote,
             RcUrl = rcUrl,
+            ManageRclone = managed,
+            RclonePath = program,
+            RcloneConfig = config,
             StartAtSignIn = _signIn.Checked,
         };
         var before = snapshot.Settings;

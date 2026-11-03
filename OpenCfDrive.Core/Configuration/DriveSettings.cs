@@ -17,7 +17,19 @@ public sealed record DriveSettings
     /// <summary>The rclone remote spec, e.g. "myremote:" or "myremote:backup".</summary>
     public string? Remote { get; init; }
 
-    /// <summary>The base URL of rclone's remote control (rclone rcd).</summary>
+    /// <summary>
+    /// Whether OpenCfDrive runs rclone's remote control itself (the default),
+    /// or uses one the user runs at <see cref="RcUrl"/>.
+    /// </summary>
+    public bool? ManageRclone { get; init; }
+
+    /// <summary>The rclone program OpenCfDrive runs; null finds one (see RcloneLocator).</summary>
+    public string? RclonePath { get; init; }
+
+    /// <summary>The rclone config file it runs with; null is rclone's own default.</summary>
+    public string? RcloneConfig { get; init; }
+
+    /// <summary>The base URL of an rclone remote control the user runs (rclone rcd).</summary>
     public string? RcUrl { get; init; }
 
     /// <summary>Whether the app starts when the user signs in to Windows.</summary>
@@ -35,7 +47,16 @@ public enum SettingSource
 public sealed record EffectiveSetting(string Value, SettingSource Source, string EnvironmentVariable);
 
 /// <summary>The settings the service runs with.</summary>
-public sealed record EffectiveSettings(EffectiveSetting SyncRoot, EffectiveSetting Remote, EffectiveSetting RcUrl)
+/// <param name="ManageRclone">OpenCfDrive runs rclone itself; otherwise it uses the one at <paramref name="RcUrl"/>.</param>
+/// <param name="RclonePath">The rclone program chosen (environment or settings), or null to find one.</param>
+/// <param name="RcloneConfig">The rclone config file chosen, or null for rclone's default.</param>
+public sealed record EffectiveSettings(
+    EffectiveSetting SyncRoot,
+    EffectiveSetting Remote,
+    EffectiveSetting RcUrl,
+    bool ManageRclone = true,
+    string? RclonePath = null,
+    string? RcloneConfig = null)
 {
     /// <summary>A remote was chosen; without one the service has nothing to sync.</summary>
     public bool HasRemote => Remote.Source != SettingSource.Default;
@@ -49,6 +70,12 @@ public static class DriveSettingsFile
 
     /// <summary>Points the service and the app at another settings file (tests, side-by-side runs).</summary>
     public const string PathVariable = "OPENCFDRIVE_SETTINGS";
+
+    /// <summary>
+    /// The rclone program to run, ahead of the settings file. Not RCLONE_...:
+    /// rclone itself reads every RCLONE_&lt;NAME&gt; variable as its --&lt;name&gt; flag.
+    /// </summary>
+    public const string RclonePathVariable = "OPENCFDRIVE_RCLONE";
 
     /// <summary>Used when no remote is configured; the demo setup script creates it.</summary>
     public const string DefaultRemote = "e2e:";
@@ -118,11 +145,20 @@ public static class DriveSettingsFile
         }
 
         var remote = Pick(RemoteVariable, saved.Remote, DefaultRemote);
+        var rcUrl = Pick(RcUrlVariable, saved.RcUrl, DefaultRcUrl);
+        var rclonePath = environment(RclonePathVariable);
         return new EffectiveSettings(
             Pick(SyncRootVariable, saved.SyncRoot, SyncStatePaths.DefaultSyncRoot),
             remote with { Value = SyncStatePaths.NormalizeRemote(remote.Value) },
-            Pick(RcUrlVariable, saved.RcUrl, DefaultRcUrl));
+            rcUrl,
+            // A remote control address in the environment (scripts, tests)
+            // means that rclone, not one of OpenCfDrive's own.
+            ManageRclone: rcUrl.Source != SettingSource.Environment && saved.ManageRclone != false,
+            RclonePath: string.IsNullOrWhiteSpace(rclonePath) ? Blank(saved.RclonePath) : rclonePath.Trim(),
+            RcloneConfig: Blank(saved.RcloneConfig));
     }
+
+    private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     /// <summary>The settings the service runs with right now (a broken file counts as empty).</summary>
     public static EffectiveSettings Current()

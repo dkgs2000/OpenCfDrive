@@ -17,10 +17,15 @@ public sealed class RcloneServeClient : IDisposable
     private long _bytesFetched;
 
     public RcloneServeClient(string rcUrl, string remote)
+        : this(new RcloneEndpoint(rcUrl), remote)
     {
-        _baseUrl = rcUrl.TrimEnd('/');
+    }
+
+    public RcloneServeClient(RcloneEndpoint endpoint, string remote)
+    {
+        _baseUrl = endpoint.BaseUrl;
         _remotePrefix = remote.TrimEnd('/');
-        _httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
+        _httpClient = endpoint.CreateHttpClient(TimeSpan.FromMinutes(30));
     }
 
     /// <summary>Total payload bytes read from rclone; proves range hydration.</summary>

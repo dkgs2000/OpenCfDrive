@@ -64,10 +64,11 @@
     </Feature>
 
     <!--
-      Before the files go: close the app and stop the running service. On a
-      real uninstall (not the old version's removal during an upgrade) the app
-      also stops starting at sign-in, and the drive is unregistered, which
-      removes its Explorer entry and leaves an ordinary folder.
+      Before the files go: close the app and stop the running service (which
+      ends the rclone it runs). On a real uninstall (not the old version's
+      removal during an upgrade) the drive is unregistered, which removes its
+      Explorer entry and leaves an ordinary folder; then the app stops starting
+      at sign-in and removes the rclone it downloaded, which no longer runs.
     -->
     <CustomAction Id="QuitApp" FileRef="AppExe" ExeCommand="--quit"
                   Execute="deferred" Impersonate="yes" Return="ignore" />
@@ -82,7 +83,7 @@
     <InstallExecuteSequence>
       <Custom Action="QuitApp" Before="StopOpenCfDrive"
               Condition="REMOVE=&quot;ALL&quot; AND UPGRADINGPRODUCTCODE" />
-      <Custom Action="UninstallApp" Before="UnregisterOpenCfDrive"
+      <Custom Action="UninstallApp" After="UnregisterOpenCfDrive"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="StopOpenCfDrive" Before="RemoveFiles"
               Condition="REMOVE=&quot;ALL&quot; AND UPGRADINGPRODUCTCODE" />

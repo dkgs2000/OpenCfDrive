@@ -26,7 +26,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
 {
     private readonly string _syncRootPath;
     private readonly string _remote;
-    private readonly string _rcUrl;
+    private readonly RcloneEndpoint _rclone;
     private readonly SqliteMetadataStore _store;
     private readonly Action<string>? _log;
 
@@ -142,10 +142,21 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         string dbPath,
         Action<string>? log = null,
         bool forceSimulation = false)
+        : this(syncRootPath, remote, new RcloneEndpoint(rcUrl), dbPath, log, forceSimulation)
+    {
+    }
+
+    public CloudSyncEngine(
+        string syncRootPath,
+        string remote,
+        RcloneEndpoint rclone,
+        string dbPath,
+        Action<string>? log = null,
+        bool forceSimulation = false)
     {
         _syncRootPath = syncRootPath;
         _remote = remote;
-        _rcUrl = rcUrl;
+        _rclone = rclone;
         _store = new SqliteMetadataStore(dbPath);
         _log = log;
         _forceSimulation = forceSimulation;
@@ -221,8 +232,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         {
             // Mock mode still needs the rclone clients so hydration + upload
             // exercise the same code paths as the real mount.
-            _rc = new RcloneRcClient(_rcUrl);
-            _serve = new RcloneServeClient(_rcUrl, _remote);
+            _rc = new RcloneRcClient(_rclone);
+            _serve = new RcloneServeClient(_rclone, _remote);
             _log?.Invoke("MOCK MODE: no sync root registration; using a plain directory.");
         }
         else if (support.IsSupported)
@@ -233,8 +244,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable
 
             if (registered)
             {
-                _rc = new RcloneRcClient(_rcUrl);
-                _serve = new RcloneServeClient(_rcUrl, _remote);
+                _rc = new RcloneRcClient(_rclone);
+                _serve = new RcloneServeClient(_rclone, _remote);
                 _connection = new SyncRootConnection(
                     _store,
                     _serve,
@@ -308,7 +319,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             return 0;
         }
 
-        _rc ??= new RcloneRcClient(_rcUrl);
+        _rc ??= new RcloneRcClient(_rclone);
 
         var items = await _rc.ListFilesAsync(_remote, cancellationToken).ConfigureAwait(false);
         if (items.Count == 0)
@@ -367,7 +378,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         string relativeDirectory,
         CancellationToken cancellationToken)
     {
-        _rc ??= new RcloneRcClient(_rcUrl);
+        _rc ??= new RcloneRcClient(_rclone);
         var listedAt = DateTimeOffset.UtcNow;
         var items = await _rc.ListDirectoryAsync(_remote, relativeDirectory, cancellationToken).ConfigureAwait(false);
 
@@ -692,7 +703,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         try
         {
             // One lookup of the file, not a listing of its whole folder.
-            _rc ??= new RcloneRcClient(_rcUrl);
+            _rc ??= new RcloneRcClient(_rclone);
             var item = await _rc.StatAsync(_remote, relative, cancellationToken).ConfigureAwait(false);
             return item is { IsDirectory: false } ? (item.Size, item.ModifiedTime) : (null, null);
         }
@@ -774,7 +785,9 @@ public sealed class CloudSyncEngine : IAsyncDisposable
                 continue;
             }
 
-            if (string.Equals(key, remotePath, StringComparison.OrdinalIgnoreCase) ||
+            // A folder is guarded as "dir/". Its own local delete may come as
+            // "dir" too: once its row is gone, nothing says it was a folder.
+            if (string.Equals(key.TrimEnd('/'), remotePath.TrimEnd('/'), StringComparison.OrdinalIgnoreCase) ||
                 (key.EndsWith('/') && remotePath.StartsWith(key, StringComparison.OrdinalIgnoreCase)))
             {
                 return true;
@@ -1199,7 +1212,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             }
 
             var (fs, remoteFile) = ResolveRemoteFile(relative);
-            _rc ??= new RcloneRcClient(_rcUrl);
+            _rc ??= new RcloneRcClient(_rclone);
 
             if (record is null && IsSimulated)
             {
@@ -1269,7 +1282,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
     private async Task DeleteRemoteDirectoryAsync(string relativeDirectory)
     {
         var (fs, remoteDirectory) = ResolveRemoteFile(relativeDirectory);
-        _rc ??= new RcloneRcClient(_rcUrl);
+        _rc ??= new RcloneRcClient(_rclone);
 
         // A subfolder of a folder that is being deleted too: the parent's
         // delete covers everything below it, including this folder (this
@@ -1415,7 +1428,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         var (fs, oldRemote) = ResolveRemoteFile(oldRelative);
         var (_, newRemote) = ResolveRemoteFile(newRelative);
 
-        _rc ??= new RcloneRcClient(_rcUrl);
+        _rc ??= new RcloneRcClient(_rclone);
         await _rc.MoveFileAsync(fs, oldRemote, newRemote).ConfigureAwait(false);
 
         _store.RenameRemotePath(oldRelative, newRelative, newLocalPath, newRelative);
@@ -1477,7 +1490,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
 
         var (fs, oldRemote) = ResolveRemoteFile(oldRelative);
         var (_, newRemote) = ResolveRemoteFile(newRelative);
-        _rc ??= new RcloneRcClient(_rcUrl);
+        _rc ??= new RcloneRcClient(_rclone);
         await _rc.MoveDirectoryAsync(fs + oldRemote, fs + newRemote).ConfigureAwait(false);
         await _rc.RemoveEmptyDirectoriesAsync(fs, oldRemote).ConfigureAwait(false);
 
@@ -1650,7 +1663,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         // client last saw. If the server has moved on since (changed,
         // deleted, or a file this client never saw at that path), its
         // version replaces the local one and the local change is discarded.
-        _rc ??= new RcloneRcClient(_rcUrl);
+        _rc ??= new RcloneRcClient(_rclone);
         var server = await _rc.StatAsync(_remote, relative, cancellationToken).ConfigureAwait(false);
         if (ServerMovedOn(record, server))
         {

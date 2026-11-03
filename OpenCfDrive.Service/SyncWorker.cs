@@ -2,6 +2,7 @@ using System.Reflection;
 using OpenCfDrive.Core.CloudFiles;
 using OpenCfDrive.Core.Configuration;
 using OpenCfDrive.Core.Control;
+using OpenCfDrive.Core.Services;
 using OpenCfDrive.Core.Storage;
 
 namespace OpenCfDrive.Service;
@@ -17,6 +18,8 @@ public sealed class SyncWorker(
     private ServiceControlServer? _control;
     private EffectiveSettings? _settings;
     private SyncRootStatus? _initialized;
+    private RcloneDaemon? _daemon;
+    private RcloneStatus? _rcloneStatus;
     private volatile ServiceState _state = ServiceState.Starting;
     private volatile string _detail = "Registering and connecting the drive.";
 
@@ -40,8 +43,8 @@ public sealed class SyncWorker(
         var remote = settings.Remote.Value;
         var rcUrl = settings.RcUrl.Value;
         logger.LogInformation(
-            "Drive '{SyncRoot}' for {Remote} through rclone at {RcUrl} (settings: {SettingsPath})",
-            syncRoot, remote, rcUrl, DriveSettingsFile.Path);
+            "Drive '{SyncRoot}' for {Remote} through {Rclone} (settings: {SettingsPath})",
+            syncRoot, remote, settings.ManageRclone ? "an rclone it runs itself" : $"the rclone at {rcUrl}", DriveSettingsFile.Path);
         if (!settings.HasRemote)
         {
             logger.LogWarning("No rclone remote is configured, so '{Remote}' is used. Choose one in the OpenCfDrive app.", remote);
@@ -81,7 +84,15 @@ public sealed class SyncWorker(
             message => logger.LogInformation("{Message}", message));
         _control.Start();
 
-        _engine = new CloudSyncEngine(syncRoot, remote, rcUrl, dbPath, msg => logger.LogInformation("{Message}", msg));
+        var endpoint = await ConnectRcloneAsync(settings, stoppingToken).ConfigureAwait(false);
+        if (endpoint is null)
+        {
+            // Nothing to sync with; stay up so the app can say why.
+            await WaitUntilStoppedAsync(stoppingToken).ConfigureAwait(false);
+            return;
+        }
+
+        _engine = new CloudSyncEngine(syncRoot, remote, endpoint, dbPath, msg => logger.LogInformation("{Message}", msg));
 
         try
         {
@@ -116,11 +127,83 @@ public sealed class SyncWorker(
             (_state, _detail) = (ServiceState.Failed, ex.Message);
         }
 
+        await WaitUntilStoppedAsync(stoppingToken).ConfigureAwait(false);
+    }
+
+    private static async Task WaitUntilStoppedAsync(CancellationToken stoppingToken)
+    {
         while (!stoppingToken.IsCancellationRequested)
         {
             await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken).ConfigureAwait(false);
         }
     }
+
+    /// <summary>rclone's own log, next to the service's: %LOCALAPPDATA%\OpenCfDrive\logs\rclone.log.</summary>
+    private static string RcloneLogPath => Path.Combine(Path.GetDirectoryName(ConsoleOutput.LogPath)!, "rclone.log");
+
+    /// <summary>
+    /// The rclone remote control to sync through: one the service starts and
+    /// owns (the default), or the one the user runs at the configured
+    /// address. Null when there is none; the status then says why.
+    /// </summary>
+    private async Task<RcloneEndpoint?> ConnectRcloneAsync(EffectiveSettings settings, CancellationToken stoppingToken)
+    {
+        if (!settings.ManageRclone)
+        {
+            _rcloneStatus = new RcloneStatus(
+                false, settings.RcUrl.Value, null, null, null, null, "External", "rclone runs outside OpenCfDrive.", null);
+            return new RcloneEndpoint(settings.RcUrl.Value);
+        }
+
+        var program = RcloneLocator.Find(settings.RclonePath);
+        if (program is null)
+        {
+            var why = settings.RclonePath is null
+                ? "rclone was not found: it is not on PATH and was not downloaded. Choose rclone.exe, or download it, in OpenCfDrive's Settings."
+                : $"rclone was not found at '{settings.RclonePath}'.";
+            logger.LogError("{Why}", why);
+            _rcloneStatus = new RcloneStatus(true, "", settings.RclonePath, null, null, null, "NotFound", why, null);
+            (_state, _detail) = (ServiceState.Failed, why);
+            return null;
+        }
+
+        _rcloneStatus = new RcloneStatus(
+            true, "", program.Path, program.Source.ToString(), null, null, "Starting", "Starting rclone.", RcloneLogPath);
+        _detail = "Starting rclone.";
+        try
+        {
+            _daemon = await RcloneDaemon.StartAsync(
+                program,
+                settings.RcloneConfig,
+                RcloneLogPath,
+                message => logger.LogInformation("{Message}", message),
+                stoppingToken).ConfigureAwait(false);
+            _detail = "Registering and connecting the drive.";
+            return _daemon.Endpoint;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            var why = $"rclone could not be started: {ex.Message}";
+            logger.LogError("{Why}", why);
+            _rcloneStatus = _rcloneStatus with { State = "Failed", Detail = why };
+            (_state, _detail) = (ServiceState.Failed, why);
+            return null;
+        }
+    }
+
+    private RcloneStatus? RcloneNow() =>
+        _daemon is { } daemon
+            ? new RcloneStatus(
+                true,
+                daemon.Endpoint.BaseUrl,
+                daemon.Program.Path,
+                daemon.Program.Source.ToString(),
+                daemon.Version,
+                daemon.ProcessId,
+                daemon.State.ToString(),
+                daemon.Detail,
+                daemon.LogPath)
+            : _rcloneStatus;
 
     private ServiceStatus BuildStatus()
     {
@@ -150,7 +233,8 @@ public sealed class SyncWorker(
             items,
             _engine?.BytesFetched ?? 0,
             ConsoleOutput.ActiveLogPath ?? "",
-            activity.Recent(100));
+            activity.Recent(100),
+            RcloneNow());
     }
 
     private static string Version =>
@@ -167,6 +251,12 @@ public sealed class SyncWorker(
         if (_engine is not null)
         {
             await _engine.DisposeAsync().ConfigureAwait(false);
+        }
+
+        // After the engine: it may still be finishing a request through it.
+        if (_daemon is not null)
+        {
+            await _daemon.DisposeAsync().ConfigureAwait(false);
         }
 
         await base.StopAsync(cancellationToken).ConfigureAwait(false);

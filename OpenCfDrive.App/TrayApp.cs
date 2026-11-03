@@ -2,6 +2,7 @@ using System.Diagnostics;
 using OpenCfDrive.Core.CloudFiles;
 using OpenCfDrive.Core.Configuration;
 using OpenCfDrive.Core.Control;
+using OpenCfDrive.Core.Services;
 using OpenCfDrive.Core.Storage;
 
 namespace OpenCfDrive.App;
@@ -245,7 +246,10 @@ internal sealed class TrayApp : ApplicationContext
         var syncChanged =
             !string.Equals(before.SyncRoot.Value, after.SyncRoot.Value, StringComparison.OrdinalIgnoreCase) ||
             before.Remote.Value != after.Remote.Value ||
-            before.RcUrl.Value != after.RcUrl.Value;
+            before.ManageRclone != after.ManageRclone ||
+            (after.ManageRclone
+                ? before.RclonePath != after.RclonePath || before.RcloneConfig != after.RcloneConfig
+                : before.RcUrl.Value != after.RcUrl.Value);
 
         return await RunAsync("Applying the settings", async () =>
         {
@@ -282,6 +286,53 @@ internal sealed class TrayApp : ApplicationContext
                 ? await SyncService.StartAsync(after.SyncRoot.Value)
                 : null;
         }, report: false);
+    }
+
+    /// <summary>
+    /// Downloads rclone from rclone.org into OpenCfDrive's own folder (it is
+    /// used when none was chosen and none is on PATH), then lets a service
+    /// that was missing it start again. Returns why it failed, or null.
+    /// </summary>
+    public async Task<string?> DownloadRcloneAsync(IProgress<string> progress)
+    {
+        return await RunAsync("Downloading rclone", async () =>
+        {
+            try
+            {
+                await RcloneDownloader.DownloadAsync(RcloneLocator.DownloadFolder, progress);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or InvalidDataException or IOException
+                                           or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+            {
+                return $"rclone could not be downloaded: {ex.Message}";
+            }
+
+            var latest = Monitor.Latest;
+            if (latest is null || !latest.Settings.HasRemote || !latest.Settings.ManageRclone)
+            {
+                return null;
+            }
+
+            var root = latest.Settings.SyncRoot.Value;
+            return latest.Status?.Rclone?.State is "NotFound" or "Failed"
+                ? await SyncService.StopAsync(root) ?? await SyncService.StartAsync(root)
+                : latest.Running ? null : await SyncService.StartAsync(root);
+        }, report: false);
+    }
+
+    /// <summary>The log of the rclone the service runs.</summary>
+    public void OpenRcloneLog()
+    {
+        var log = Monitor.Latest?.Status?.Rclone?.LogPath
+                  ?? Path.Combine(Path.GetDirectoryName(SyncStatePaths.StateRoot)!, "logs", "rclone.log");
+        if (File.Exists(log))
+        {
+            Process.Start(new ProcessStartInfo(log) { UseShellExecute = true })?.Dispose();
+        }
+        else
+        {
+            ShowProblem($"There is no rclone log yet ({log}).");
+        }
     }
 
     /// <summary>The state of a folder that held another remote's drive: it no longer applies.</summary>

@@ -46,22 +46,43 @@ Download the 64-bit installer from the GitHub release: either
 `OpenCfDrive-<version>-x64-setup.exe` or `OpenCfDrive-<version>-x64.msi`
 (the `.exe` installs that same MSI). Both install for the current user only,
 into `%LOCALAPPDATA%\Programs\OpenCfDrive`, without administrator rights, and
-add an "OpenCfDrive" Start Menu entry. .NET is included, so nothing else is
-needed except rclone. The installers are not code-signed yet, so Windows
-SmartScreen may warn before running them.
+add an "OpenCfDrive" Start Menu entry. .NET is included. The installers are
+not code-signed yet, so Windows SmartScreen may warn before running them.
 
-OpenCfDrive talks to the server through rclone's remote control, which you run
-yourself (OpenCfDrive does not start rclone):
+OpenCfDrive talks to the server through rclone, which it runs itself but does
+not include. It runs the `rclone.exe` chosen in its settings; without one, the
+one on `PATH` (installed with `winget install Rclone.Rclone`, for example);
+without that, a copy it downloads from rclone.org when you press "Download
+rclone" in its settings, checked against the release's published SHA-256
+checksums, into `%LOCALAPPDATA%\OpenCfDrive\rclone`.
+
+Set up the remote first with rclone's own configuration wizard, which asks for
+the server's details and, for services like Google Drive or OneDrive, opens the
+browser to sign in (rclone's documentation has a page for each provider). With
+the downloaded copy, that is
+`& "$env:LOCALAPPDATA\OpenCfDrive\rclone\rclone.exe" config`.
 
 ```powershell
-rclone rcd --rc-serve --rc-no-auth --rc-addr 127.0.0.1:5572
+rclone config     # create the remote, e.g. "myremote"
 ```
 
 After installing, the OpenCfDrive app opens. In its Settings tab, choose the
 rclone remote (the list comes from rclone's config, and a path is allowed, as
-in `myremote:backup`), check the remote control address, and press Save: the
-sync service starts and the drive appears in Explorer's navigation pane, at
-`%USERPROFILE%\OpenCfDrive` unless you chose another folder.
+in `myremote:backup`; Refresh list shows remotes added later), and press Save:
+the sync service starts rclone, then the drive, which appears in Explorer's
+navigation pane at `%USERPROFILE%\OpenCfDrive` unless you chose another folder.
+
+The rclone the service runs (`rclone rcd --rc-serve`) listens only on
+`127.0.0.1`, on a free port, and wants a login made up for each run, which the
+service gives it through its environment, so it never shows in a process list.
+It runs in a Windows job object with the service: whenever the service ends,
+even killed, Windows ends rclone too. If rclone stops on its own, the service
+starts it again (after 1 s, then 5, 15 and 60 s), on the same port and login.
+Its log is `%LOCALAPPDATA%\OpenCfDrive\logs\rclone.log`.
+
+To use an `rclone rcd` you run yourself instead, choose "I run rclone rcd
+myself" and give its address; it needs `--rc-serve --rc-no-auth`, since
+OpenCfDrive sends no login to it.
 
 The app then lives in the notification area, behind the arrow next to the
 clock (drag its icon onto the taskbar to keep it in view). Clicking the icon
@@ -71,8 +92,10 @@ syncing, and shows the log. The Status tab shows:
 - the sync service: whether it runs, since when, its version, and whether the
   drive is registered with Explorer and connected; how many items it tracks and
   how much it downloaded;
-- rclone: whether its remote control answers (and its version), whether it lets
-  OpenCfDrive in, and whether the chosen remote is in rclone's config;
+- rclone: who runs it, which program (and whether it was chosen, found on
+  `PATH` or downloaded) and its version, where it listens, whether it runs (or
+  is being restarted, and why), and whether the chosen remote is in rclone's
+  config;
 - the remote: what kind it is and where it points (for example
   `s3 (AWS), region eu-west-1` or `crypt over gdrive:secret`, never a password,
   key or token), and the space the server reports, if it does. The Settings
@@ -84,10 +107,11 @@ and starts the sync service when a remote is chosen. Closing the app's window
 only hides it; Exit in the icon's menu closes the app, and syncing continues.
 The service's log is `%LOCALAPPDATA%\OpenCfDrive\logs\OpenCfDrive.log`.
 
-Uninstalling (Settings > Apps) closes the app, stops the service, removes the
-sign-in start, and unregisters the drive, which removes it from Explorer and
-leaves `%USERPROFILE%\OpenCfDrive` as an ordinary folder with whatever was
-downloaded. An upgrade keeps the registration and the settings.
+Uninstalling (Settings > Apps) closes the app, stops the service and its
+rclone, removes the sign-in start and the rclone OpenCfDrive downloaded, and
+unregisters the drive, which removes it from Explorer and leaves
+`%USERPROFILE%\OpenCfDrive` as an ordinary folder with whatever was downloaded.
+An upgrade keeps the registration and the settings.
 
 ## Build
 
@@ -131,7 +155,10 @@ are set.
 | --- | --- | --- | --- |
 | Drive folder | `SyncRoot` | `OPENCFDRIVE_ROOT` | `%USERPROFILE%\OpenCfDrive` |
 | rclone remote | `Remote` | `RCLONE_FS` | none (the service then uses `e2e:`, the demo backend's) |
-| rclone remote control | `RcUrl` | `RCLONE_RC_URL` | `http://127.0.0.1:5572` |
+| OpenCfDrive runs rclone | `ManageRclone` | | yes; setting `RCLONE_RC_URL` means no |
+| rclone program | `RclonePath` | `OPENCFDRIVE_RCLONE` | on `PATH`, else the downloaded copy |
+| rclone config file | `RcloneConfig` | | rclone's own default (`rclone config file` says which) |
+| Remote control you run | `RcUrl` | `RCLONE_RC_URL` | `http://127.0.0.1:5572` |
 | Start at sign-in | `StartAtSignIn` | | on for the installed app |
 
 `OPENCFDRIVE_SETTINGS` points both the app and the service at another
@@ -649,8 +676,9 @@ installed or downloaded separately and keeps its own license:
 
 - **rclone** ([MIT license](https://github.com/rclone/rclone/blob/master/COPYING)).
   OpenCfDrive runs it as a separate program and talks to it over its HTTP
-  Remote Control API; no rclone code is included. The tests and the demo
-  backend also run it as their WebDAV or S3 server.
+  Remote Control API; no rclone code is included. It runs one already
+  installed, or downloads the official release from rclone.org when asked.
+  The tests and the demo backend also run it as their WebDAV or S3 server.
 - **NuGet packages** listed in the project files (`Microsoft.Data.Sqlite`,
   `SQLitePCLRaw`, `Microsoft.Extensions.Hosting`, and the xunit test packages),
   restored at build time.
