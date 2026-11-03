@@ -15,7 +15,23 @@ public sealed record ServiceStatus(
     int ItemsTracked,
     long BytesDownloaded,
     string LogPath,
-    IReadOnlyList<ActivityEntry> RecentActivity);
+    IReadOnlyList<ActivityEntry> RecentActivity,
+    RcloneStatus? Rclone = null);
+
+/// <summary>The rclone the service talks to.</summary>
+/// <param name="Managed">The service runs it itself; otherwise the user runs it at <paramref name="Url"/>.</param>
+/// <param name="Program">The rclone program it runs, and <paramref name="Source"/> says how it was found.</param>
+/// <param name="State">Running, Starting, Restarting, NotFound or Failed; for one the user runs, External.</param>
+public sealed record RcloneStatus(
+    bool Managed,
+    string Url,
+    string? Program,
+    string? Source,
+    string? Version,
+    int? ProcessId,
+    string State,
+    string Detail,
+    string? LogPath);
 
 public enum ServiceState
 {

@@ -20,9 +20,14 @@ public sealed class RcloneRcClient : IDisposable
     private readonly string _rcUrl;
 
     public RcloneRcClient(string rcUrl)
+        : this(new RcloneEndpoint(rcUrl))
     {
-        _rcUrl = rcUrl.TrimEnd('/');
-        _httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+    }
+
+    public RcloneRcClient(RcloneEndpoint endpoint)
+    {
+        _rcUrl = endpoint.BaseUrl;
+        _httpClient = endpoint.CreateHttpClient(TimeSpan.FromMinutes(10));
     }
 
     public string RcUrl => _rcUrl;

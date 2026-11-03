@@ -25,6 +25,7 @@ third-party components, each under its own license:
   license
   https://aka.ms/WinSDKLicenseURL
 
-rclone is not included. OpenCfDrive works with an rclone you install
-separately (MIT license: https://github.com/rclone/rclone/blob/master/COPYING).
+rclone is not included. OpenCfDrive runs an rclone you install separately, or
+one it downloads from https://downloads.rclone.org when you ask it to (MIT
+license: https://github.com/rclone/rclone/blob/master/COPYING).
 OpenCfDrive is not affiliated with or endorsed by the rclone project.

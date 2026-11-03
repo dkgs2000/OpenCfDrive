@@ -41,6 +41,21 @@ public class SqliteMetadataStoreTests
     }
 
     [Fact]
+    public void Delete_RemovesADatabaseThatWasJustRead()
+    {
+        var path = TempDbPath();
+        var store = new SqliteMetadataStore(path);
+        store.Initialize();
+        store.SetConfig("RcloneFs", "box:");
+        Assert.Equal("box:", store.GetConfig("RcloneFs"));
+        Assert.Equal(0, store.Count());
+
+        SqliteMetadataStore.Delete(path);
+
+        Assert.False(File.Exists(path));
+    }
+
+    [Fact]
     public void Upsert_AndLookups_RoundTrip()
     {
         var store = new SqliteMetadataStore(TempDbPath());

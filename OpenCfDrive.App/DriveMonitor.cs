@@ -36,9 +36,14 @@ internal sealed record DriveSnapshot(
 
             if (!Running)
             {
-                return Settings.HasRemote
-                    ? (Health.Idle, "Stopped", "The sync service is not running.")
-                    : (Health.Idle, "Not set up", "Choose your rclone remote in Settings to start.");
+                if (!Settings.HasRemote)
+                {
+                    return (Health.Idle, "Not set up", "Choose your rclone remote in Settings to start.");
+                }
+
+                return Settings.ManageRclone && Rclone is { Answers: false }
+                    ? (Health.Problem, "rclone not found", $"{Rclone.Problem} Choose rclone.exe or download it in Settings.")
+                    : (Health.Idle, "Stopped", "The sync service is not running.");
             }
 
             if (Status is null)
@@ -46,14 +51,17 @@ internal sealed record DriveSnapshot(
                 return (Health.Busy, "Running", "The sync service runs, but has not reported its status.");
             }
 
+            // The rclone the service runs itself reports through the service.
+            var ownRclone = Status.Rclone is { Managed: true } own ? own : null;
             var (health, headline, detail) = Status.State switch
             {
                 ServiceState.Starting => (Health.Busy, "Starting", Status.Detail),
                 ServiceState.Unavailable => (Health.Problem, "Cloud Files unavailable", Status.Detail),
+                ServiceState.Failed when ownRclone?.State == "NotFound" => (Health.Problem, "rclone not found", Status.Detail),
                 ServiceState.Failed => (Health.Problem, "Problem", Status.Detail),
-                _ => Rclone is { Usable: false }
-                    ? (Health.Problem, "rclone unreachable", Rclone.Problem ?? "")
-                    : (Health.Good, "Running", Status.Detail),
+                _ when ownRclone is { State: not "Running" } => (Health.Problem, "rclone stopped", ownRclone.Detail),
+                _ when ownRclone is null && Rclone is { Usable: false } => (Health.Problem, "rclone unreachable", Rclone.Problem ?? ""),
+                _ => (Health.Good, "Running", Status.Detail),
             };
 
             return RunsWithOtherSettings
@@ -67,12 +75,15 @@ internal sealed record DriveSnapshot(
         Status is not null &&
         (!string.Equals(Status.SyncRoot, Settings.SyncRoot.Value, StringComparison.OrdinalIgnoreCase) ||
          !string.Equals(Status.Remote, Settings.Remote.Value, StringComparison.Ordinal) ||
-         !string.Equals(Status.RcUrl, Settings.RcUrl.Value, StringComparison.OrdinalIgnoreCase));
+         (Status.Rclone?.Managed ?? true) != Settings.ManageRclone ||
+         (!Settings.ManageRclone && !string.Equals(Status.RcUrl, Settings.RcUrl.Value, StringComparison.OrdinalIgnoreCase)));
 }
 
 /// <summary>Reads the settings, the service's status and rclone's, whenever asked.</summary>
 internal sealed class DriveMonitor
 {
+    private static readonly TimeSpan ProgramCheckInterval = TimeSpan.FromSeconds(30);
+
     private bool _refreshing;
     private bool _describing;
     private DateTime _rcloneCheckedAt;
@@ -113,10 +124,18 @@ internal sealed class DriveMonitor
                 ? await ServiceControl.GetStatusAsync(settings.SyncRoot.Value, TimeSpan.FromSeconds(2))
                 : null;
 
-            var rclone = Latest?.Rclone;
-            if (rclone is null || rclone.RcUrl != settings.RcUrl.Value || DateTime.UtcNow - _rcloneCheckedAt >= rcloneMaxAge)
+            // Asking the rclone program means running it a few times; the
+            // service reports its own rclone's state live anyway.
+            var access = RcloneAccess.From(settings);
+            if (access.Managed && rcloneMaxAge > TimeSpan.Zero && rcloneMaxAge < ProgramCheckInterval)
             {
-                rclone = await RcloneProbe.CheckAsync(settings.RcUrl.Value);
+                rcloneMaxAge = ProgramCheckInterval;
+            }
+
+            var rclone = Latest?.Rclone;
+            if (rclone is null || rclone.Key != access.Key || DateTime.UtcNow - _rcloneCheckedAt >= rcloneMaxAge)
+            {
+                rclone = await RcloneProbe.CheckAsync(access);
                 _rcloneCheckedAt = DateTime.UtcNow;
             }
 
@@ -128,7 +147,7 @@ internal sealed class DriveMonitor
 
             if (known && (Latest.RemoteInfo is null || DateTime.UtcNow - _remoteDescribedAt >= remoteMaxAge))
             {
-                _ = DescribeRemoteAsync(settings.RcUrl.Value, snapshot.Remote);
+                _ = DescribeRemoteAsync(access, snapshot.Remote);
             }
         }
         finally
@@ -138,7 +157,7 @@ internal sealed class DriveMonitor
     }
 
     /// <summary>Asks rclone about the remote off to the side: the server may take a while to say its space.</summary>
-    private async Task DescribeRemoteAsync(string rcUrl, string remote)
+    private async Task DescribeRemoteAsync(RcloneAccess access, string remote)
     {
         if (_describing)
         {
@@ -148,7 +167,7 @@ internal sealed class DriveMonitor
         _describing = true;
         try
         {
-            var info = await RcloneProbe.DescribeAsync(rcUrl, remote);
+            var info = await RcloneProbe.DescribeAsync(access, remote);
             _remoteDescribedAt = DateTime.UtcNow;
             if (Latest is { } latest && latest.Remote == remote)
             {
