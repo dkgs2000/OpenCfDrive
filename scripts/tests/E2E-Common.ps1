@@ -102,6 +102,43 @@ function Wait-ForCondition {
     return $false
 }
 
+# Waits until $Condition holds, checking it again each time Windows reports
+# that the attributes of the file at $Path changed: a download finishing, a
+# local copy freed, a pin set. No polling; the timeout only bounds a failure.
+function Wait-ForAttributes {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][scriptblock]$Condition,
+        [int]$TimeoutSeconds = 15
+    )
+
+    # Distinct names: $Condition runs in this scope (see Wait-Local).
+    $attributeCheck = $Condition
+    $attributeEvents = "attributes-" + [guid]::NewGuid()
+    $attributeWatcher = New-Object System.IO.FileSystemWatcher (Split-Path -Parent $Path), (Split-Path -Leaf $Path)
+    $attributeWatcher.NotifyFilter = [System.IO.NotifyFilters]::Attributes
+    Register-ObjectEvent -InputObject $attributeWatcher -EventName Changed -SourceIdentifier $attributeEvents | Out-Null
+    $attributeWatcher.EnableRaisingEvents = $true
+    try {
+        # Checked only once the watcher runs, so a change made before it
+        # started is seen by the check and one made after raises an event.
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while (-not (& $attributeCheck)) {
+            $left = [math]::Ceiling(($deadline - (Get-Date)).TotalSeconds)
+            if ($left -le 0 -or $null -eq (Wait-Event -SourceIdentifier $attributeEvents -Timeout $left)) {
+                return [bool](& $attributeCheck)
+            }
+            Remove-Event -SourceIdentifier $attributeEvents -ErrorAction SilentlyContinue
+        }
+        return $true
+    }
+    finally {
+        Unregister-Event -SourceIdentifier $attributeEvents -ErrorAction SilentlyContinue
+        Remove-Event -SourceIdentifier $attributeEvents -ErrorAction SilentlyContinue
+        $attributeWatcher.Dispose()
+    }
+}
+
 function Get-FreeTcpPort {
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
