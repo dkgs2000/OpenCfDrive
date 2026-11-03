@@ -410,7 +410,7 @@ drive, then the server is expected to match:
   reached are kept and reach the server once it answers; nothing comes back
   meanwhile
 - Free up space on a file with an unsynced edit (cloud mode): it is uploaded
-  first, then freed
+  first, then freed, and opens whole again
 
 **No needless work.** Every scenario also declares the most it may cost: uploads,
 bytes downloaded, server renames, deletes and lookups. The harness counts every
@@ -519,6 +519,16 @@ namespace up front, OpenCfDrive fills each folder on demand.
 - **Free up space never drops the only copy of a change.** A file with local
   changes the server does not have yet is uploaded first and freed after, as
   OneDrive does; the platform's own refusal covers only what in-sync tells.
+- **A placeholder's size is the platform's record, not the file's.** A save
+  that changes a file's size in place leaves the platform's record at the old
+  size, and a file freed after that downloads back only that much (the rest
+  reads as zeros). The size is given again when a file is marked in sync after
+  an upload and when it is freed, as Nextcloud does
+  (`EditedPlaceholderContractTest`).
+- **"Always keep on this device" downloads through a handle without data
+  access.** A write handle is refused while a program has the file open
+  sharing reads only, and refuses such a program for a moment after the file
+  already shows as downloaded (`HydratePlaceholderContractTest`).
 - **Deletes and renames must be acknowledged.** `NOTIFY_DELETE` and
   `NOTIFY_RENAME` arrive *before* the operation, and the platform holds it until
   the provider answers `ACK_DELETE` / `ACK_RENAME`; without that the user's

@@ -805,7 +805,9 @@ function Get-E2EScenarios {
             Assert-Local "client/offline-renamed.txt" "offline-rename"
         }
         # Never the only copy of a change: OneDrive uploads it first, then frees it.
-        New-E2EScenario "C25" "free up space on a file with an unsynced edit: it is uploaded first, then freed" -Budget @{ DownloadBytes = 20; Uploads = 1; Lookups = 2 } -CloudOnly {
+        # Opened again, it comes back whole: the edit grew it in place, and the
+        # platform's record of its size is the one the download fills.
+        New-E2EScenario "C25" "free up space on a file with an unsynced edit: it is uploaded first, then freed, and opens whole" -Budget @{ DownloadBytes = 47; Uploads = 1; Lookups = 2 } -CloudOnly {
             $path = Get-LocalPath "client/free-after-upload.txt"
             Assert-Local "client/free-after-upload.txt" "free-after-upload-v1"
             [System.IO.File]::AppendAllText($path, "-edited")
@@ -815,6 +817,7 @@ function Get-E2EScenarios {
                 throw "client\free-after-upload.txt was not freed once its edit was uploaded."
             }
             & attrib.exe -U $path | Out-Null
+            Assert-Local "client/free-after-upload.txt" "free-after-upload-v1-edited"
         }
         New-E2EScenario "C26" "client creates a folder, an empty folder and a file with Arabic names, and renames the file" -Budget @{ Uploads = 1; Lookups = 2; ServerFolders = 2; ServerRenames = 1 } {
             $folder = "c26-" + (Get-ArabicName 0x0645, 0x062C, 0x0644, 0x062F)          # "folder"
