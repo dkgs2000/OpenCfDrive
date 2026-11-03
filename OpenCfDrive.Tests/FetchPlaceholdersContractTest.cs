@@ -154,6 +154,113 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
         }
     }
 
+    /// <summary>
+    /// Offline (the server could not be reached), a folder shows what is on
+    /// this PC at once and the server is not asked, as in Nextcloud and
+    /// OneDrive; once a check reaches the server, listings go to it again.
+    /// </summary>
+    [SkippableFact]
+    public void Offline_AFolderShowsWhatIsLocal_WithoutAskingTheServer()
+    {
+        Skip.IfNot(
+            Prerequisites.CloudFilesAvailable,
+            $"Cloud Files API unavailable on this host: {Prerequisites.CloudFilesReason}");
+
+        var root = Path.Combine(Path.GetTempPath(), "opencfdrive-fetchph", Guid.NewGuid().ToString("N"));
+        var syncRoot = Path.Combine(root, "drive");
+        Directory.CreateDirectory(syncRoot);
+        var now = DateTimeOffset.UtcNow;
+        var remote = new ConcurrentQueue<PlaceholderEntry>([new PlaceholderEntry("first.txt", false, 5, now, "first.txt")]);
+        var calls = new ConcurrentQueue<string>();
+
+        Task<IReadOnlyList<PlaceholderEntry>> ListDirectory(string directory, CancellationToken cancellationToken)
+        {
+            calls.Enqueue(directory);
+            var entries = new List<PlaceholderEntry>();
+            while (remote.TryDequeue(out var entry))
+            {
+                entries.Add(entry);
+            }
+
+            return Task.FromResult<IReadOnlyList<PlaceholderEntry>>(entries);
+        }
+
+        // The server answers checks only once the test says it is back.
+        var serverBack = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var server = new ServerConnection(cancellationToken => serverBack.Task.WaitAsync(cancellationToken), TimeSpan.FromSeconds(30));
+        var online = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        server.Changed += isOnline =>
+        {
+            if (isOnline)
+            {
+                online.TrySetResult();
+            }
+        };
+
+        var store = new SqliteMetadataStore(Path.Combine(root, "state.db"));
+        store.Initialize();
+        using var serve = new RcloneServeClient("http://127.0.0.1:1", "unused:");
+        var registrar = new SyncRootRegistrar();
+        Assert.True(registrar.Register(syncRoot, Guid.NewGuid(), Guid.NewGuid()).Success);
+        using var connection = new SyncRootConnection(store, serve, output.WriteLine, listDirectory: ListDirectory, server: server);
+        var resumed = new AutoResetEvent(false);
+        connection.RefreshesResumed += directory =>
+        {
+            if (directory.Length == 0)
+            {
+                resumed.Set();
+            }
+        };
+
+        void WaitUntilRefreshable()
+        {
+            var clock = Stopwatch.StartNew();
+            while (!new CloudPlaceholderService().QueryState(syncRoot).Partial)
+            {
+                var left = TimeSpan.FromSeconds(30) - clock.Elapsed;
+                Assert.True(left > TimeSpan.Zero && resumed.WaitOne(left), "Refreshes were not switched back on for the root.");
+            }
+        }
+
+        try
+        {
+            Assert.True(connection.Connect(syncRoot), "CfConnectSyncRoot failed.");
+            Assert.True(new CloudPlaceholderService().EnableOnDemandPopulation(syncRoot));
+            Assert.Contains("first.txt", Enumerate(syncRoot));
+
+            server.Failed("the test took it offline");
+            remote.Enqueue(new PlaceholderEntry("while-offline.txt", false, 3, now, "while-offline.txt"));
+            WaitUntilRefreshable();
+            calls.Clear();
+
+            var offline = Enumerate(syncRoot);
+            Assert.Contains("first.txt", offline);
+            Assert.DoesNotContain("while-offline.txt", offline);
+            Assert.Empty(calls);
+
+            // Using the drive started a check; the server is back.
+            serverBack.SetResult();
+            Assert.True(online.Task.Wait(TimeSpan.FromSeconds(30)), "The drive did not go back online.");
+            WaitUntilRefreshable();
+            Assert.Contains("while-offline.txt", Enumerate(syncRoot));
+            Assert.Single(calls);
+        }
+        finally
+        {
+            connection.Disconnect();
+            registrar.Unregister(syncRoot);
+
+            try
+            {
+                Directory.Delete(root, recursive: true);
+            }
+            catch
+            {
+                // ignored
+            }
+        }
+    }
+
     private void CreateFileFromAnotherProcess(string path)
     {
         var start = new ProcessStartInfo("cmd.exe", $"/d /c \"echo created> \"{path}\"\"")

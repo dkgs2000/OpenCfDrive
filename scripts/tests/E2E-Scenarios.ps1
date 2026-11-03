@@ -470,9 +470,11 @@ function Get-E2EScenarios {
             if ($peak -ge $size) { throw "The service's peak memory ($peak bytes) reached the file size: it buffered the whole file." }
         }
         # Offline the way a lost network is: the server stops answering while
-        # the client's rclone keeps running. A listing then falls back to what
-        # is local; each logs one failed listing, hence the errors allowed.
-        New-E2EScenario "S18" "offline: an opened folder keeps what is local, an unopened one is empty, back online lists the server" -Budget @{ DownloadBytes = 9; Errors = 4 } -CloudOnly {
+        # the client's rclone keeps running. The first listing waits for it in
+        # vain (the one error allowed) and puts the drive offline; from then
+        # on, as in Nextcloud and OneDrive, folders show what is local at once.
+        # Using the drive checks the server again, so back online it lists it.
+        New-E2EScenario "S18" "offline: an opened folder keeps what is local, an unopened one is empty, back online lists the server" -Budget @{ DownloadBytes = 9; Errors = 1 } -CloudOnly {
             Set-RemoteFile "s18-seen/cached.txt" "seen"
             Set-RemoteFile "s18-unseen/later.txt" "later"
             Wait-Local "" { (Test-Local "s18-seen") -and (Test-Local "s18-unseen") } "s18-seen and s18-unseen did not appear locally."

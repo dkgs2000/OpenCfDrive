@@ -470,7 +470,7 @@ internal sealed class MainForm : Form
         _state.ForeColor = status?.State switch
         {
             ServiceState.Syncing => GoodColor,
-            ServiceState.Starting => BusyColor,
+            ServiceState.Starting or ServiceState.Offline => BusyColor,
             ServiceState.Failed or ServiceState.Unavailable => ProblemColor,
             _ => SystemColors.ControlText,
         };

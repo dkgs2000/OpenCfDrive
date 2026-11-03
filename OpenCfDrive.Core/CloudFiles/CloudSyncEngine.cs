@@ -96,6 +96,18 @@ public sealed class CloudSyncEngine : IAsyncDisposable
     private readonly ConcurrentDictionary<string, DateTimeOffset> _localChangeAt =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Whether the server answers (cloud mode); see <see cref="ServerConnection"/>.</summary>
+    private ServerConnection? _server;
+
+    /// <summary>Files changed while offline, uploaded once the server answers.</summary>
+    private readonly ConcurrentDictionary<string, byte> _deferredUploads = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>False while the server cannot be reached; folders then show what is on this PC.</summary>
+    public bool IsOnline => _server?.IsOnline ?? true;
+
+    /// <summary>Why the server cannot be reached, while offline.</summary>
+    public string? OfflineReason => _server?.OfflineReason;
+
     /// <summary>
     /// Mock mode only (plain files, no in-sync state): length and write time
     /// of each file when it last matched the server, so a change event with
@@ -246,13 +258,30 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             {
                 _rc = new RcloneRcClient(_rclone);
                 _serve = new RcloneServeClient(_rclone, _remote);
+
+                // Checked with a listing of the drive's top folder, given as
+                // long as any listing.
+                var rc = _rc;
+                _server = new ServerConnection(
+                    cancellationToken => rc.ListDirectoryAsync(_remote, string.Empty, cancellationToken),
+                    SyncRootConnection.ListingTimeout,
+                    _log);
+                _server.Changed += online =>
+                {
+                    if (online)
+                    {
+                        UploadDeferred();
+                    }
+                };
+
                 _connection = new SyncRootConnection(
                     _store,
                     _serve,
                     _log,
                     deleteRemote: HandleRemoteDeleteAsync,
                     renameRemote: HandleRemoteRenameAsync,
-                    listDirectory: ListNewRemoteEntriesAsync);
+                    listDirectory: ListNewRemoteEntriesAsync,
+                    server: _server);
 
                 // Off the callback thread: the shell is still waiting on it.
                 _connection.DirectoryListed += directory => _ = Task.Run(() => ApplyServerChangesAsync(directory));
@@ -1588,6 +1617,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
 
         _ = Task.Run(async () =>
         {
+            var deferred = false;
             try
             {
                 // Debounce: editors write several times per save.
@@ -1608,6 +1638,14 @@ public sealed class CloudSyncEngine : IAsyncDisposable
                 // an edit made right after one is still uploaded.
                 if (IsProviderWrite(localPath) && !HasUnsyncedLocalChanges(localPath))
                 {
+                    return;
+                }
+
+                // Offline, nothing is sent: the file is uploaded once the
+                // server answers, as Nextcloud's next sync run would.
+                if (_server is { IsOnline: false })
+                {
+                    deferred = true;
                     return;
                 }
 
@@ -1632,6 +1670,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             catch (Exception ex)
             {
                 _log?.Invoke($"Upload failed for '{localPath}': {ex.Message}");
+                if (_server is not null && ServerConnection.IsUnreachable(ex))
+                {
+                    _server.Failed(ex.Message);
+                    deferred = true;
+                }
             }
             finally
             {
@@ -1639,8 +1682,45 @@ public sealed class CloudSyncEngine : IAsyncDisposable
                 {
                     _uploading.Remove(localPath);
                 }
+
+                // Only now, so the upload once online is not turned away as
+                // one still running.
+                if (deferred)
+                {
+                    DeferUpload(localPath);
+                }
             }
         });
+    }
+
+    /// <summary>Uploads a file once the server answers again.</summary>
+    private void DeferUpload(string localPath)
+    {
+        if (_deferredUploads.TryAdd(localPath, 0))
+        {
+            _log?.Invoke($"Offline: '{RelativeOf(localPath)}' is uploaded once the server answers.");
+        }
+
+        // Back online meanwhile: Changed has already fired.
+        if (_server is { IsOnline: true })
+        {
+            UploadDeferred();
+        }
+        else
+        {
+            _server?.CheckNow();
+        }
+    }
+
+    private void UploadDeferred()
+    {
+        foreach (var localPath in _deferredUploads.Keys)
+        {
+            if (_deferredUploads.TryRemove(localPath, out _))
+            {
+                QueueUpload(localPath);
+            }
+        }
     }
 
     public async Task<bool> UploadAsync(string localPath, CancellationToken cancellationToken = default)
@@ -1774,6 +1854,9 @@ public sealed class CloudSyncEngine : IAsyncDisposable
 
         _connection?.Dispose();
         _connection = null;
+
+        _server?.Dispose();
+        _server = null;
 
         _serve?.Dispose();
         _serve = null;

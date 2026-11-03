@@ -219,6 +219,11 @@ public sealed class SyncWorker(
         }
 
         var initialized = _initialized;
+        var (state, detail) = _state == ServiceState.Syncing && _engine is { IsOnline: false } engine
+            ? (ServiceState.Offline,
+               $"The server cannot be reached ({engine.OfflineReason}). Folders show what is on this PC, and changes " +
+               "are sent once it answers; it is checked again when the network changes, when the drive is used, and every minute or so.")
+            : (_state, _detail);
         return new ServiceStatus(
             Environment.ProcessId,
             _startedAt,
@@ -226,8 +231,8 @@ public sealed class SyncWorker(
             settings.SyncRoot.Value,
             settings.Remote.Value,
             settings.RcUrl.Value,
-            _state,
-            _detail,
+            state,
+            detail,
             initialized?.Registered ?? false,
             initialized?.Connected ?? false,
             items,

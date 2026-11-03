@@ -258,6 +258,21 @@ internal struct CF_CALLBACK_INFO
     public long RequestKey;
 }
 
+// What CF_CALLBACK_INFO.ProcessInfo points to: the process whose I/O raised
+// the callback. Set only for a connection made with
+// CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO.
+[StructLayout(LayoutKind.Sequential)]
+internal struct CF_PROCESS_INFO
+{
+    public uint StructSize;
+    public uint ProcessId;
+    public IntPtr ImagePath;
+    public IntPtr PackageName;
+    public IntPtr ApplicationId;
+    public IntPtr CommandLine;
+    public uint SessionId;
+}
+
 // Overlays the native CF_CALLBACK_PARAMETERS union. Only the members this
 // provider consumes are modelled; every member starts at the same offset
 // (8, immediately after ParamSize and its padding).

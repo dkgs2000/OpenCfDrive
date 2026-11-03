@@ -49,6 +49,7 @@ public sealed class SyncRootConnection : IDisposable
     private readonly Func<string, Task>? _deleteRemote;
     private readonly Func<string, string, RenameSource?, Task>? _renameRemote;
     private readonly Func<string, CancellationToken, Task<IReadOnlyList<PlaceholderEntry>>>? _listDirectory;
+    private readonly ServerConnection? _server;
 
     /// <summary>
     /// How long a folder's remote listing may take before the shell is
@@ -56,7 +57,7 @@ public sealed class SyncRootConnection : IDisposable
     /// up but cannot reach the server, and it keeps retrying; without a limit
     /// the shell would wait for the platform's 60 s timeout and show an error.
     /// </summary>
-    private static readonly TimeSpan ListingTimeout = TimeSpan.FromSeconds(10);
+    internal static readonly TimeSpan ListingTimeout = TimeSpan.FromSeconds(10);
 
     // Full local paths of deletes, moves and renames the user made that have
     // not reached the server yet (count per path).
@@ -88,6 +89,10 @@ public sealed class SyncRootConnection : IDisposable
     /// fully populated after an answer before refreshes are switched back on.
     /// A re-list after the window sees the live remote again.
     /// </param>
+    /// <param name="server">
+    /// Whether the server answers. While it does not, listings show what is
+    /// local and downloads fail at once instead of waiting on the network.
+    /// </param>
     public SyncRootConnection(
         SqliteMetadataStore store,
         RcloneServeClient serve,
@@ -95,7 +100,8 @@ public sealed class SyncRootConnection : IDisposable
         Func<string, Task>? deleteRemote = null,
         Func<string, string, RenameSource?, Task>? renameRemote = null,
         Func<string, CancellationToken, Task<IReadOnlyList<PlaceholderEntry>>>? listDirectory = null,
-        TimeSpan? listingReuseWindow = null)
+        TimeSpan? listingReuseWindow = null,
+        ServerConnection? server = null)
     {
         _store = store;
         _serve = serve;
@@ -104,6 +110,7 @@ public sealed class SyncRootConnection : IDisposable
         _renameRemote = renameRemote;
         _listDirectory = listDirectory;
         _listingReuseWindow = listingReuseWindow ?? TimeSpan.FromSeconds(1);
+        _server = server;
     }
 
     public bool IsConnected => _connected;
@@ -192,11 +199,12 @@ public sealed class SyncRootConnection : IDisposable
             },
         };
 
+        // Process info: the log says which program asked for a listing.
         var hr = CfApi.CfConnectSyncRoot(
             syncRootPath,
             table,
             IntPtr.Zero,
-            CF_CONNECT_FLAGS.CF_CONNECT_FLAG_NONE,
+            CF_CONNECT_FLAGS.CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO,
             out _connectionKey);
 
         _connected = CfApi.Succeeded(hr);
@@ -222,6 +230,16 @@ public sealed class SyncRootConnection : IDisposable
             if (remotePath is null)
             {
                 _log?.Invoke($"FETCH_DATA for unknown file id {info.FileId}; completing with failure.");
+                CompleteWithFailure(info, fetch.RequiredFileOffset, fetch.RequiredLength);
+                return;
+            }
+
+            // Offline, an online-only file cannot be opened, and fails at once
+            // instead of waiting on the network (as in Nextcloud).
+            if (_server is { IsOnline: false })
+            {
+                _log?.Invoke($"[{DateTimeOffset.Now:HH:mm:ss.fff}] Offline: '{remotePath}' is not on this PC and cannot be downloaded until the server answers.");
+                _server.CheckNow();
                 CompleteWithFailure(info, fetch.RequiredFileOffset, fetch.RequiredLength);
                 return;
             }
@@ -259,6 +277,7 @@ public sealed class SyncRootConnection : IDisposable
                     (_, mark) => (Math.Max(0, mark.Active - 1), DateTimeOffset.UtcNow));
             }
 
+            _server?.Succeeded();
             _store.MarkHydrated(remotePath);
             Hydrated?.Invoke(new HydrationCompleted(
                 normalizedPath,
@@ -269,6 +288,11 @@ public sealed class SyncRootConnection : IDisposable
         catch (Exception ex)
         {
             _log?.Invoke($"FETCH_DATA failed: {ex}");
+            if (ServerConnection.IsUnreachable(ex))
+            {
+                _server?.Failed(ex.Message);
+            }
+
             try
             {
                 // Bytes already accepted stay; only the rest is failed.
@@ -450,14 +474,20 @@ public sealed class SyncRootConnection : IDisposable
                 return;
             }
 
+            // Who asked, and for which names ("*" for a listing, a single name
+            // for a lookup).
+            var pattern = Marshal.PtrToStringUni(
+                Marshal.PtrToStructure<CF_CALLBACK_PARAMETERS>(callbackParametersPtr).FetchPlaceholdersPattern);
+            var requester = $"{RequesterOf(info)}, pattern '{pattern}'";
+
             var clock = Stopwatch.StartNew();
-            var (entries, listed) = ListCoalesced(directory);
+            var (entries, listed) = ListCoalesced(directory, requester);
             TransferPlaceholders(info, entries, StatusSuccess);
             ScheduleRepopulation(directory);
             if (listed)
             {
                 _log?.Invoke(
-                    $"[{DateTimeOffset.Now:HH:mm:ss.fff}] FETCH_PLACEHOLDERS '{directory}' -> " +
+                    $"[{DateTimeOffset.Now:HH:mm:ss.fff}] FETCH_PLACEHOLDERS '{directory}' for {requester} -> " +
                     $"{entries.Count} new in {clock.ElapsedMilliseconds} ms" +
                     (entries.Count > 0 ? $": {string.Join(", ", entries.Select(e => e.RelativeName))}" : "."));
                 DirectoryListed?.Invoke(directory);
@@ -481,11 +511,19 @@ public sealed class SyncRootConnection : IDisposable
     /// At most one remote listing per directory per reuse window. Callbacks
     /// inside the window return nothing new: whatever the last listing found
     /// was already transferred. A listing that fails or takes longer than
-    /// ListingTimeout (remote offline) also returns nothing, so the shell
-    /// shows the local entries (empty if there are none) instead of an error.
+    /// ListingTimeout also returns nothing, so the shell shows the local
+    /// entries (empty if there are none) instead of an error; if the server
+    /// could not be reached, the drive goes offline, and until it answers
+    /// again every listing shows what is local at once (see ServerConnection).
     /// </summary>
-    private (IReadOnlyList<PlaceholderEntry> Entries, bool Listed) ListCoalesced(string directory)
+    private (IReadOnlyList<PlaceholderEntry> Entries, bool Listed) ListCoalesced(string directory, string requester)
     {
+        if (_server is { IsOnline: false })
+        {
+            _server.CheckNow();
+            return ([], false);
+        }
+
         var gate = _listingGates.GetOrAdd(directory, _ => new SemaphoreSlim(1, 1));
         gate.Wait();
         try
@@ -496,15 +534,28 @@ public sealed class SyncRootConnection : IDisposable
                 return ([], false);
             }
 
+            // Gone offline while this one waited for the gate.
+            if (_server is { IsOnline: false })
+            {
+                return ([], false);
+            }
+
             using var timeout = new CancellationTokenSource(ListingTimeout);
             try
             {
-                return (_listDirectory!(directory, timeout.Token).GetAwaiter().GetResult(), true);
+                var entries = _listDirectory!(directory, timeout.Token).GetAwaiter().GetResult();
+                _server?.Succeeded();
+                return (entries, true);
             }
             catch (Exception ex)
             {
                 var reason = timeout.IsCancellationRequested ? $"no answer within {ListingTimeout.TotalSeconds:0} s" : ex.Message;
-                _log?.Invoke($"FETCH_PLACEHOLDERS '{directory}': remote listing failed, showing local entries: {reason}");
+                _log?.Invoke($"[{DateTimeOffset.Now:HH:mm:ss.fff}] FETCH_PLACEHOLDERS '{directory}' for {requester}: remote listing failed, showing local entries: {reason}");
+                if (timeout.IsCancellationRequested || ServerConnection.IsUnreachable(ex))
+                {
+                    _server?.Failed(reason);
+                }
+
                 return ([], false);
             }
             finally
@@ -561,6 +612,19 @@ public sealed class SyncRootConnection : IDisposable
 
             _log?.Invoke($"Could not switch refreshes back on for '{directory}'; it shows server changes again after a restart.");
         });
+    }
+
+    /// <summary>The program whose I/O raised a callback, as "name (pid)".</summary>
+    private static string RequesterOf(CF_CALLBACK_INFO info)
+    {
+        if (info.ProcessInfo == IntPtr.Zero)
+        {
+            return "an unknown program";
+        }
+
+        var process = Marshal.PtrToStructure<CF_PROCESS_INFO>(info.ProcessInfo);
+        var image = process.ImagePath == IntPtr.Zero ? null : Marshal.PtrToStringUni(process.ImagePath);
+        return $"{(string.IsNullOrEmpty(image) ? "pid" : Path.GetFileName(image))} ({process.ProcessId})";
     }
 
     /// <summary>Sync-root-relative directory ('/' separated, empty for the root).</summary>

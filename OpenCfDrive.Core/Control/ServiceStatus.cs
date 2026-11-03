@@ -41,6 +41,9 @@ public enum ServiceState
     /// <summary>The drive is registered and connected.</summary>
     Syncing,
 
+    /// <summary>The server cannot be reached: folders show what is on this PC, and changes wait.</summary>
+    Offline,
+
     /// <summary>The Cloud Files API is missing; nothing syncs.</summary>
     Unavailable,
 
