@@ -75,6 +75,7 @@ $mountCheck = {
     # RecallOnDataAccess (0x400000) is not a named FileAttributes member in
     # this build, so test it numerically. Offline = 0x1000, ReparsePoint = 0x400.
     $RecallOnDataAccess = 0x400000
+    $isDehydrated = { param($p) ((Get-Item -LiteralPath $p -Force).Attributes -band $RecallOnDataAccess) -ne 0 }
     $isPlaceholder = (($attrs -band $RecallOnDataAccess) -ne 0) -or
                      (($attrs -band [System.IO.FileAttributes]::Offline) -ne 0)
     if (-not $isPlaceholder) {
@@ -94,11 +95,13 @@ $mountCheck = {
 
     # The hydrated bytes must be kept: if the placeholder is still marked for
     # recall afterwards, every later read and any write will hit cfapi timeouts.
-    $after = (Get-Item -LiteralPath $beta -Force).Attributes
-    if (($after -band $RecallOnDataAccess) -ne 0) {
+    # Windows lets the read through as soon as its bytes arrive and clears the
+    # mark a moment later (on CI the read has returned first), so wait for it.
+    if (-not (Wait-ForAttributes $beta { -not (& $isDehydrated $beta) })) {
+        $after = (Get-Item -LiteralPath $beta -Force).Attributes
         throw "beta.txt is still dehydrated after a successful read (attributes: $after); hydration is not persisting."
     }
-    Write-E2ELog "MOUNT: beta.txt is locally available (attributes: $after)"
+    Write-E2ELog "MOUNT: beta.txt is locally available (attributes: $((Get-Item -LiteralPath $beta -Force).Attributes))"
 
     # 5. A file inside a directory placeholder hydrates the same way.
     $readme = Join-Path $docs "readme.txt"
@@ -143,16 +146,14 @@ $mountCheck = {
     # 8. "Free up space" and "Always keep on this device" only set the
     #     unpinned / pinned attribute (attrib +U / +P is the same thing); the
     #     provider must drop or download the local copy.
-    $isDehydrated = { param($p) ((Get-Item -LiteralPath $p -Force).Attributes -band $RecallOnDataAccess) -ne 0 }
-
     & attrib.exe -P +U $beta | Out-Null
-    if (-not (Wait-ForCondition { & $isDehydrated $beta } -TimeoutSeconds 15)) {
+    if (-not (Wait-ForAttributes $beta { & $isDehydrated $beta })) {
         throw "Free up space (attrib +U) did not remove the local copy of beta.txt."
     }
     Write-E2ELog "MOUNT: free up space removed the local copy of beta.txt"
 
     & attrib.exe -U +P $beta | Out-Null
-    if (-not (Wait-ForCondition { -not (& $isDehydrated $beta) } -TimeoutSeconds 15)) {
+    if (-not (Wait-ForAttributes $beta { -not (& $isDehydrated $beta) })) {
         throw "Always keep on this device (attrib +P) did not download beta.txt."
     }
     $pinnedContent = [System.IO.File]::ReadAllText($beta)
@@ -164,7 +165,7 @@ $mountCheck = {
 
     # On a folder: everything local inside it is freed.
     & attrib.exe +U $docs | Out-Null
-    if (-not (Wait-ForCondition { & $isDehydrated $readme } -TimeoutSeconds 15)) {
+    if (-not (Wait-ForAttributes $readme { & $isDehydrated $readme })) {
         throw "Free up space on the docs folder did not remove the local copies inside it."
     }
     & attrib.exe -U $docs | Out-Null

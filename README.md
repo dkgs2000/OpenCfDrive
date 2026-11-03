@@ -366,6 +366,10 @@ shows what each scenario cost.
   copies; `attrib +P` (Always keep on this device) downloads without opening
 - an Explorer window can be opened at the sync root
 
+Whether a file is downloaded is checked by waiting on Windows' attribute change
+notifications for it (`Wait-ForAttributes`), not by polling: Windows marks a
+file downloaded a moment after the read that downloaded it returns.
+
 The sync root defaults to `%TEMP%\opencfdrive-e2e[-mock][-s3]\drive` and is
 removed at the end, so the tests never touch your own folders. Pass `-SyncRoot`
 to mount somewhere else, or `-KeepRegistration` to leave the mount in place.
