@@ -434,12 +434,22 @@ namespace up front, OpenCfDrive fills each folder on demand.
   back at the same path is a replacement. A file appearing elsewhere with the
   size and exact write time the deleted one last had in sync is the same file
   moved, and becomes one server move instead of a delete and an upload.
+- **In-sync alone does not prove a file unchanged.** The platform clears
+  in-sync on most writes, but not all: an append that starts on a page boundary
+  (to a downloaded 4 KiB file, say) leaves it set. So, like other sync clients
+  (Nextcloud compares size and modification time with its journal), the
+  provider also compares the file's size and write time with what they were
+  when it was last in sync, and only a file that is in sync and matches both
+  counts as unchanged. That is the server's size and time for a placeholder
+  made from a listing or updated from the server (downloading and freeing up
+  space keep both), and the file's own after an upload, since servers usually
+  stamp their own time; the store keeps them.
 - **A rename clears in-sync; the provider sets it again.** The platform clears
   a placeholder's in-sync state on every rename. The provider reads the state
   in `NOTIFY_RENAME`, before acknowledging, and once the rename has reached the
   server it sets the new identity together with `MARK_IN_SYNC`, but only if the
-  file was in sync and has not been written since. Otherwise the renamed file
-  would look edited and be downloaded and uploaded again.
+  file was unchanged (see above) and has not been written since. Otherwise the
+  renamed file would look edited and be downloaded and uploaded again.
 - **Folders.** A folder deleted locally deletes the files this client knows and
   then removes the server folder only if it is empty (`operations/rmdirs`), so
   files added on the server that this client never listed survive. Each file

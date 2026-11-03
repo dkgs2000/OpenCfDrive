@@ -17,9 +17,6 @@ namespace OpenCfDrive.Tests;
 /// </summary>
 public class FetchPlaceholdersContractTest(ITestOutputHelper output)
 {
-    /// <summary>A little longer than SyncRootConnection's default reuse window.</summary>
-    private static readonly TimeSpan ReuseWindow = TimeSpan.FromSeconds(1.5);
-
     [SkippableFact]
     public void EveryEnumeration_PicksUpEntriesAddedOnTheRemote()
     {
@@ -62,6 +59,25 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
 
         using var connection = new SyncRootConnection(
             store, serve, output.WriteLine, listDirectory: ListDirectory);
+        var resumed = new ConcurrentDictionary<string, AutoResetEvent>(StringComparer.OrdinalIgnoreCase);
+        connection.RefreshesResumed += directory => resumed.GetOrAdd(directory, _ => new AutoResetEvent(false)).Set();
+
+        // Until the connection has switched refreshes back on for a directory
+        // ("partially populated" again), which it does in the background a
+        // moment after each answer; only then does a listing reach the server.
+        void WaitUntilRefreshable(string directory)
+        {
+            var signal = resumed.GetOrAdd(directory, _ => new AutoResetEvent(false));
+            var path = directory.Length == 0 ? syncRoot : Path.Combine(syncRoot, directory);
+            var clock = Stopwatch.StartNew();
+            while (!new CloudPlaceholderService().QueryState(path).Partial)
+            {
+                var left = TimeSpan.FromSeconds(30) - clock.Elapsed;
+                Assert.True(left > TimeSpan.Zero && signal.WaitOne(left), $"Refreshes were not switched back on for '{path}'.");
+            }
+
+            output.WriteLine($"refreshable again after {clock.ElapsedMilliseconds} ms: '{directory}'");
+        }
 
         try
         {
@@ -81,23 +97,24 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
             Assert.Contains("first.txt", first);
             Assert.Contains("docs", first);
 
-            // Added "on the server" after the first listing. Within the reuse
-            // window the shell is answered from the previous listing, so wait
-            // it out the way a user's next refresh naturally would.
+            // Added "on the server" after the first listing. Until refreshes
+            // are switched back on, the shell is answered from the previous
+            // listing, so wait for that the way a user's next refresh would.
             Add("", new PlaceholderEntry("late.txt", false, 4, now, "late.txt"));
-            Thread.Sleep(ReuseWindow);
+            WaitUntilRefreshable("");
             var second = Enumerate(syncRoot);
             Assert.Contains("first.txt", second);
             Assert.Contains("late.txt", second);
 
             // A nested directory placeholder is refreshed the same way.
+            var docs = Path.Combine(syncRoot, "docs");
             Add("docs", new PlaceholderEntry("nested.txt", false, 6, now, "docs/nested.txt"));
-            var nested = Enumerate(Path.Combine(syncRoot, "docs"));
+            var nested = Enumerate(docs);
             Assert.Contains("nested.txt", nested);
 
             Add("docs", new PlaceholderEntry("nested-late.txt", false, 6, now, "docs/nested-late.txt"));
-            Thread.Sleep(ReuseWindow);
-            var nestedAgain = Enumerate(Path.Combine(syncRoot, "docs"));
+            WaitUntilRefreshable("docs");
+            var nestedAgain = Enumerate(docs);
             Assert.Contains("nested.txt", nestedAgain);
             Assert.Contains("nested-late.txt", nestedAgain);
 
@@ -105,14 +122,14 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
             // first. If the answer leaves the directory "partially
             // populated", the create is retried until it fails with "The
             // name of the file cannot be resolved by the system".
-            Thread.Sleep(ReuseWindow);
+            WaitUntilRefreshable("");
             CreateFileFromAnotherProcess(Path.Combine(syncRoot, "created-locally.txt"));
-            Thread.Sleep(ReuseWindow);
-            CreateFileFromAnotherProcess(Path.Combine(syncRoot, "docs", "created-locally.txt"));
+            WaitUntilRefreshable("docs");
+            CreateFileFromAnotherProcess(Path.Combine(docs, "created-locally.txt"));
 
             // ...and refreshes keep working after a local create.
             Add("", new PlaceholderEntry("after-create.txt", false, 3, now, "after-create.txt"));
-            Thread.Sleep(ReuseWindow);
+            WaitUntilRefreshable("");
             Assert.Contains("after-create.txt", Enumerate(syncRoot));
 
             // One enumeration raises hundreds of FETCH_PLACEHOLDERS callbacks;

@@ -124,6 +124,13 @@ public sealed class SyncRootConnection : IDisposable
     /// </summary>
     public event Action<string>? DirectoryListed;
 
+    /// <summary>
+    /// Raised when refreshes are switched back on for a directory after an
+    /// answer (see <see cref="ScheduleRepopulation"/>): from then on its next
+    /// listing asks the server again. The argument is sync-root-relative.
+    /// </summary>
+    public event Action<string>? RefreshesResumed;
+
     public sealed record HydrationCompleted(string LocalPath, string RemotePath, long Offset, long Length);
 
     public sealed record RemoteDeleted(string LocalPath, string RemotePath);
@@ -538,8 +545,14 @@ public sealed class SyncRootConnection : IDisposable
             // program holding the folder open can briefly prevent.
             for (var attempt = 1; attempt <= 10; attempt++)
             {
-                if (!_connected || !Directory.Exists(path) || _placeholders.EnableOnDemandPopulation(path))
+                if (!_connected || !Directory.Exists(path))
                 {
+                    return;
+                }
+
+                if (_placeholders.EnableOnDemandPopulation(path))
+                {
+                    RefreshesResumed?.Invoke(directory);
                     return;
                 }
 

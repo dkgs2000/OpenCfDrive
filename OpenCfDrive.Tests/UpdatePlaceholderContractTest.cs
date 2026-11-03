@@ -30,18 +30,13 @@ public class UpdatePlaceholderContractTest(ITestOutputHelper output)
                 Assert.Equal("old-content", File.ReadAllText(path));
                 Assert.Equal(1, fetches());
 
-                // A local edit clears in-sync; the engine marks the file in
-                // sync again after uploading it. Until then, a server change
-                // must be refused (VERIFY_IN_SYNC) so the edit is not lost.
+                // An edited file, uploaded and marked in sync again by the
+                // engine. Whether the edit cleared in-sync is not relied on:
+                // Windows does not do it for every write.
                 File.AppendAllText(path, "-edited");
-                Assert.False(placeholders.QueryState(path).InSync, "A local edit should clear in-sync.");
-                var refused = placeholders.UpdateFromRemote(path, 1, DateTimeOffset.UtcNow);
-                output.WriteLine($"UpdateFromRemote on an edited file -> {HResult.Describe(refused)}");
-                Assert.False(CfApi.Succeeded(refused), "A server change overwrote a local edit.");
-                Assert.Equal("old-content-edited", File.ReadAllText(path));
-
                 Assert.True(placeholders.MarkInSync(path, CloudPlaceholderService.BuildFileIdentity("file.txt")), "MarkInSync failed.");
                 Assert.True(placeholders.QueryState(path).InSync, "MarkInSync did not set in-sync.");
+                Assert.Equal("old-content-edited", File.ReadAllText(path));
             }
 
             content = Encoding.UTF8.GetBytes("new-content-from-server");
@@ -68,10 +63,10 @@ public class UpdatePlaceholderContractTest(ITestOutputHelper output)
             var path = Path.Combine(syncRoot, "file.txt");
             Assert.Equal("old-content", File.ReadAllText(path));
             File.AppendAllText(path, "-edited");
-            Assert.False(placeholders.QueryState(path).InSync, "A local edit should clear in-sync.");
 
-            // Server wins: the edit is dropped and the server's version is
-            // what the next read gets.
+            // Server wins: the edit is dropped (in sync or not, see
+            // SizeAndWriteTime_StayAsSynced_UntilTheFileIsEdited) and the
+            // server's version is what the next read gets.
             content = Encoding.UTF8.GetBytes("new-content-from-server");
             var hr = placeholders.UpdateFromRemote(path, content.Length, DateTimeOffset.UtcNow, discardLocalChanges: true);
             output.WriteLine($"UpdateFromRemote(discard) on an edited file -> {HResult.Describe(hr)}");
@@ -80,6 +75,49 @@ public class UpdatePlaceholderContractTest(ITestOutputHelper output)
             Assert.Equal(0, CloudPlaceholderService.GetOnDiskSize(path));
             Assert.Equal("new-content-from-server", File.ReadAllText(path));
         });
+    }
+
+    /// <summary>
+    /// What the engine tells an edit by besides in-sync, which Windows does
+    /// not clear for every write (an append starting on a page boundary
+    /// leaves it set): the file's size and write time. Downloading the file
+    /// and freeing up its space keep both, and a server update sets them to
+    /// exactly the server's, which is what the store records.
+    /// </summary>
+    [SkippableFact]
+    public void SizeAndWriteTime_StayAsSynced_UntilTheFileIsEdited()
+    {
+        var content = Encoding.UTF8.GetBytes("synced-content");
+
+        RunInSyncRoot(() => content, (syncRoot, placeholders, fetches) =>
+        {
+            var path = Path.Combine(syncRoot, "file.txt");
+            var synced = SizeAndWriteTime(path);
+
+            Assert.Equal("synced-content", File.ReadAllText(path));
+            Assert.Equal(synced, SizeAndWriteTime(path));
+
+            Assert.True(placeholders.Dehydrate(path), "Freeing up space failed.");
+            Assert.Equal(synced, SizeAndWriteTime(path));
+
+            var serverTime = new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero).AddTicks(1234567);
+            content = Encoding.UTF8.GetBytes("server-version");
+            var hr = placeholders.UpdateFromRemote(path, content.Length, serverTime);
+            Assert.True(CfApi.Succeeded(hr), $"UpdateFromRemote failed with {HResult.Describe(hr)}");
+            Assert.Equal((content.Length, serverTime.UtcDateTime), SizeAndWriteTime(path));
+
+            Assert.Equal("server-version", File.ReadAllText(path));
+            Assert.Equal((content.Length, serverTime.UtcDateTime), SizeAndWriteTime(path));
+
+            File.AppendAllText(path, "-edited");
+            Assert.NotEqual((content.Length, serverTime.UtcDateTime), SizeAndWriteTime(path));
+        });
+    }
+
+    private static (long Length, DateTime WriteUtc) SizeAndWriteTime(string path)
+    {
+        var info = new FileInfo(path);
+        return (info.Length, info.LastWriteTimeUtc);
     }
 
     [SkippableFact]
