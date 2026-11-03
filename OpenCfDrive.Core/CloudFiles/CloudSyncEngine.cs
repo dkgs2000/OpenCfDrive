@@ -1456,7 +1456,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             }
 
             _providerWrites[localPath] = DateTimeOffset.UtcNow;
-            if (_placeholders.Dehydrate(localPath))
+            if (_placeholders.Dehydrate(localPath, new FileInfo(localPath).Length))
             {
                 _store.MarkDehydrated(relative);
                 _log?.Invoke($"Free up space: removed the local copy of '{relative}'.");
@@ -2617,7 +2617,12 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             var identity = CloudPlaceholderService.BuildFileIdentity(relative);
             if (state.IsPlaceholder)
             {
-                _placeholders.MarkInSync(localPath, identity);
+                // With the file's size: the platform's own record of it is
+                // what Free up space later downloads back, and an edit in
+                // place does not change it (EditedPlaceholderContractTest).
+                // The size it has now, not as sent: a write since then is
+                // uploaded next, and must not be given a size it no longer has.
+                _placeholders.MarkInSync(localPath, identity, new FileInfo(localPath).Length);
             }
             else
             {

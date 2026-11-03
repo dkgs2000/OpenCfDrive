@@ -468,25 +468,39 @@ public sealed class CloudPlaceholderService
     }
 
     /// <summary>Marks a hydrated/uploaded placeholder as in sync (green check overlay).</summary>
-    public bool MarkInSync(string localPath, byte[] fileIdentity)
+    /// <param name="fileSize">
+    /// The file's size as uploaded. The platform keeps its own record of a
+    /// placeholder's size, which writes do not change; without the new one,
+    /// an edit that changed the size is downloaded to the old size after Free
+    /// up space (the rest reads as zeros). Nextcloud's updatePlaceholderInfo
+    /// passes it on every upload too.
+    /// </param>
+    public bool MarkInSync(string localPath, byte[] fileIdentity, long? fileSize = null)
     {
         if (!CloudFilesCapability.Current.IsSupported)
         {
             return false;
         }
 
-        return UpdateWithIdentity(localPath, fileIdentity, CF_UPDATE_FLAGS.CF_UPDATE_FLAG_MARK_IN_SYNC);
+        return UpdateWithIdentity(localPath, fileIdentity, CF_UPDATE_FLAGS.CF_UPDATE_FLAG_MARK_IN_SYNC, fileSize);
     }
 
-    private static bool UpdateWithIdentity(string localPath, byte[] fileIdentity, CF_UPDATE_FLAGS flags)
+    private static bool UpdateWithIdentity(string localPath, byte[] fileIdentity, CF_UPDATE_FLAGS flags, long? fileSize = null)
     {
         var identityPtr = Marshal.AllocHGlobal(fileIdentity.Length == 0 ? 1 : fileIdentity.Length);
+        var metadataPtr = fileSize is null ? IntPtr.Zero : Marshal.AllocHGlobal(Marshal.SizeOf<CF_FS_METADATA>());
         try
         {
             Marshal.Copy(fileIdentity, 0, identityPtr, fileIdentity.Length);
+            if (fileSize is { } size)
+            {
+                // Zero times and attributes mean "unchanged".
+                Marshal.StructureToPtr(new CF_FS_METADATA { FileSize = size }, metadataPtr, fDeleteOld: false);
+            }
+
             return CfApi.Succeeded(WithMetadataHandle(localPath, handle => CfApi.CfUpdatePlaceholder(
                 handle,
-                IntPtr.Zero,
+                metadataPtr,
                 identityPtr,
                 (uint)fileIdentity.Length,
                 IntPtr.Zero,
@@ -498,6 +512,10 @@ public sealed class CloudPlaceholderService
         finally
         {
             Marshal.FreeHGlobal(identityPtr);
+            if (metadataPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(metadataPtr);
+            }
         }
     }
 
@@ -518,12 +536,23 @@ public sealed class CloudPlaceholderService
     /// <summary>
     /// Evicts the local copy of a hydrated placeholder so the next read has to
     /// go through FETCH_DATA again. Length -1 (CF_EOF) means the whole file.
+    /// Only a file in sync is freed.
     /// </summary>
-    public bool Dehydrate(string localPath)
+    /// <param name="fileSize">
+    /// Given again with it, as Nextcloud does: the next read downloads as much
+    /// as the platform's own record of the size says, and a placeholder marked
+    /// in sync without its new size after an edit still has the old one.
+    /// </param>
+    public bool Dehydrate(string localPath, long? fileSize = null)
     {
         if (!CloudFilesCapability.Current.IsSupported)
         {
             return false;
+        }
+
+        if (fileSize is { } size)
+        {
+            return CfApi.Succeeded(UpdateFromRemote(localPath, size, modifiedUtc: null));
         }
 
         return CfApi.Succeeded(WithWin32Handle(localPath, handle => CfApi.CfDehydratePlaceholder(
@@ -538,6 +567,10 @@ public sealed class CloudPlaceholderService
     /// Downloads the whole file into the placeholder (the platform raises
     /// FETCH_DATA, which this process serves). Used for "Always keep on this
     /// device". Returns the HRESULT.
+    /// Through a handle without data access, which the platform accepts: a
+    /// write handle refuses every program that opens the file for reading
+    /// only (sharing read), and it is still open for a moment after the file
+    /// shows as downloaded.
     /// </summary>
     public int Hydrate(string localPath)
     {
@@ -546,7 +579,7 @@ public sealed class CloudPlaceholderService
             return -1;
         }
 
-        return WithWin32Handle(localPath, handle => CfApi.CfHydratePlaceholder(
+        return WithMetadataHandle(localPath, handle => CfApi.CfHydratePlaceholder(
             handle,
             0,
             -1,
