@@ -312,9 +312,42 @@ public sealed class RcloneRcClient : IDisposable
     /// Moves a whole directory (<c>sync/move</c>). Uses the server's own
     /// directory move where it has one; otherwise rclone copies and deletes.
     /// </summary>
+    /// <summary>
+    /// Whether the remote keeps a folder with nothing in it (rclone's
+    /// CanHaveEmptyDirectories, from <c>operations/fsinfo</c>). Bucket stores
+    /// such as S3 only have folders as parts of file names.
+    /// </summary>
+    public async Task<bool> CanHaveEmptyDirectoriesAsync(string remotePath, CancellationToken cancellationToken = default)
+    {
+        var (fs, _) = SplitRemote(remotePath);
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{_rcUrl}/operations/fsinfo")
+        {
+            Content = new StringContent(JsonSerializer.Serialize(new { fs }), System.Text.Encoding.UTF8, "application/json"),
+        };
+
+        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
+        return !doc.RootElement.TryGetProperty("Features", out var features) ||
+               !features.TryGetProperty("CanHaveEmptyDirectories", out var empty) ||
+               empty.ValueKind != JsonValueKind.False;
+    }
+
+    /// <summary>
+    /// Creates a folder and any missing parents (<c>operations/mkdir</c>); one
+    /// that exists already is fine. Remotes without real folders (S3 without
+    /// directory markers) accept it and keep nothing until a file is inside.
+    /// </summary>
+    public async Task MakeDirectoryAsync(string fs, string remoteDirectory, CancellationToken cancellationToken = default)
+    {
+        await PostAsync("operations/mkdir", new { fs, remote = remoteDirectory }, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task MoveDirectoryAsync(string srcFs, string dstFs, CancellationToken cancellationToken = default)
     {
-        await PostAsync("sync/move", new { srcFs, dstFs, deleteEmptySrcDirs = true }, cancellationToken).ConfigureAwait(false);
+        // Empty folders move too: a folder made here is on the server even
+        // with nothing in it, and must stay there under its new name.
+        await PostAsync("sync/move", new { srcFs, dstFs, createEmptySrcDirs = true, deleteEmptySrcDirs = true }, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

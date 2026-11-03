@@ -81,7 +81,8 @@ public sealed class SyncWorker(
             ServiceControl.PipeName(syncRoot),
             BuildStatus,
             lifetime.StopApplication,
-            message => logger.LogInformation("{Message}", message));
+            message => logger.LogInformation("{Message}", message),
+            syncNow: () => _engine?.SyncNowAsync() ?? Task.CompletedTask);
         _control.Start();
 
         var endpoint = await ConnectRcloneAsync(settings, stoppingToken).ConfigureAwait(false);
@@ -111,6 +112,7 @@ public sealed class SyncWorker(
             if (status.CloudFilesSupported)
             {
                 _engine.StartWatcher();
+                _engine.StartBackgroundSync();
                 (_state, _detail) = status.Registered && status.Connected
                     ? (ServiceState.Syncing, "The drive is registered with Explorer and connected.")
                     : (ServiceState.Failed, "The drive could not be registered or connected; see the log.");

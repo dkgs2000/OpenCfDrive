@@ -84,6 +84,40 @@ public class SqliteMetadataStoreTests
     }
 
     [Fact]
+    public void PendingChanges_AreKeptInOrder_OnceEach_AcrossReopening()
+    {
+        var path = TempDbPath();
+        var store = new SqliteMetadataStore(path);
+        store.Initialize();
+
+        store.AddPendingChange(PendingChangeKind.Delete, "a.txt", @"C:\drive\a.txt");
+        store.AddPendingChange(PendingChangeKind.Rename, "old/", @"C:\drive\old", @"C:\drive\new");
+        store.AddPendingChange(PendingChangeKind.Delete, "a.txt", @"C:\drive\a.txt");
+
+        var reopened = new SqliteMetadataStore(path);
+        reopened.Initialize();
+        var changes = reopened.GetPendingChanges();
+        Assert.Collection(
+            changes,
+            delete => Assert.Equal((PendingChangeKind.Delete, "a.txt", (string?)null), (delete.Kind, delete.RemotePath, delete.NewLocalPath)),
+            rename => Assert.Equal((PendingChangeKind.Rename, "old/", @"C:\drive\new"), (rename.Kind, rename.RemotePath, rename.NewLocalPath)));
+
+        reopened.RemovePendingChange(changes[0].Id);
+        Assert.Equal("old/", Assert.Single(reopened.GetPendingChanges()).RemotePath);
+    }
+
+    [Fact]
+    public void GetDirectories_ReturnsOnlyFolders()
+    {
+        var store = new SqliteMetadataStore(TempDbPath());
+        store.Initialize();
+        store.UpsertFile("docs/", @"C:\drive\docs", "docs/", 0, true, true, 0, null);
+        store.UpsertFile("docs/a.txt", @"C:\drive\docs\a.txt", "docs/a.txt", 0, true, false, 1, null);
+
+        Assert.Equal("docs/", Assert.Single(store.GetDirectories()).RemotePath);
+    }
+
+    [Fact]
     public void Upsert_AndLookups_RoundTrip()
     {
         var store = new SqliteMetadataStore(TempDbPath());
