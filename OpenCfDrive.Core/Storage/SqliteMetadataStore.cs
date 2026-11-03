@@ -16,6 +16,14 @@ public sealed class SqliteMetadataStore
     /// <summary>Deletes a state database and its SQLite side files.</summary>
     public static void Delete(string dbPath)
     {
+        // A disposed connection stays open in Microsoft.Data.Sqlite's pool and
+        // keeps the file in use, so this process's own earlier reads would make
+        // the delete fail as if another process held it.
+        using (var connection = new SqliteConnection($"Data Source={dbPath}"))
+        {
+            SqliteConnection.ClearPool(connection);
+        }
+
         foreach (var path in new[] { dbPath, dbPath + "-journal", dbPath + "-wal", dbPath + "-shm" })
         {
             File.Delete(path);
