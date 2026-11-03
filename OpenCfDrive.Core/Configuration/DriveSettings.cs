@@ -34,6 +34,9 @@ public sealed record DriveSettings
 
     /// <summary>Whether the app starts when the user signs in to Windows.</summary>
     public bool? StartAtSignIn { get; init; }
+
+    /// <summary>Whether the app checks for new versions on its own (the default) and downloads them.</summary>
+    public bool? CheckForUpdates { get; init; }
 }
 
 public enum SettingSource

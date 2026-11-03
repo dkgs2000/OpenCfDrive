@@ -4,6 +4,7 @@ using OpenCfDrive.Core.Configuration;
 using OpenCfDrive.Core.Control;
 using OpenCfDrive.Core.Services;
 using OpenCfDrive.Core.Storage;
+using OpenCfDrive.Core.Updates;
 
 namespace OpenCfDrive.App;
 
@@ -25,9 +26,12 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem _start;
     private readonly ToolStripMenuItem _stop;
     private readonly ToolStripMenuItem _restart;
+    private readonly ToolStripMenuItem _installUpdate;
     private readonly ToolStripMenuItem _exit;
     private readonly System.Windows.Forms.Timer _timer = new();
     private MainForm? _window;
+    private Action? _balloonClicked;
+    private UpdateStage _updateStage;
     private bool _busy;
     private bool _exiting;
 
@@ -45,6 +49,7 @@ internal sealed class TrayApp : ApplicationContext
         _stop = new ToolStripMenuItem("Stop syncing", null, async (_, _) => await StopAsync());
         _restart = new ToolStripMenuItem("Restart syncing", null, async (_, _) => await RestartAsync());
         var openLog = new ToolStripMenuItem("View the log", null, (_, _) => OpenLog());
+        _installUpdate = new ToolStripMenuItem("Restart and update", null, async (_, _) => await InstallUpdateAsync()) { Visible = false };
         _exit = new ToolStripMenuItem("Exit", null, (_, _) => Exit());
 
         _menu = new ContextMenuStrip();
@@ -53,7 +58,7 @@ internal sealed class TrayApp : ApplicationContext
             _headline, new ToolStripSeparator(),
             _openFolder, openWindow, new ToolStripSeparator(),
             _start, _stop, _restart, new ToolStripSeparator(),
-            openLog, _exit,
+            openLog, _installUpdate, _exit,
         ]);
         _menu.Opening += (_, _) => UpdateMenu();
 
@@ -74,10 +79,23 @@ internal sealed class TrayApp : ApplicationContext
                 ShowWindow();
             }
         };
-        _tray.BalloonTipClicked += (_, _) => ShowWindow(settings: !(Monitor.Latest?.Settings.HasRemote ?? false));
+        _tray.BalloonTipClicked += (_, _) => (_balloonClicked ?? (() => ShowWindow(settings: !(Monitor.Latest?.Settings.HasRemote ?? false))))();
 
         _instance.OnSignal(_instance.ShowRequested, () => _ui.Post(_ => ShowWindow(), null));
         _instance.OnSignal(_instance.QuitRequested, () => _ui.Post(_ => Exit(), null));
+
+        // Only the copy the installer put in place updates itself: the MSI
+        // installs there, not over a build someone runs from elsewhere.
+        Updates = new Updater(
+            AppVersion.Current,
+            AppVersion.UpdateRepository,
+            Updater.DefaultFolder,
+            automatic: () => DriveSettingsFile.Load().CheckForUpdates != false,
+            unavailable: SignInStartup.IsInstalledCopy
+                ? null
+                : $"Only the installed copy updates itself; this one runs from {Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory)}.");
+        _updateStage = Updates.Status.Stage;
+        Updates.Changed += status => _ui.Post(_ => OnUpdateChanged(status), null);
 
         Monitor.Updated += OnUpdated;
         _timer.Interval = (int)HiddenRefresh.TotalMilliseconds;
@@ -88,6 +106,8 @@ internal sealed class TrayApp : ApplicationContext
     }
 
     public DriveMonitor Monitor { get; } = new();
+
+    public Updater Updates { get; }
 
     public bool Busy => _busy;
 
@@ -108,9 +128,11 @@ internal sealed class TrayApp : ApplicationContext
         }
         else if (!latest.Settings.HasRemote)
         {
-            _tray.ShowBalloonTip(
-                10_000, "OpenCfDrive is not set up", "Click here to choose your rclone remote.", ToolTipIcon.Info);
+            ShowBalloon("OpenCfDrive is not set up", "Click here to choose your rclone remote.", ToolTipIcon.Info);
         }
+
+        // After the drive: what an earlier update left, then the checks.
+        Updates.Start();
     }
 
     /// <summary>
@@ -170,7 +192,86 @@ internal sealed class TrayApp : ApplicationContext
         _start.Enabled = !_busy && latest is { Running: false, SettingsProblem: null } && latest.Settings.HasRemote;
         _stop.Enabled = !_busy && running;
         _restart.Enabled = !_busy && running;
+        var update = Updates.Status;
+        _installUpdate.Visible = update.Stage == UpdateStage.Ready;
+        _installUpdate.Text = update.Available is { } version ? $"Restart and update to {GitHubReleases.Format(version)}" : "Restart and update";
+        _installUpdate.Enabled = !_busy;
         _exit.Text = running ? "Exit (syncing continues)" : "Exit";
+    }
+
+    private void OnUpdateChanged(UpdateStatus status)
+    {
+        if (_exiting)
+        {
+            return;
+        }
+
+        _window?.ShowUpdate(status);
+
+        // Said once when a download becomes ready, and again at each start
+        // while it waits (as Nextcloud does).
+        if (status.Stage == UpdateStage.Ready && _updateStage != UpdateStage.Ready && status.Available is { } version)
+        {
+            ShowBalloon(
+                $"OpenCfDrive {GitHubReleases.Format(version)} is ready",
+                "Click here to restart OpenCfDrive and install it.",
+                ToolTipIcon.Info,
+                async () => await InstallUpdateAsync(ask: true));
+        }
+
+        // Checking briefly leaves Ready during a check that finds the same download.
+        if (status.Stage is not UpdateStage.Checking)
+        {
+            _updateStage = status.Stage;
+        }
+    }
+
+    /// <summary>
+    /// Stops syncing, so nothing the installer replaces is in use, starts the
+    /// downloaded installer and exits; the installer opens the app again,
+    /// which starts syncing.
+    /// </summary>
+    public async Task InstallUpdateAsync(bool ask = false)
+    {
+        var status = Updates.Status;
+        if (status.Stage != UpdateStage.Ready || status.Available is not { } version)
+        {
+            return;
+        }
+
+        if (ask && MessageBox.Show(
+                $"Install OpenCfDrive {GitHubReleases.Format(version)} now?\n\nOpenCfDrive closes, stops syncing for the moment " +
+                "the installer takes, and opens again.",
+                "Update OpenCfDrive",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Information) != DialogResult.OK)
+        {
+            return;
+        }
+
+        if (Monitor.Latest is { Running: true } latest &&
+            await RunAsync("Stopping syncing for the update", () => SyncService.StopAsync(latest.Settings.SyncRoot.Value)) is not null)
+        {
+            return;
+        }
+
+        if (Updates.BeginInstall() is not { } installer)
+        {
+            ShowProblem("The downloaded update is gone; check for updates again.");
+            return;
+        }
+
+        try
+        {
+            Process.Start(Updater.InstallCommand(installer, Updates.InstallLog, Environment.ProcessPath!))?.Dispose();
+        }
+        catch (System.ComponentModel.Win32Exception ex)
+        {
+            ShowProblem($"The installer could not be started: {ex.Message}");
+            return;
+        }
+
+        Exit();
     }
 
     public void ShowWindow(bool settings = false)
@@ -186,6 +287,7 @@ internal sealed class TrayApp : ApplicationContext
             _window.ShowSnapshot(latest);
         }
 
+        _window.ShowUpdate(Updates.Status);
         if (settings)
         {
             _window.ShowSettingsTab();
@@ -379,8 +481,15 @@ internal sealed class TrayApp : ApplicationContext
         }
         else
         {
-            _tray.ShowBalloonTip(10_000, "OpenCfDrive", problem, ToolTipIcon.Warning);
+            ShowBalloon("OpenCfDrive", problem, ToolTipIcon.Warning);
         }
+    }
+
+    /// <summary>A notification; clicking it runs <paramref name="clicked"/>, or opens the window.</summary>
+    private void ShowBalloon(string title, string text, ToolTipIcon icon, Action? clicked = null)
+    {
+        _balloonClicked = clicked;
+        _tray.ShowBalloonTip(10_000, title, text, icon);
     }
 
     public void OpenFolder()
@@ -420,6 +529,7 @@ internal sealed class TrayApp : ApplicationContext
 
         _exiting = true;
         _timer.Stop();
+        Updates.Dispose();
         _window?.CloseForExit();
         _tray.Visible = false;
         _tray.Dispose();

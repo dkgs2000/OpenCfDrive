@@ -113,12 +113,41 @@ unregisters the drive, which removes it from Explorer and leaves
 `%USERPROFILE%\OpenCfDrive` as an ordinary folder with whatever was downloaded.
 An upgrade keeps the registration and the settings.
 
+### Updates
+
+The installed app updates itself from the GitHub releases of the repository it
+was built from, the way Nextcloud's desktop client updates itself on Windows
+(`src/gui/updater/ocupdater.cpp`):
+
+- It asks GitHub for the latest release (not drafts or pre-releases) 3 s after
+  it starts and then every 10 hours, unless "Check for new versions" is off in
+  Settings. "Check for updates" on the Status tab asks at once either way.
+- A newer version's setup (`OpenCfDrive-<version>-x64-setup.exe`) is
+  downloaded in the background into `%LOCALAPPDATA%\OpenCfDrive\updates` and
+  must match the size and SHA-256 GitHub lists for it. Then the app says it is
+  ready, with a notification, on the Status tab and in the icon's menu, until
+  it is installed. The setup rather than the MSI, because it upgrades an
+  install made with either; the MSI run over a setup's install would leave the
+  old version listed in Apps.
+- "Restart and update" stops syncing, runs the setup with `/passive` (a
+  progress bar and no questions) from a PowerShell that opens the app again
+  afterwards, and closes the app. The new app starts syncing again.
+- On the next start the app tells whether the update installed. If it did, the
+  installer is removed; if not, it is offered again with the installer's log
+  (`updates\install.log`).
+
+Only the installed copy updates itself, and only a build made with
+`Build-Installer.ps1 -Repository owner/name` knows where its releases are (the
+release workflow passes its own repository). Other builds show why they do not
+update. Version 0.1.0 has no updater: install the next version by hand once.
+
 ## Build
 
 ```powershell
 dotnet build .\OpenCfDrive.slnx
 dotnet test .\OpenCfDrive.slnx
 .\installer\Build-Installer.ps1 -Version 1.2.3   # both installers, into .\artifacts
+.\installer\Build-Installer.ps1 -Version 1.2.3 -Repository owner/name   # ...that update from that repository's releases
 ```
 
 The installers use the WiX Toolset v5 (MS-RL license), which the build restores
@@ -233,7 +262,8 @@ Two GitHub Actions workflows, both on Windows runners:
   as local processes. Each job keeps its logs as an artifact.
 - **Release** (`.github/workflows/release.yml`), when a version tag is pushed,
   or by hand with a version. It runs every test first, then builds both 64-bit
-  installers and publishes a GitHub release with them attached:
+  installers (set to update from this repository's releases) and publishes a
+  GitHub release with them attached. Installed copies find it within 10 hours:
 
   ```powershell
   git tag v1.2.3
