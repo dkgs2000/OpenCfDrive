@@ -173,6 +173,28 @@ function Stop-StaleProcesses {
     Start-Sleep -Milliseconds 400
 }
 
+# Asks the cloud service to look at the server now, the way its background
+# sync does every 30 s, and returns once that run has finished (the service
+# answers on its control pipe only then). Mock mode never looks at the server.
+$script:E2ESyncRoot = ""
+function Sync-Remote([int]$TimeoutSeconds = 120) {
+    if (-not $script:E2EIsCloud) { return }
+    $pipeName = [System.IO.Path]::GetFileNameWithoutExtension((Get-StateDbPath $script:E2ESyncRoot))
+    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
+    try {
+        $pipe.Connect(10000)
+        $writer = New-Object System.IO.StreamWriter($pipe)
+        $writer.AutoFlush = $true
+        $writer.WriteLine("sync")
+        $reader = New-Object System.IO.StreamReader($pipe)
+        $answer = $reader.ReadLineAsync()
+        if (-not $answer.Wait($TimeoutSeconds * 1000)) { throw "The service did not finish a sync run within $TimeoutSeconds s." }
+        if ($answer.Result -notmatch '"synced":true') { throw "The service's sync run did not finish: $($answer.Result)" }
+    } finally {
+        $pipe.Dispose()
+    }
+}
+
 function Read-LogText([string]$Path) {
     if (-not (Test-Path $Path)) { return "" }
     try { return (Get-Content -Path $Path -Raw -ErrorAction SilentlyContinue) } catch { return "" }
@@ -265,8 +287,16 @@ $script:E2ERcloneExe = ""
 $script:E2ERcloneConf = ""
 
 function Invoke-ServerRclone([string[]]$Arguments) {
-    $result = Invoke-Native -FilePath $script:E2ERcloneExe `
-        -Arguments (@("--config", $script:E2ERcloneConf) + $Arguments) -PassThruOutput
+    # rclone writes UTF-8; Windows PowerShell reads a program's output in the
+    # console's code page, which turns non-English names (C26, S23) into '?'.
+    $previous = [Console]::OutputEncoding
+    try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
+    try {
+        $result = Invoke-Native -FilePath $script:E2ERcloneExe `
+            -Arguments (@("--config", $script:E2ERcloneConf) + $Arguments) -PassThruOutput
+    } finally {
+        try { [Console]::OutputEncoding = $previous } catch { }
+    }
     if ($result.ExitCode -ne 0) {
         throw "rclone $($Arguments -join ' ') failed (exit $($result.ExitCode)): $($result.Output -join ' ')"
     }
@@ -463,6 +493,10 @@ function Start-E2EService {
     [Environment]::SetEnvironmentVariable("OPENCFDRIVE_ROOT", $SyncRoot, "Process")
     [Environment]::SetEnvironmentVariable("RCLONE_FS", $script:E2ERemoteSpec, "Process")
     [Environment]::SetEnvironmentVariable("RCLONE_RC_URL", "http://127.0.0.1:$($script:E2ERcPort)", "Process")
+    # The background sync runs only when a scenario asks (Sync-Remote), so each
+    # one sees exactly the server calls it caused. Its schedule is unit-tested.
+    [Environment]::SetEnvironmentVariable("OPENCFDRIVE_REMOTE_POLL_SECONDS", "86400", "Process")
+    $script:E2ESyncRoot = $SyncRoot
 
     Write-E2ELog "Starting $(Split-Path -Leaf $ServiceExe)"
     $service = Start-Process -FilePath $ServiceExe -WorkingDirectory $SyncRoot -WindowStyle Hidden -PassThru `
@@ -523,6 +557,8 @@ function Invoke-OpenCfDriveE2E {
     )
 
     $isCloud = $Mode -eq "cloud"
+    $script:E2EIsCloud = $isCloud
+    $script:E2EBackend = $Backend
 
     if ([string]::IsNullOrWhiteSpace($TempRoot)) {
         $suffix = if ($isCloud) { "" } else { "-mock" }
@@ -759,7 +795,8 @@ function Invoke-OpenCfDriveE2E {
         # Unregistering drops every online-only placeholder and turns folder
         # placeholders into plain folders, but keeps the store. Registered
         # again, opening a folder must still show what the server has: the
-        # remote is the source of truth, and nothing is crawled at startup.
+        # remote is the source of truth, nothing is crawled at startup, and
+        # what went missing is never taken for deleted here.
         if ($isCloud -and -not $KeepRegistration) {
             $restartDir = Join-Path $SyncRoot "restart"
             $restartFile = Join-Path $restartDir "never-opened.txt"
@@ -779,11 +816,14 @@ function Invoke-OpenCfDriveE2E {
             $proc = Start-E2EService -ServiceExe $serviceExe -SyncRoot $SyncRoot `
                 -OutLog (Join-Path $TempRoot "service-restart.log") -ErrLog (Join-Path $TempRoot "service-restart.err") `
                 -ReadyPattern $readyPattern -FailurePattern $failurePattern
+            # A folder listed before stays listed; the background sync brings
+            # back what the server has in it.
             $back = Wait-ForCondition {
+                Sync-Remote
                 Get-ChildItem -LiteralPath $SyncRoot -Force -ErrorAction SilentlyContinue | Out-Null
                 Get-ChildItem -LiteralPath $restartDir -Force -ErrorAction SilentlyContinue | Out-Null
                 Test-Path -LiteralPath $restartFile
-            } -TimeoutSeconds 30 -PollMilliseconds 1200
+            } -TimeoutSeconds 30 -PollMilliseconds 200
             if (-not $back) {
                 throw "Registered again, restart\never-opened.txt did not come back. Log: $(Read-LogText (Join-Path $TempRoot 'service-restart.log'))"
             }

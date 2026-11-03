@@ -15,6 +15,9 @@ public static class ServiceControl
     public const string StatusRequest = "status";
     public const string StopRequest = "stop";
 
+    /// <summary>Look at the server now; answered once that sync run has finished.</summary>
+    public const string SyncRequest = "sync";
+
     internal static readonly JsonSerializerOptions Json = new()
     {
         Converters = { new JsonStringEnumConverter() },

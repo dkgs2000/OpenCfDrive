@@ -16,17 +16,23 @@ affiliated with or endorsed by the rclone project.
 
 - Files appear as placeholders and download when opened ("Free up space" and
   "Always keep on this device" work from Explorer's menu).
-- The remote is the source of truth, and it is read one folder at a time:
-  opening or refreshing a folder lists that folder from the server, and
-  server-side adds, changes, deletes and renames show up then. The drive is
-  never crawled, not even at startup, and no server notifications are needed.
-- If the server cannot be reached, a folder shows what is already local (its
-  cache). A folder that was never opened is then empty.
-- Local adds, edits, deletes, renames and moves are sent to the server.
-- **Conflicts: the server wins.** If a file changed (or was deleted) on the
-  server while it has local changes that were not sent yet, the server's
-  version replaces the local one and the local changes are discarded. See
-  [Conflicts](#conflicts).
+- Syncing works the way Nextcloud's and OneDrive's does. The remote is the
+  source of truth, read one folder at a time: the first time a folder is
+  opened it is listed from the server, and from then on it is fully populated
+  (Explorer shows it as available, not online-only) and a background sync
+  keeps it current, every 30 s and right after the server is back. Server-side
+  adds, changes, deletes and renames show up without reopening anything. The
+  drive is never crawled, and no server notifications are needed.
+- If the server cannot be reached, the drive is offline: folders show what is
+  already local, files not downloaded cannot be opened, and local edits,
+  deletes, renames and new folders are kept and sent once it answers.
+- Local adds, edits, deletes, renames, moves and new folders (empty ones too)
+  are sent to the server. Changes made while OpenCfDrive was not running are
+  found and sent when it starts.
+- **Conflicts keep both versions**, as in Nextcloud and OneDrive: a file changed
+  on both sides keeps the server's version under its name and the local one as
+  "name (conflicted copy date time).ext", which is uploaded too. Local changes
+  are never thrown away. See [Conflicts](#conflicts).
 - The folder is registered with Explorer (navigation pane entry) through
   `StorageProviderSyncRootManager`.
 - The OpenCfDrive app, behind an icon in the notification area, sets it up and
@@ -218,29 +224,35 @@ The hash is derived from the full sync-root path, so each sync root gets its own
 
 ## Conflicts
 
-The rule today is simple: **the server wins.** A conflict is a file that has
-local changes not yet sent to the server, while the server's copy is no longer
-the one this client last saw. In that case:
+The rules are Nextcloud's (and OneDrive keeps both the same way): **no local
+change is ever thrown away.** A conflict is a file that has local changes not
+yet sent to the server, while the server's copy is no longer the one this
+client last saw. In that case:
 
 | Server side | Local side | Result |
 | --- | --- | --- |
-| changed | edited, not sent yet | The server's version replaces the local file (it downloads again when opened). The local edit is discarded. |
-| deleted | edited, not sent yet | The local file is deleted. Nothing is sent back. |
-| a file this client never saw | a new local file at the same path | The server's file replaces the local one. |
+| changed | edited, not sent yet | Both are kept. The server's version keeps the name (it downloads when opened); the local one is copied to `name (conflicted copy 2026-11-03 175504).ext`, the local edit's time, and that copy is uploaded as a file of its own. |
+| deleted | edited, not sent yet | The local file is kept and uploaded again. |
+| folder deleted | files inside edited, not sent yet | Those files and their folders are kept and uploaded again; everything else in the folder goes. |
+| changed | deleted | The delete is not sent: the server's version comes back. |
+| a file this client never saw | a new local file at the same path | The same size and time count as the same file; otherwise both are kept, the local one as a conflict copy. |
 | unchanged | edited | Not a conflict: the edit is uploaded. |
+
+The conflict copy's name is built as Nextcloud's `Utility::makeConflictFileName`
+builds it: the tag goes before the extension, or at the end of a name without
+one (`.hidden`, `Makefile`).
 
 The client notices a conflict in two places:
 
-- **When a folder is listed** (opened or refreshed). The listing is compared
-  with the size and time the client last saw for each file.
-- **Just before an upload.** It looks up that one file on the server
-  (`operations/stat`), and uploads only if the server still has the version
-  the client last saw. This covers an edit saved while the server copy changed
-  and no listing happened in between.
+- **When a folder is listed**: by the background sync, or the first time it is
+  opened. The listing is compared with the size and time the client last saw
+  for each file.
+- **Just before an upload or a delete.** It looks up that one file on the
+  server (`operations/stat`), and sends the change only if the server still
+  has the version the client last saw. This covers an edit saved while the
+  server copy changed and no listing happened in between.
 
-Discarded local changes are not kept anywhere: there is no conflict copy.
-
-Known limits of this first version:
+Known limits:
 
 - A server change is recognised by size and modification time (a difference of
   1 s or more), not by content. A change that keeps both is not seen.
@@ -248,9 +260,6 @@ Known limits of this first version:
   change that lands between them is overwritten by the upload.
 - A file the client is still uploading, or has just renamed, is skipped by a
   listing that may predate that change; the check before the upload covers it.
-
-A better conflict policy is planned, for example keeping the local version as
-a separate conflict copy, or conditional uploads that close the window above.
 
 ## Continuous integration
 
@@ -328,14 +337,20 @@ the backend's own protocol and never uses the client's rclone.
 
 Nothing notifies the client of server-side changes. The servers are plain, with
 no change notifications, and the client relies on none: it finds server changes
-only when a folder is listed. The same matrix passing on WebDAV and on S3 is the
+by listing the folders it has (its background sync) and when a folder is
+opened the first time. The same matrix passing on WebDAV and on S3 is the
 evidence that the client depends on rclone alone.
+
+The E2E service's background sync runs only when a scenario asks for a run
+(the service's `sync` control request, answered once the run has finished), so
+each scenario sees exactly the server calls it caused; the 30 s schedule itself
+is unit-tested (`SyncSchedulerTests`).
 
 ### Scenario matrix
 
-**Server side (`S01`–`S18`, cloud mode only).** Another app changes the server,
-then the scenario lists the folder, as Explorer does when you open it or press
-F5, and expects the local side to match:
+**Server side (`S01`–`S23`, cloud mode only).** Another app changes the server,
+then the scenario has the client run its background sync, lists the folder as
+Explorer does, and expects the local side to match:
 
 - add a file; in an existing folder; nested folders
 - update a file that is downloaded; one never opened; same size, only the time
@@ -343,24 +358,33 @@ F5, and expects the local side to match:
 - delete a file (downloaded or not); delete a folder with files
 - rename a file; move a file to another folder; rename a folder
 - a 3 MB binary file (byte-exact); 40 files at once
-- both sides edit the same file: the server's version wins and nothing is
-  uploaded
-- the server deletes a file that has an unsynced local edit: the server wins,
-  the local file is deleted and nothing is sent back
+- both sides edit the same file: both are kept, the local edit as a conflict
+  copy that is uploaded too
+- the server deletes a file that has an unsynced local edit: the edit is kept
+  and uploaded again
+- the server deletes a folder while a file in it has an unsynced edit: that
+  file stays and goes back, the rest of the folder goes
+- the client deletes a file the server changed meanwhile: the server's version
+  comes back
+- the client and the server add different files at the same new path: both
+  are kept
+- a folder once listed shows as available (no cloud icon) and still gets what
+  the server adds
+- files and folders with Arabic names, added and renamed on the server
 - "Always keep on this device" on a 300 MB server file: one request for the
   whole file, streamed in 4 MB chunks, byte-exact, and the service's memory
   stays far below the file size
 - offline (the server process is paused, so requests hang as on a lost
-  network): the first listing waits for it in vain and puts the drive offline,
-  after which an opened folder lists its local entries at once and a
-  downloaded file still opens, a folder never opened is empty, and back online
-  (using the drive checks the server) the unopened folder lists the server
+  network): an opened folder lists its local entries at once, the first
+  listing of a folder never opened waits for the server in vain and puts the
+  drive offline, that folder is empty, and back online (using the drive checks
+  the server) it lists the server
 
 Mock mode skips these. It is a test stand-in over a plain folder, with no way
 to know when a folder is opened, so it copies the server once at startup.
 
-**Client side (`C01`–`C19`, both modes).** A local action in the drive, then the
-server is expected to match:
+**Client side (`C01`–`C26`, both modes unless noted).** A local action in the
+drive, then the server is expected to match:
 
 - add a file; in an existing folder; in new nested folders
 - edit a file never opened; overwrite with the same size; overwrite shorter
@@ -372,9 +396,21 @@ server is expected to match:
 - copy or move a file in from outside the drive
 - a 3 MB binary file (byte-exact); 40 files at once
 - a file open locally is changed on the server, then saved, with no listing in
-  between: the check before the upload sees it and the server's version wins
+  between: the check before the upload sees it and both versions are kept
 - rename a file, then edit it: the edit is uploaded (a rename is not mistaken
   for a server change)
+- append to a downloaded file that ends on a page boundary: the edit is
+  uploaded
+- create an empty folder; create one and rename it right away (Explorer's New
+  folder: only the final name reaches the server); move a folder with files
+  and a subfolder in from outside the drive. On S3, which keeps no empty
+  folders, an empty folder stays here and is never taken for deleted
+- folders and files with Arabic names, and a rename
+- offline (cloud mode): a delete and a rename made while the server cannot be
+  reached are kept and reach the server once it answers; nothing comes back
+  meanwhile
+- Free up space on a file with an unsynced edit (cloud mode): it is uploaded
+  first, then freed
 
 **No needless work.** Every scenario also declares the most it may cost: uploads,
 bytes downloaded, server renames, deletes and lookups. The harness counts every
@@ -417,44 +453,72 @@ namespace up front, OpenCfDrive fills each folder on demand.
 ### Invariants
 
 - **The remote is the source of truth, read one folder at a time.** Nothing is
-  listed at startup and the drive is never crawled. Every directory enumeration
-  by another process (Explorer, `dir`, file dialogs) raises
-  `FETCH_PLACEHOLDERS` (population policy `FULL`), and `SyncRootConnection`
-  answers it from a live, non-recursive `operations/list` of that one
-  directory. It hands out every server entry that has no placeholder on disk,
-  including known items whose placeholder is gone (after unregistering and
-  registering again, for instance). The exception is an item the user deleted,
-  moved or renamed whose change has not reached the server yet. A server
-  folder found on disk as a plain folder (unregistering leaves them so) is
-  converted back into a placeholder with on-demand population, so it is
-  listed when opened. The callback must always be completed. An unanswered
-  request blocks the shell until cfapi gives up after 60 s with
-  `ERROR_CLOUD_FILE_REQUEST_TIMEOUT`. The client never relies on server
-  notifications: listing a folder is the only way it learns about changes.
+  crawled. The first enumeration of a folder by another process (Explorer,
+  `dir`, file dialogs) raises `FETCH_PLACEHOLDERS` (population policy `FULL`),
+  and `SyncRootConnection` answers it from a live, non-recursive
+  `operations/list` of that one directory. It hands out every server entry
+  that has no placeholder on disk, including known items whose placeholder is
+  gone (after unregistering and registering again, for instance). The
+  exceptions are an item the user deleted, moved or renamed whose change has
+  not reached the server yet, and a new local file not uploaded yet where the
+  server has one of its own (its upload keeps both). A server folder found on
+  disk as a plain folder (unregistering leaves them so) is converted back into
+  a placeholder with on-demand population, so it is listed when opened. The
+  callback must always be completed. An unanswered request blocks the shell
+  until cfapi gives up after 60 s with `ERROR_CLOUD_FILE_REQUEST_TIMEOUT`.
+- **Listed folders stay listed; the background sync keeps them current.** The
+  answer sets `CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION`
+  and the folder stays fully populated, as Nextcloud's and OneDrive's folders
+  do. Windows lists it from disk from then on, and Explorer shows it as
+  available: a folder not fully populated carries `OFFLINE` and
+  `RECALL_ON_DATA_ACCESS`, which is the cloud icon. A fully populated folder is
+  also what the platform needs before it lets a new name be created there; in
+  a "partially populated" one it asks again and again until the create fails
+  with `ERROR_CANT_RESOLVE_FILENAME`. Server changes in listed folders come from
+  the background sync (`SyncScheduler`, copied from Nextcloud's sync runs): one
+  run at start, one every 30 s (Nextcloud's `remotePollInterval`;
+  `OPENCFDRIVE_REMOTE_POLL_SECONDS` overrides it), one right after the server
+  is back, and one on the service's `sync` control request. A run first sends
+  the deletes and renames kept from an offline spell, then lists the listed
+  folders (the platform keeps that state on disk) one at a time, parents
+  first, never recursively, creates placeholders (`CfCreatePlaceholders`) for
+  what the server added, and applies its changes and deletes. Folders never
+  opened are not listed until they are. The client never relies on server
+  notifications.
 - **Fetch from the remote, fall back to the cache.** A listing that fails, or
   gets no answer within 10 s (offline usually means rclone is up but keeps
   retrying an unreachable server), is answered with nothing new and no server
   comparison. The folder then shows what is already local, so nothing local is
-  deleted; a folder never opened shows empty.
+  deleted; a folder never opened shows empty and stays unlisted, so it is
+  listed once the server answers.
 - **Offline is a state, as in Nextcloud and OneDrive.** A request that cannot
   reach the server (no answer in time, no connection to rclone, or rclone's
   own network error) puts the drive offline (`ServerConnection`). Until the
-  server answers again, every folder shows what is local at once instead of
-  waiting 10 s per folder (Windows may ask for a folder's parent too, which
-  would double that), an online-only file fails to open at once, as in
-  Nextcloud, and edits wait and are uploaded once the server answers, as on
-  Nextcloud's next sync. The server is checked again when Windows reports a
-  network change, when the drive is used, and on Nextcloud's schedule: 62 s
-  after going offline, then one more 62 s per failed check, at most 8 × 62 s.
-  The app shows "Offline". Deletes and renames made offline are not yet kept
-  for later: they fail, and the server's copy stays.
-- **Answered folders are marked full, then switched back.** The answer sets
-  `CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION`, because
-  creating a new name in a "partially populated" folder makes the platform ask
-  again and again until the create fails with `ERROR_CANT_RESOLVE_FILENAME`
-  ("The name of the file cannot be resolved by the system"). One second later
-  `CfUpdatePlaceholder(ENABLE_ON_DEMAND_POPULATION)` switches the folder back,
-  so the next listing asks the server again.
+  server answers again, a folder never opened shows what is local at once
+  instead of waiting 10 s, an online-only file fails to open at once, as in
+  Nextcloud, and nothing made here is lost: edits and new folders wait and are
+  sent once the server answers, and deletes and renames are kept in the store
+  (`PendingChanges`, so they survive a restart, like Nextcloud's journal), in
+  the order made, with the items they change left alone by listings meanwhile.
+  The server is checked again when Windows reports a network change, when the
+  drive is used, and on Nextcloud's schedule: 62 s after going offline, then
+  one more 62 s per failed check, at most 8 × 62 s. The app shows "Offline".
+- **Changes made while the service was not running are sent when it starts**,
+  as Nextcloud's local discovery finds them: edited and new files are
+  uploaded, new folders created. Deletes are not taken from it: unregistering
+  the drive removes every online-only file, and that must never delete them on
+  the server. What is missing comes back from the server instead.
+- **New folders, empty ones too, are created on the server**
+  (`operations/mkdir`), held for a moment like an upload so that Explorer's
+  "New folder" renamed right away reaches the server under the name that
+  stays. A folder moved in from outside the drive is reported alone, so what it
+  holds is uploaded with it. Remotes without empty folders (rclone's
+  `CanHaveEmptyDirectories`, false for S3 and other bucket stores) cannot hold
+  an empty one: it stays here, and its absence on the server is not taken for
+  a delete.
+- **Free up space never drops the only copy of a change.** A file with local
+  changes the server does not have yet is uploaded first and freed after, as
+  OneDrive does; the platform's own refusal covers only what in-sync tells.
 - **Deletes and renames must be acknowledged.** `NOTIFY_DELETE` and
   `NOTIFY_RENAME` arrive *before* the operation, and the platform holds it until
   the provider answers `ACK_DELETE` / `ACK_RENAME`; without that the user's
@@ -510,12 +574,12 @@ namespace up front, OpenCfDrive fills each folder on demand.
   holds the server's last known size and time, also after uploads). Once the
   shell has its reply, files deleted on the server are deleted locally, and
   changed files get `CfUpdatePlaceholder(MARK_IN_SYNC | DEHYDRATE)` with the
-  new size and time. The server wins (see [Conflicts](#conflicts)), so this
-  leaves out `VERIFY_IN_SYNC`, which would make the platform refuse a file
-  edited locally. A plain local file is converted to a placeholder first. Only
-  a file whose own upload or rename is still on its way is left for the next
-  listing, because this listing may predate it. Deletes that come from the
-  server are not sent back to it.
+  new size and time. A local edit is first kept as a conflict copy (see
+  [Conflicts](#conflicts)), so this leaves out `VERIFY_IN_SYNC`, which would
+  make the platform refuse a file edited locally. A plain local file is
+  converted to a placeholder first. Only a file whose own upload or rename is
+  still on its way is left for the next listing, because this listing may
+  predate it. Deletes that come from the server are not sent back to it.
 - **Placeholder updates need the Win32 handle.** `CfOpenFileWithOplock` returns a
   protected handle that `CfUpdatePlaceholder` and friends reject with `E_HANDLE`.
   `CloudPlaceholderService.WithWin32Handle` references it and passes
@@ -535,14 +599,12 @@ namespace up front, OpenCfDrive fills each folder on demand.
   `operations/stat` on that one file, not a listing of its folder.
 - **One remote listing per directory per second.** Enumerations by the provider
   process itself never raise the callback.
-- **On-demand population is enabled on the root and every directory.** The
-  root is registered without `CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT`,
-  directory placeholders are created without
-  `CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION`, and startup calls
-  `CfUpdatePlaceholder(ENABLE_ON_DEMAND_POPULATION)` on the root and every
-  directory the store knows. That is local work, with no server calls, and it
-  re-enables population on directories that older versions created with it
-  disabled or that a stop left marked full.
+- **On-demand population is enabled on the root and every new directory**
+  until it is first listed. The root is registered without
+  `CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT`, and directory
+  placeholders are created without
+  `CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION`. A folder made here
+  is converted to a placeholder fully populated: all it holds is local.
 - **Directories are placeholders too.** Folders are handed out as *directory*
   placeholders (`FILE_ATTRIBUTE_DIRECTORY`, size 0). Plain
   `Directory.CreateDirectory` folders are invisible to cfapi.
@@ -600,18 +662,22 @@ remote does report are kept.
   example, hydrated files restored by a previous uninstall) stay normal local
   files. cfapi placeholders cannot be created over an existing file; CloudMirror
   behaves the same way. Edits to them are still uploaded by the watcher.
-- Files added, changed or deleted on the remote show up the next time their
-  folder is listed (open it or press F5 in Explorer). A re-list within 1 s of
-  the previous one reuses that listing. Folders that are never opened are not
-  refreshed, and are empty while the server cannot be reached.
+- Files added, changed or deleted on the remote show up in folders already
+  opened within 30 s (the next background sync run), as with Nextcloud;
+  refreshing Explorer (F5) does not ask the server sooner. Folders never opened
+  are listed when they are, and are empty while the server cannot be reached.
+- The background sync lists every folder that was ever opened, one at a time,
+  every 30 s: on remotes that count requests (cloud APIs with quotas), many
+  opened folders mean many listings.
 - Offline, a file that was never downloaded cannot be opened; only downloaded
-  files (and ones kept with "Always keep on this device") are readable. Edits
-  are uploaded once the server answers again, but deletes and renames made
-  offline are not kept for later yet.
-- A local edit that has not reached the server yet is discarded if the server
-  copy changed or was deleted in the meantime: the server wins (see
-  [Conflicts](#conflicts)). A file open in another program is updated on a
-  later listing.
+  files (and ones kept with "Always keep on this device") are readable. Edits,
+  new folders, deletes and renames made offline are sent once the server
+  answers again.
+- A conflict leaves a conflict copy next to the file ("name (conflicted copy
+  date time).ext"), on the server too; delete whichever version is not wanted.
+  A file open in another program is updated on a later run.
+- On S3 and other bucket stores, an empty folder exists only here until a file
+  is put in it: they have no folders of their own.
 - A program that opens a file in the few milliseconds while the client applies
   a server change to it can get "being used by another process"; opening it
   again works.

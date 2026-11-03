@@ -102,6 +102,31 @@ public sealed class CloudSyncEngine : IAsyncDisposable
     /// <summary>Files changed while offline, uploaded once the server answers.</summary>
     private readonly ConcurrentDictionary<string, byte> _deferredUploads = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>New local folders made while offline, created on the server once it answers.</summary>
+    private readonly ConcurrentDictionary<string, byte> _deferredFolders = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Local paths (old and new) of the deletes and renames kept for the
+    /// server while it could not be reached; the store keeps the changes
+    /// themselves (<see cref="SqliteMetadataStore.AddPendingChange"/>).
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _offlinePaths = new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly SemaphoreSlim _pendingGate = new(1, 1);
+
+    /// <summary>New local folders waiting to be created on the server.</summary>
+    private readonly HashSet<string> _creatingFolders = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The background sync with the server (cloud mode); see <see cref="SyncScheduler"/>.</summary>
+    private SyncScheduler? _scheduler;
+
+    /// <summary>
+    /// False for remotes that have folders only as parts of file names (S3
+    /// and other bucket stores): an empty folder made here cannot be on the
+    /// server, so its absence there does not mean it was deleted.
+    /// </summary>
+    private bool _remoteKeepsEmptyFolders = true;
+
     /// <summary>False while the server cannot be reached; folders then show what is on this PC.</summary>
     public bool IsOnline => _server?.IsOnline ?? true;
 
@@ -266,13 +291,18 @@ public sealed class CloudSyncEngine : IAsyncDisposable
                     cancellationToken => rc.ListDirectoryAsync(_remote, string.Empty, cancellationToken),
                     SyncRootConnection.ListingTimeout,
                     _log);
+                // Back online, everything kept for the server goes, and the
+                // server is looked at again (Nextcloud runs a sync then too;
+                // the run sends the deletes and renames kept first).
                 _server.Changed += online =>
                 {
                     if (online)
                     {
                         UploadDeferred();
+                        _ = _scheduler?.SyncNowAsync();
                     }
                 };
+                _scheduler = new SyncScheduler(SyncRemoteAsync, SyncScheduler.ConfiguredInterval());
 
                 _connection = new SyncRootConnection(
                     _store,
@@ -312,6 +342,22 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             }
         }
 
+        if (_rc is not null)
+        {
+            try
+            {
+                _remoteKeepsEmptyFolders = await _rc.CanHaveEmptyDirectoriesAsync(_remote, cancellationToken).ConfigureAwait(false);
+                if (!_remoteKeepsEmptyFolders)
+                {
+                    _log?.Invoke($"'{_remote}' keeps no empty folders (folders are parts of file names there): an empty folder made here stays only here until a file is put in it.");
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or System.Text.Json.JsonException)
+            {
+                // Assume folders are kept, as on most remotes.
+            }
+        }
+
         return new SyncRootStatus(
             support.IsSupported,
             support.Reason,
@@ -324,27 +370,19 @@ public sealed class CloudSyncEngine : IAsyncDisposable
 
     /// <summary>
     /// Pillar 2: the namespace. In cloud mode the drive is never crawled and
-    /// nothing is listed up front: Windows asks for a folder's contents when
-    /// it is opened (FETCH_PLACEHOLDERS), and each request lists that one
-    /// folder. A folder that cannot be listed shows what is already local,
-    /// which is nothing if it was never opened. Startup only switches
-    /// on-demand population back on for the folders on disk, with no server
-    /// calls. Mock mode, a test stand-in, has no such callback and copies the
-    /// remote into a plain folder.
+    /// nothing is listed up front: Windows asks for a folder's contents the
+    /// first time it is opened (FETCH_PLACEHOLDERS), and that request lists
+    /// the one folder. From then on the folder is fully populated and the
+    /// background sync keeps it current (see <see cref="SyncRemoteAsync"/>).
+    /// A folder that cannot be listed shows what is already local, which is
+    /// nothing if it was never opened. Mock mode, a test stand-in, has no such
+    /// callback and copies the remote into a plain folder.
     /// </summary>
     public async Task<int> PopulateAsync(CancellationToken cancellationToken = default)
     {
         if (!IsSimulated)
         {
-            // A folder can be left marked fully populated (by an earlier
-            // version, or a stop just after answering it); switched back on,
-            // opening it lists the server again.
-            var reenabled = _store.GetAll()
-                .Where(row => row.IsDirectory)
-                .Select(row => row.LocalPath)
-                .Prepend(_syncRootPath)
-                .Count(_placeholders.EnableOnDemandPopulation);
-            _log?.Invoke($"On-demand population enabled on {reenabled} directories; each is listed when opened.");
+            _log?.Invoke($"{ListedDirectories().Count()} folder(s) listed on this PC; the background sync keeps them current.");
             return 0;
         }
 
@@ -462,12 +500,23 @@ public sealed class CloudSyncEngine : IAsyncDisposable
                 continue;
             }
 
-            if (known.TryGetValue(remotePath, out var record) || (record = _store.GetByRemotePath(remotePath)) is not null)
+            var isKnown = known.TryGetValue(remotePath, out var record) || (record = _store.GetByRemotePath(remotePath)) is not null;
+
+            // A file made here and not uploaded yet, where the server got one
+            // of its own: never taken for the server's. Its upload finds the
+            // server's and keeps both.
+            if (!isKnown && !item.IsDirectory && File.Exists(localPath) && !_placeholders.QueryState(localPath).IsPlaceholder)
+            {
+                QueueUpload(localPath);
+                continue;
+            }
+
+            if (isKnown)
             {
                 var present = item.IsDirectory ? Directory.Exists(localPath) : File.Exists(localPath);
                 if (present)
                 {
-                    if (!item.IsDirectory && !record.IsDirectory && DiffersFromServer(record, item))
+                    if (!item.IsDirectory && !record!.IsDirectory && DiffersFromServer(record, item))
                     {
                         changed.Add(new ChangedFile(record, item.Size, item.ModifiedTime));
                     }
@@ -509,6 +558,161 @@ public sealed class CloudSyncEngine : IAsyncDisposable
     }
 
     /// <summary>
+    /// Starts what runs beside the drive once it is connected and watched, as
+    /// Nextcloud does on start: changes made here while the service was not
+    /// running are sent, deletes and renames kept from an offline spell are
+    /// sent, and the background sync starts (a run now, then every interval).
+    /// </summary>
+    public void StartBackgroundSync()
+    {
+        if (IsSimulated || _scheduler is null)
+        {
+            return;
+        }
+
+        foreach (var change in _store.GetPendingChanges())
+        {
+            _offlinePaths[change.LocalPath] = 0;
+            if (change.NewLocalPath is not null)
+            {
+                _offlinePaths[change.NewLocalPath] = 0;
+            }
+        }
+
+        // The first run sends what was kept from an offline spell before it
+        // lists anything.
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                DiscoverLocalChanges();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _log?.Invoke($"Looking for changes made while OpenCfDrive was not running failed: {ex.Message}");
+            }
+
+            _scheduler.Start();
+        });
+    }
+
+    /// <summary>
+    /// Looks at the server now (the app's or a script's "sync now") and
+    /// completes once that run has finished.
+    /// </summary>
+    public Task SyncNowAsync() => _scheduler?.SyncNowAsync() ?? Task.CompletedTask;
+
+    /// <summary>
+    /// One background sync run, the counterpart of a Nextcloud sync run's
+    /// remote discovery for the folders this PC has listed: each is listed
+    /// (parents first, one at a time, never recursively) and what changed on
+    /// the server is applied: new items appear, changed files take the new
+    /// version (keeping a local edit as a conflict copy), and deleted ones go.
+    /// Folders never opened are left to be listed when they are. Offline,
+    /// nothing is asked; the connection check runs instead.
+    /// </summary>
+    private async Task SyncRemoteAsync(CancellationToken cancellationToken)
+    {
+        if (_server is { IsOnline: false })
+        {
+            _server.CheckNow();
+            return;
+        }
+
+        // Local changes kept from an offline spell go first, so no listing
+        // takes what they change for the server's current state.
+        await SendPendingChangesAsync().ConfigureAwait(false);
+
+        foreach (var directory in ListedDirectories().ToList())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!await RefreshDirectoryAsync(directory, cancellationToken).ConfigureAwait(false))
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The folders Windows has had listed (fully populated directory
+    /// placeholders; the platform keeps that state on disk), parents first.
+    /// </summary>
+    private IEnumerable<string> ListedDirectories() =>
+        _store.GetDirectories()
+            .Select(row => row.RemotePath.TrimEnd('/'))
+            .Prepend(string.Empty)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(directory => directory.Length == 0 ? 0 : directory.Count(c => c == '/') + 1)
+            .Where(directory => IsListed(LocalPathOf(directory)));
+
+    private bool IsListed(string localDirectory) =>
+        Directory.Exists(localDirectory) &&
+        _placeholders.QueryState(localDirectory) is { IsPlaceholder: true, Partial: false };
+
+    private string LocalPathOf(string relative) =>
+        relative.Length == 0
+            ? _syncRootPath
+            : Path.Combine(_syncRootPath, relative.TrimEnd('/').Replace('/', Path.DirectorySeparatorChar));
+
+    /// <summary>
+    /// Lists one listed folder and applies what changed. False when the
+    /// server could not be reached: the drive is offline and the run stops.
+    /// </summary>
+    private async Task<bool> RefreshDirectoryAsync(string directory, CancellationToken cancellationToken)
+    {
+        if (!Directory.Exists(LocalPathOf(directory)))
+        {
+            return true; // removed by its parent's changes in this run
+        }
+
+        IReadOnlyList<PlaceholderEntry> entries;
+        using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+        {
+            timeout.CancelAfter(SyncRootConnection.ListingTimeout);
+            try
+            {
+                entries = await ListNewRemoteEntriesAsync(directory, timeout.Token).ConfigureAwait(false);
+                _server?.Succeeded();
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                var reason = timeout.IsCancellationRequested
+                    ? $"no answer within {SyncRootConnection.ListingTimeout.TotalSeconds:0} s"
+                    : ex.Message;
+                if (timeout.IsCancellationRequested || ServerConnection.IsUnreachable(ex))
+                {
+                    _server?.Failed(reason);
+                    return false;
+                }
+
+                // Typically a folder the server removed since its parent was
+                // listed; the parent's next listing removes it here.
+                _log?.Invoke($"Background sync could not list '{directory}' ({reason}); the next run tries again.");
+                return true;
+            }
+        }
+
+        if (entries.Count > 0)
+        {
+            var items = entries
+                .Select(entry => new RcloneItemMetadata(
+                    entry.FileIdentity,
+                    directory.Length == 0 ? entry.RelativeName : $"{directory}/{entry.RelativeName}",
+                    entry.Size,
+                    entry.ModifiedUtc,
+                    entry.IsDirectory))
+                .ToList();
+            var result = _placeholders.CreatePlaceholders(_syncRootPath, items);
+            _log?.Invoke(
+                $"Server added in '{directory}': {string.Join(", ", entries.Select(e => e.RelativeName))}" +
+                (result.Failed > 0 ? $" ({result.Failed} could not be shown: {string.Join("; ", result.Errors)})." : "."));
+        }
+
+        await ApplyServerChangesAsync(directory).ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>
     /// True when the server's copy is not the one this client last saw: a
     /// known file changed or gone, or a file at a path this client never saw.
     /// </summary>
@@ -532,12 +736,14 @@ public sealed class CloudSyncEngine : IAsyncDisposable
     }
 
     /// <summary>
-    /// Applies what the last listing of a directory found: files deleted on
-    /// the server are deleted locally, files changed on the server get their
-    /// new size/time and drop their local copy. The server wins: local
-    /// changes that have not reached the server are discarded. Only the
-    /// client's own upload or rename still on its way is waited for (the
-    /// listing may predate it); the upload then checks the server itself.
+    /// Applies what the last listing of a directory found, as Nextcloud does:
+    /// files deleted on the server are deleted locally, files changed on the
+    /// server get their new size/time and drop their local copy. A local
+    /// change that has not reached the server is never lost: an edited file
+    /// the server changed too is kept as a conflict copy, and one the server
+    /// deleted is uploaded again. Only the client's own upload or rename still
+    /// on its way is waited for (the listing may predate it); the upload then
+    /// checks the server itself.
     /// </summary>
     private async Task ApplyServerChangesAsync(string relativeDirectory)
     {
@@ -580,12 +786,18 @@ public sealed class CloudSyncEngine : IAsyncDisposable
     }
 
     /// <summary>
-    /// Server wins: the file is gone from the server, so it goes locally too,
-    /// local changes included. The local delete is not sent back.
+    /// The file is gone from the server, so it goes locally too; the local
+    /// delete is not sent back. One with local changes the server never got
+    /// stays and is uploaded again instead (Nextcloud restores it the same way).
     /// </summary>
     private void ApplyServerFileDelete(FileRecord record)
     {
-        var discarded = HasUnsyncedLocalChanges(record.LocalPath);
+        if (HasUnsyncedLocalChanges(record.LocalPath))
+        {
+            RestoreToServer(record, "deleted it");
+            return;
+        }
+
         _serverDeletes[record.RemotePath] = DateTimeOffset.UtcNow;
         try
         {
@@ -595,9 +807,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             }
 
             _store.DeleteByRemotePath(record.RemotePath);
-            _log?.Invoke(discarded
-                ? $"Server deleted '{record.RemotePath}'; the server wins: removed the local file and its local changes."
-                : $"Server deleted '{record.RemotePath}'; removed the local file.");
+            _log?.Invoke($"Server deleted '{record.RemotePath}'; removed the local file.");
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -608,15 +818,29 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// The folder is gone from the server, so it goes locally too. Files in
+    /// it with local changes the server never got stay, with the folders
+    /// they are in, and are uploaded again (as Nextcloud keeps them); only
+    /// the rest goes. The client's own upload or rename still on its way is
+    /// waited for.
+    /// </summary>
     private void ApplyServerDirectoryDelete(FileRecord record, DateTimeOffset listedAt)
     {
         var prefix = record.RemotePath.TrimEnd('/') + "/";
+
+        // A remote without empty folders never lists one: absent is not deleted.
+        if (!_remoteKeepsEmptyFolders && Directory.Exists(record.LocalPath) &&
+            !Directory.EnumerateFileSystemEntries(record.LocalPath).Any())
+        {
+            return;
+        }
+
+        var edited = new List<string>();
         if (Directory.Exists(record.LocalPath))
         {
-            // Server wins over local changes inside, but the client's own
-            // upload or rename still on its way is waited for. Only
-            // enumerations by other processes are forwarded to the provider,
-            // so this sees exactly what is on disk.
+            // Only enumerations by other processes are forwarded to the
+            // provider, so this sees exactly what is on disk.
             foreach (var file in Directory.EnumerateFiles(record.LocalPath, "*", SearchOption.AllDirectories))
             {
                 if (IsOwnChangeInFlight(file, RelativeOf(file), listedAt))
@@ -624,7 +848,18 @@ public sealed class CloudSyncEngine : IAsyncDisposable
                     _log?.Invoke($"Server deleted folder '{prefix}', but '{RelativeOf(file)}' is still being sent; the next listing deletes it.");
                     return;
                 }
+
+                if (HasUnsyncedLocalChanges(file))
+                {
+                    edited.Add(file);
+                }
             }
+        }
+
+        if (edited.Count > 0)
+        {
+            KeepEditedInDeletedFolder(record, prefix, edited);
+            return;
         }
 
         _serverDeletes[prefix] = DateTimeOffset.UtcNow;
@@ -647,11 +882,106 @@ public sealed class CloudSyncEngine : IAsyncDisposable
     }
 
     /// <summary>
-    /// Server wins: the local copy is replaced by the server's version, and
-    /// local changes not yet sent are discarded. In cloud mode the file
-    /// becomes a dehydrated placeholder with the server's size and time (a
-    /// plain local file is made a placeholder first); in mock mode the
-    /// server's bytes are written over it.
+    /// Deleted folder, edited files: those files and their folders stay and
+    /// are uploaded again; every other file goes, and so do folders left
+    /// empty. Rows go for what is deleted and for the kept files (which are
+    /// new to the server now); the folders kept keep theirs.
+    /// </summary>
+    private void KeepEditedInDeletedFolder(FileRecord record, string prefix, IReadOnlyList<string> edited)
+    {
+        var keep = new HashSet<string>(edited, StringComparer.OrdinalIgnoreCase);
+        foreach (var file in Directory.EnumerateFiles(record.LocalPath, "*", SearchOption.AllDirectories).ToList())
+        {
+            if (keep.Contains(file))
+            {
+                continue;
+            }
+
+            var remotePath = RelativeOf(file);
+            _serverDeletes[remotePath] = DateTimeOffset.UtcNow;
+            try
+            {
+                File.Delete(file);
+                _store.DeleteByRemotePath(remotePath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _serverDeletes.TryRemove(remotePath, out _);
+                _log?.Invoke($"Server deleted '{remotePath}', but the local file could not be removed: {ex.Message}");
+            }
+        }
+
+        foreach (var directory in Directory.EnumerateDirectories(record.LocalPath, "*", SearchOption.AllDirectories)
+                     .OrderByDescending(path => path.Length)
+                     .ToList())
+        {
+            if (!Directory.EnumerateFileSystemEntries(directory).Any())
+            {
+                var remotePath = RelativeOf(directory) + "/";
+                _serverDeletes[remotePath] = DateTimeOffset.UtcNow;
+                try
+                {
+                    Directory.Delete(directory);
+                    _store.DeleteByRemotePath(remotePath);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    _serverDeletes.TryRemove(remotePath, out _);
+                }
+            }
+        }
+
+        // What stays is new to the server now: no rows, so no listing takes
+        // it for deleted again; the uploads bring the folders back with them.
+        _store.DeleteTree(prefix);
+        _store.DeleteByRemotePath(record.RemotePath);
+        foreach (var file in edited)
+        {
+            _log?.Invoke($"Server deleted folder '{prefix}', but '{RelativeOf(file)}' has local changes: it is kept and uploaded again.");
+            QueueUpload(file);
+        }
+    }
+
+    /// <summary>
+    /// A file with local changes the server lost track of (it deleted the
+    /// file, or its folder): the local version stays and is uploaded as new.
+    /// </summary>
+    private void RestoreToServer(FileRecord record, string what)
+    {
+        _store.DeleteByRemotePath(record.RemotePath);
+        _log?.Invoke($"Server {what} '{record.RemotePath}', which has local changes: they are kept and uploaded again.");
+        QueueUpload(record.LocalPath);
+    }
+
+    /// <summary>
+    /// Keeps the local version of a file the server changed too: a copy of
+    /// it next to it, named like Nextcloud's conflict copies, which is
+    /// uploaded as a file of its own (OneDrive and Nextcloud keep both).
+    /// Returns the copy's path, or null if it could not be made.
+    /// </summary>
+    private string? KeepConflictCopy(string localPath, string remotePath)
+    {
+        try
+        {
+            var copy = ConflictCopies.PathFor(localPath, File.GetLastWriteTime(localPath));
+            File.Copy(localPath, copy);
+            _log?.Invoke($"Conflict: '{remotePath}' changed here and on the server; the server's version keeps the name, this PC's is kept as '{RelativeOf(copy)}'.");
+            return copy;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _log?.Invoke($"Conflict: '{remotePath}' changed here and on the server, and the local version could not be copied aside ({ex.Message}); it is kept as it is for now.");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The local copy is replaced by the server's version. A local change
+    /// not yet sent is kept first as a conflict copy, and if it cannot be,
+    /// nothing is replaced. In cloud mode the file becomes a dehydrated
+    /// placeholder with the server's size and time (a plain local file is
+    /// made a placeholder first); in mock mode the server's bytes are written
+    /// over it.
     /// </summary>
     private bool ApplyServerVersion(string localPath, string remotePath, long size, DateTimeOffset? modifiedUtc)
     {
@@ -660,7 +990,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             return false;
         }
 
-        var discarded = HasUnsyncedLocalChanges(localPath);
+        if (HasUnsyncedLocalChanges(localPath) && KeepConflictCopy(localPath, remotePath) is null)
+        {
+            return false;
+        }
+
         _providerWrites[localPath] = DateTimeOffset.UtcNow;
         bool replaced;
         if (IsSimulated)
@@ -693,9 +1027,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         }
 
         _store.UpdateRemoteMetadata(remotePath, size, modifiedUtc, dehydrated: !IsSimulated);
-        _log?.Invoke(discarded
-            ? $"Server changed '{remotePath}' ({size} bytes); the server wins: its version replaced the local changes."
-            : $"Server changed '{remotePath}' ({size} bytes); local copy will be re-downloaded on next open.");
+        _log?.Invoke($"Server changed '{remotePath}' ({size} bytes); local copy will be re-downloaded on next open.");
         return true;
     }
 
@@ -990,7 +1322,17 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             EnableRaisingEvents = true,
         };
 
-        _watcher.Created += (_, e) => QueueUpload(e.FullPath);
+        _watcher.Created += (_, e) =>
+        {
+            if (Directory.Exists(e.FullPath))
+            {
+                QueueCreateFolder(e.FullPath);
+            }
+            else
+            {
+                QueueUpload(e.FullPath);
+            }
+        };
         _watcher.Changed += (_, e) =>
         {
             QueuePinChange(e.FullPath);
@@ -1063,7 +1405,23 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         });
     }
 
+    /// <summary>
+    /// One pin or unpin at a time per file: the second of two requests (the
+    /// watcher's, and the one an upload makes once a file waiting to be freed
+    /// is sent) then finds the work done. Two at once would open a file the
+    /// other just freed with write access, which downloads it again.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, object> _pinLocks = new(StringComparer.OrdinalIgnoreCase);
+
     private void ApplyPinState(string localPath, bool keepLocal)
+    {
+        lock (_pinLocks.GetOrAdd(localPath, _ => new object()))
+        {
+            ApplyPinStateNow(localPath, keepLocal);
+        }
+    }
+
+    private void ApplyPinStateNow(string localPath, bool keepLocal)
     {
         var attributes = File.GetAttributes(localPath);
         var isLocal = (attributes & RecallOnDataAccessAttribute) == 0;
@@ -1086,8 +1444,17 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         }
         else if (!keepLocal && isLocal)
         {
-            // Refused by the platform if the file has local edits that have
-            // not been uploaded (it is not in sync), so nothing is lost.
+            // Never the only copy of a change: a file with local changes the
+            // server does not have yet is uploaded first and freed after
+            // (OneDrive does the same). The platform's own refusal covers
+            // only what in-sync tells, which is not every edit.
+            if (HasUnsyncedLocalChanges(localPath))
+            {
+                _log?.Invoke($"Free up space: '{relative}' has changes that are not on the server yet; it is freed once they are uploaded.");
+                QueueUpload(localPath);
+                return;
+            }
+
             _providerWrites[localPath] = DateTimeOffset.UtcNow;
             if (_placeholders.Dehydrate(localPath))
             {
@@ -1240,12 +1607,58 @@ public sealed class CloudSyncEngine : IAsyncDisposable
 
         var relative = remoteRelativePath.TrimEnd('/');
         var record = _store.GetByRemotePath(remoteRelativePath) ?? _store.GetByRemotePath(relative);
-        if (remoteRelativePath.EndsWith('/') || record?.IsDirectory == true || _store.GetTree(relative).Count > 0)
+        var isDirectory = remoteRelativePath.EndsWith('/') || record?.IsDirectory == true || _store.GetTree(relative).Count > 0;
+
+        // Offline: kept, with the rows, until the server answers.
+        if (_server is { IsOnline: false })
         {
-            await DeleteRemoteDirectoryAsync(relative).ConfigureAwait(false);
+            KeepForLater(PendingChangeKind.Delete, isDirectory ? relative + "/" : relative, LocalPathOf(relative));
             return;
         }
 
+        try
+        {
+            if (isDirectory)
+            {
+                await DeleteRemoteDirectoryAsync(relative).ConfigureAwait(false);
+            }
+            else
+            {
+                await DeleteRemoteFileAsync(relative, record).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (_server is not null && ServerConnection.IsUnreachable(ex))
+        {
+            _server.Failed(ex.Message);
+            KeepForLater(PendingChangeKind.Delete, isDirectory ? relative + "/" : relative, LocalPathOf(relative));
+        }
+    }
+
+    /// <summary>
+    /// The server version of a file deleted here changed since this client
+    /// last saw it: it is not deleted, and comes back here with the next
+    /// listing (Nextcloud restores it too, rather than lose the change).
+    /// </summary>
+    private async Task<bool> ChangedOnServerSinceAsync(string relative, FileRecord? record)
+    {
+        if (record is null || record.IsDirectory)
+        {
+            return false;
+        }
+
+        _rc ??= new RcloneRcClient(_rclone);
+        var server = await _rc.StatAsync(_remote, relative).ConfigureAwait(false);
+        if (server is { IsDirectory: false } && DiffersFromServer(record, server))
+        {
+            _log?.Invoke($"'{relative}' was deleted here, but it changed on the server since: the server's version is kept and comes back.");
+            return true;
+        }
+
+        return false;
+    }
+
+    private async Task DeleteRemoteFileAsync(string relative, FileRecord? record)
+    {
         // Registered before the claim below, so a folder delete that finds
         // the file claimed can wait for it.
         var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1261,6 +1674,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable
 
             var (fs, remoteFile) = ResolveRemoteFile(relative);
             _rc ??= new RcloneRcClient(_rclone);
+
+            if (await ChangedOnServerSinceAsync(relative, record).ConfigureAwait(false))
+            {
+                return;
+            }
 
             if (record is null && IsSimulated)
             {
@@ -1361,9 +1779,13 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             var (_, remoteFile) = ResolveRemoteFile(row.RemotePath);
             try
             {
-                await _rc.TryDeleteFileAsync(fs, remoteFile).ConfigureAwait(false);
+                // Changed on the server since: kept there, with its folder.
+                if (!await ChangedOnServerSinceAsync(row.RemotePath, row).ConfigureAwait(false))
+                {
+                    await _rc.TryDeleteFileAsync(fs, remoteFile).ConfigureAwait(false);
+                }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!ServerConnection.IsUnreachable(ex))
             {
                 // One file must not stop the rest; the folder then stays.
                 _log?.Invoke($"Could not delete remote '{fs}{remoteFile}': {ex.Message}");
@@ -1412,7 +1834,14 @@ public sealed class CloudSyncEngine : IAsyncDisposable
     private bool IsLocalChangePending(string localPath) =>
         _connection?.IsLocalChangePending(localPath) == true ||
         IsRenaming(localPath) ||
+        IsKeptOffline(localPath) ||
         _pendingDeletes.Keys.Any(path =>
+            string.Equals(path, localPath, StringComparison.OrdinalIgnoreCase) ||
+            localPath.StartsWith(path + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>A delete or rename of the item, or of a folder above it, is kept for the server.</summary>
+    private bool IsKeptOffline(string localPath) =>
+        _offlinePaths.Keys.Any(path =>
             string.Equals(path, localPath, StringComparison.OrdinalIgnoreCase) ||
             localPath.StartsWith(path + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
 
@@ -1449,16 +1878,44 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             return;
         }
 
-        if (isTrackedDirectory)
+        if (Directory.Exists(newLocalPath) && !isTrackedDirectory)
         {
-            await RenameRemoteDirectoryAsync(oldRelative, newRelative, newLocalPath, source).ConfigureAwait(false);
+            // A folder the server does not have yet (Explorer's "New folder",
+            // renamed before it was created there): made under the new name.
+            QueueCreateFolder(newLocalPath);
             return;
         }
 
-        if (Directory.Exists(newLocalPath))
+        // Offline: kept until the server answers. The item is already under
+        // its new name here, and listings leave both names alone meanwhile.
+        if (_server is { IsOnline: false } && (isTrackedDirectory || record is not null))
         {
-            // A folder nothing is tracked under: already handled by the other
-            // signal, or empty and never on the server.
+            KeepForLater(PendingChangeKind.Rename, oldRemoteRelative, LocalPathOf(oldRelative), newLocalPath);
+            return;
+        }
+
+        try
+        {
+            await RenameTrackedAsync(oldRelative, newRelative, newLocalPath, record, isTrackedDirectory, source).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (_server is not null && ServerConnection.IsUnreachable(ex))
+        {
+            _server.Failed(ex.Message);
+            KeepForLater(PendingChangeKind.Rename, oldRemoteRelative, LocalPathOf(oldRelative), newLocalPath);
+        }
+    }
+
+    private async Task RenameTrackedAsync(
+        string oldRelative,
+        string newRelative,
+        string newLocalPath,
+        FileRecord? record,
+        bool isTrackedDirectory,
+        SyncRootConnection.RenameSource? source)
+    {
+        if (isTrackedDirectory)
+        {
+            await RenameRemoteDirectoryAsync(oldRelative, newRelative, newLocalPath, source).ConfigureAwait(false);
             return;
         }
 
@@ -1506,10 +1963,17 @@ public sealed class CloudSyncEngine : IAsyncDisposable
     private void UpdateRenamedPlaceholder(string localPath, string identityPath, SyncRootConnection.RenameSource? source)
     {
         var identity = CloudPlaceholderService.BuildFileIdentity(identityPath);
-        var unchanged = source is { InSync: true } &&
-                        File.GetLastWriteTimeUtc(localPath) == source.LastWriteUtc &&
-                        (!File.Exists(localPath) || new FileInfo(localPath).Length == source.Length) &&
-                        (!File.Exists(localPath) || MatchesLastSync(localPath, _store.GetByRemotePath(identityPath)));
+        var record = _store.GetByRemotePath(identityPath);
+
+        // A rename sent later (it was kept while offline) has no state from
+        // before it; the file's size and write time against its last sync
+        // tell instead. A folder has no content to compare.
+        var unchanged = source is null
+            ? Directory.Exists(localPath) || (record?.SyncedLocalState is not null && MatchesLastSync(localPath, record))
+            : source.InSync &&
+              File.GetLastWriteTimeUtc(localPath) == source.LastWriteUtc &&
+              (!File.Exists(localPath) || new FileInfo(localPath).Length == source.Length) &&
+              (!File.Exists(localPath) || MatchesLastSync(localPath, record));
 
         if (unchanged)
         {
@@ -1641,6 +2105,14 @@ public sealed class CloudSyncEngine : IAsyncDisposable
                     return;
                 }
 
+                // A rename or delete of it is kept for the server: sending that
+                // decides whether there is anything to upload (see
+                // SendPendingChangesAsync); a rename alone looks like an edit.
+                if (IsKeptOffline(localPath))
+                {
+                    return;
+                }
+
                 // Offline, nothing is sent: the file is uploaded once the
                 // server answers, as Nextcloud's next sync run would.
                 if (_server is { IsOnline: false })
@@ -1714,12 +2186,272 @@ public sealed class CloudSyncEngine : IAsyncDisposable
 
     private void UploadDeferred()
     {
+        foreach (var localPath in _deferredFolders.Keys)
+        {
+            if (_deferredFolders.TryRemove(localPath, out _))
+            {
+                QueueCreateFolder(localPath);
+            }
+        }
+
         foreach (var localPath in _deferredUploads.Keys)
         {
             if (_deferredUploads.TryRemove(localPath, out _))
             {
                 QueueUpload(localPath);
             }
+        }
+    }
+
+    /// <summary>
+    /// A folder made here, empty or not, is made on the server too, as
+    /// Nextcloud and OneDrive do (uploading a file creates the folders above
+    /// it, but an empty folder has nothing to upload). Held for a moment like
+    /// an upload: Explorer's "New folder" is usually renamed right away, and
+    /// the rename then brings the name that stays.
+    /// </summary>
+    private void QueueCreateFolder(string localPath)
+    {
+        if (_populating || IsStateFile(localPath) || IsProviderWrite(localPath))
+        {
+            return;
+        }
+
+        lock (_creatingFolders)
+        {
+            if (!_creatingFolders.Add(localPath))
+            {
+                return;
+            }
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(750).ConfigureAwait(false);
+                await CreateRemoteFolderAsync(localPath).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                if (_server is not null && ServerConnection.IsUnreachable(ex))
+                {
+                    _server.Failed(ex.Message);
+                    DeferFolder(localPath);
+                }
+                else
+                {
+                    _log?.Invoke($"Upload failed for folder '{RelativeOf(localPath)}': {ex.Message}");
+                }
+            }
+            finally
+            {
+                lock (_creatingFolders)
+                {
+                    _creatingFolders.Remove(localPath);
+                }
+            }
+        });
+    }
+
+    private async Task CreateRemoteFolderAsync(string localPath)
+    {
+        if (!Directory.Exists(localPath))
+        {
+            return; // renamed or deleted meanwhile
+        }
+
+        var relative = RelativeOf(localPath);
+        var remotePath = relative + "/";
+        if (_store.GetByRemotePath(remotePath) is not null && (IsSimulated || _placeholders.QueryState(localPath).IsPlaceholder))
+        {
+            return; // a folder the server already has
+        }
+
+        if (_server is { IsOnline: false })
+        {
+            DeferFolder(localPath);
+            return;
+        }
+
+        var (fs, remoteDirectory) = ResolveRemoteFile(relative);
+        _rc ??= new RcloneRcClient(_rclone);
+        await _rc.MakeDirectoryAsync(fs, remoteDirectory).ConfigureAwait(false);
+        _store.UpsertFile(
+            remotePath: remotePath,
+            localPath: localPath,
+            fileIdentity: remotePath,
+            fileId: 0,
+            isPlaceholder: !IsSimulated,
+            isDirectory: true,
+            size: 0,
+            modifiedUtc: null,
+            inSync: true);
+        _localChangeAt[remotePath] = DateTimeOffset.UtcNow;
+
+        // Everything in it is here, so it is fully populated: listed, and
+        // kept current by the background sync from now on.
+        if (!IsSimulated && !_placeholders.QueryState(localPath).IsPlaceholder)
+        {
+            _placeholders.ConvertToPlaceholder(localPath, CloudPlaceholderService.BuildFileIdentity(remotePath), markInSync: true);
+        }
+
+        _log?.Invoke($"Created folder '{relative}' on {fs}.");
+
+        // A folder moved or copied in is reported alone, without what it holds.
+        foreach (var file in Directory.EnumerateFiles(localPath))
+        {
+            QueueUpload(file);
+        }
+
+        foreach (var folder in Directory.EnumerateDirectories(localPath))
+        {
+            QueueCreateFolder(folder);
+        }
+    }
+
+    private void DeferFolder(string localPath)
+    {
+        if (_deferredFolders.TryAdd(localPath, 0))
+        {
+            _log?.Invoke($"Offline: folder '{RelativeOf(localPath)}' is created on the server once it answers.");
+        }
+
+        if (_server is { IsOnline: true })
+        {
+            UploadDeferred();
+        }
+        else
+        {
+            _server?.CheckNow();
+        }
+    }
+
+    /// <summary>
+    /// Keeps a delete or rename for the server while it cannot be reached:
+    /// in the store, so it survives a restart, and marked so that listings
+    /// do not bring the item back meanwhile. Sent once the server answers.
+    /// </summary>
+    private void KeepForLater(PendingChangeKind kind, string remotePath, string localPath, string? newLocalPath = null)
+    {
+        _store.AddPendingChange(kind, remotePath, localPath, newLocalPath);
+        _offlinePaths[localPath] = 0;
+        if (newLocalPath is not null)
+        {
+            _offlinePaths[newLocalPath] = 0;
+        }
+
+        _log?.Invoke(kind == PendingChangeKind.Delete
+            ? $"Offline: '{remotePath}' is deleted on the server once it answers."
+            : $"Offline: '{remotePath}' is renamed to '{RelativeOf(newLocalPath!)}' on the server once it answers.");
+        _server?.CheckNow();
+    }
+
+    /// <summary>
+    /// Sends the deletes and renames kept while offline, in the order they
+    /// were made; a caller that finds this running waits for it, so none of
+    /// them is still on its way once this returns.
+    /// </summary>
+    private async Task SendPendingChangesAsync()
+    {
+        if (_server is { IsOnline: false })
+        {
+            return;
+        }
+
+        await _pendingGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            foreach (var change in _store.GetPendingChanges())
+            {
+                if (_server is { IsOnline: false })
+                {
+                    return; // the rest waits for the next time it answers
+                }
+
+                // Taken first; a change that still cannot be sent is kept again.
+                _store.RemovePendingChange(change.Id);
+                try
+                {
+                    if (change.Kind == PendingChangeKind.Delete)
+                    {
+                        await HandleRemoteDeleteAsync(change.RemotePath).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await HandleRemoteRenameAsync(change.RemotePath, change.NewLocalPath!).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log?.Invoke($"Delete propagation failed for '{change.RemotePath}' (kept while offline): {ex.Message}");
+                }
+                finally
+                {
+                    // Listings leave the item alone until here, unless it was kept again.
+                    var kept = _store.GetPendingChanges();
+                    foreach (var path in new[] { change.LocalPath, change.NewLocalPath })
+                    {
+                        if (path is not null && !kept.Any(c => string.Equals(c.LocalPath, path, StringComparison.OrdinalIgnoreCase) ||
+                                                               string.Equals(c.NewLocalPath, path, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            _offlinePaths.TryRemove(path, out _);
+                        }
+                    }
+                }
+
+                // What was edited under the new name, offline too, goes now.
+                if (change.NewLocalPath is { } renamed && !IsKeptOffline(renamed))
+                {
+                    var files = Directory.Exists(renamed)
+                        ? Directory.EnumerateFiles(renamed, "*", SearchOption.AllDirectories)
+                        : File.Exists(renamed) ? [renamed] : [];
+                    foreach (var file in files.Where(HasUnsyncedLocalChanges))
+                    {
+                        QueueUpload(file);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            _pendingGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Changes made here while the service was not running, found when it
+    /// starts (Nextcloud's local discovery does the same): edited or new
+    /// files are uploaded, new folders created on the server. Deletes are
+    /// not taken from it: unregistering the drive removes every online-only
+    /// file, and that must never delete them on the server. What is missing
+    /// comes back from the server instead.
+    /// </summary>
+    private void DiscoverLocalChanges()
+    {
+        int files = 0, folders = 0;
+        var options = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = 0 };
+        foreach (var folder in Directory.EnumerateDirectories(_syncRootPath, "*", options))
+        {
+            if (_store.GetByRemotePath(RelativeOf(folder) + "/") is null && !_placeholders.QueryState(folder).IsPlaceholder)
+            {
+                QueueCreateFolder(folder);
+                folders++;
+            }
+        }
+
+        foreach (var file in Directory.EnumerateFiles(_syncRootPath, "*", options))
+        {
+            if (!IsStateFile(file) && HasUnsyncedLocalChanges(file))
+            {
+                QueueUpload(file);
+                files++;
+            }
+        }
+
+        if (files + folders > 0)
+        {
+            _log?.Invoke($"Changes made while OpenCfDrive was not running: {files} file(s) and {folders} folder(s) are sent to the server.");
         }
     }
 
@@ -1754,6 +2486,14 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             {
                 return false;
             }
+
+            // A plain file still as it was last synced (unregistering leaves
+            // downloaded files so): made a placeholder again, not sent again.
+            if (!state.IsPlaceholder && record is { IsDirectory: false, SyncedLocalState: not null } && MatchesLastSync(localPath, record))
+            {
+                _placeholders.ConvertToPlaceholder(localPath, CloudPlaceholderService.BuildFileIdentity(record.RemotePath), markInSync: true);
+                return false;
+            }
         }
         else if (_lastSyncedState.TryGetValue(localPath, out var synced) &&
                  synced == (info.Length, info.LastWriteTimeUtc))
@@ -1761,17 +2501,60 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             return false;
         }
 
-        // Server wins: a local change is only sent over the version this
-        // client last saw. If the server has moved on since (changed,
-        // deleted, or a file this client never saw at that path), its
-        // version replaces the local one and the local change is discarded.
+        // A local change is only sent over the version this client last saw.
+        // If the server has moved on since, nothing is lost, as in Nextcloud:
+        // a file it changed, or one it got from elsewhere at this path, takes
+        // the server's version and the local one is kept as a conflict copy;
+        // a file it deleted is uploaded again.
         _rc ??= new RcloneRcClient(_rclone);
         var server = await _rc.StatAsync(_remote, relative, cancellationToken).ConfigureAwait(false);
         if (ServerMovedOn(record, server))
         {
-            if (server is null || server.IsDirectory)
+            if (server is null)
             {
-                ApplyServerFileDelete(record!);
+                _store.DeleteByRemotePath(record!.RemotePath);
+                _log?.Invoke($"Server deleted '{relative}', which has local changes: they are kept and uploaded again.");
+                record = null;
+            }
+            else if (server.IsDirectory)
+            {
+                // A folder took the name on the server: the file is kept
+                // under its conflict name, and the folder comes with the
+                // next listing.
+                if (KeepConflictCopy(localPath, relative) is not null)
+                {
+                    File.Delete(localPath);
+                    if (record is not null)
+                    {
+                        _store.DeleteByRemotePath(record.RemotePath);
+                    }
+                }
+
+                return false;
+            }
+            else if (record is null && SameAsServer(info, server))
+            {
+                // Added on both sides, the same file (Nextcloud takes equal
+                // size and time for equal): nothing to send.
+                _store.UpsertFile(
+                    remotePath: relative,
+                    localPath: localPath,
+                    fileIdentity: relative,
+                    fileId: state.FileId,
+                    isPlaceholder: true,
+                    isDirectory: false,
+                    size: server.Size,
+                    modifiedUtc: server.ModifiedTime,
+                    inSync: true,
+                    localSize: sent.Length,
+                    localWriteUtc: sent.WriteUtc);
+                if (!IsSimulated)
+                {
+                    _placeholders.ConvertToPlaceholder(localPath, CloudPlaceholderService.BuildFileIdentity(relative), markInSync: true);
+                }
+
+                RememberSyncedState(localPath);
+                return false;
             }
             else
             {
@@ -1791,9 +2574,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable
                 }
 
                 ApplyServerVersion(localPath, relative, server.Size, server.ModifiedTime);
+                return false;
             }
-
-            return false;
         }
 
         var (fs, remoteFile) = ResolveRemoteFile(relative);
@@ -1841,14 +2623,29 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             {
                 _placeholders.ConvertToPlaceholder(localPath, identity, markInSync: true);
             }
+
+            // Free up space was asked for while this was still to be sent.
+            if ((File.GetAttributes(localPath) & UnpinnedAttribute) != 0)
+            {
+                ApplyPinState(localPath, keepLocal: false);
+            }
         }
 
         return true;
     }
 
+    /// <summary>The same file on both sides, by Nextcloud's test: equal size and modification time.</summary>
+    private static bool SameAsServer(FileInfo local, CloudItem server) =>
+        local.Length == server.Size &&
+        server.ModifiedTime is { } serverTime &&
+        Math.Abs((serverTime.UtcDateTime - local.LastWriteTimeUtc).TotalSeconds) < 1;
+
 
     public async ValueTask DisposeAsync()
     {
+        _scheduler?.Dispose();
+        _scheduler = null;
+
         _watcher?.Dispose();
         _watcher = null;
 

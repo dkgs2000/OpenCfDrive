@@ -2,10 +2,11 @@
 # both sides. Dot-sourced by E2E-Common.ps1; relies on its helpers.
 #
 #   S## server side  Another app changes the server through its own rclone
-#                    process. Nothing notifies the client: the scenario lists
-#                    the folder (what Explorer does when you open it or press
-#                    F5) and expects the local side to match the server
-#                    afterwards. Cloud mode only: mock mode never lists the
+#                    process. Nothing notifies the client: the scenario asks
+#                    the client for the background sync run it makes every
+#                    30 s (Sync-Remote), lists the folder the way Explorer
+#                    does, and expects the local side to match the server
+#                    afterwards. Cloud mode only: mock mode never looks at the
 #                    server after startup.
 #   C## client side  A local action in the drive. The scenario expects the
 #                    server to match, checked through the separate rclone
@@ -45,6 +46,9 @@ function Initialize-E2EScenarioFixtures {
     Set-RemoteFile "client/conflict.txt" "conflict-v1"
     Set-RemoteFile "client/rename-edit.txt" "rename-edit-v1"
     Set-RemoteFile "client/page.txt" ("p" * 4096)
+    Set-RemoteFile "client/offline-delete.txt" "offline-delete"
+    Set-RemoteFile "client/offline-rename.txt" "offline-rename"
+    Set-RemoteFile "client/free-after-upload.txt" "free-after-upload-v1"
     # For the unregister / register again check in E2E-Common.ps1.
     Set-RemoteFile "restart/never-opened.txt" "never-opened"
 }
@@ -62,8 +66,15 @@ function Get-OutsidePath([string]$Name) {
     return (Join-Path $outside $Name)
 }
 
-# Lists a local folder the way Explorer does. In cloud mode this is the only
-# thing that makes the client look at the server.
+# A name in Arabic script, from its code points: Windows PowerShell 5.1 reads
+# a script saved without a byte order mark in the ANSI code page, so the
+# names cannot be written out in this file.
+function Get-ArabicName([int[]]$CodePoints) {
+    return -join ($CodePoints | ForEach-Object { [char]$_ })
+}
+
+# Lists a local folder the way Explorer does. The first listing of a folder
+# asks the server; after that the folder is listed from disk.
 function Update-LocalFolder([string]$Folder) {
     $path = Get-LocalPath $Folder
     if (Test-Path -LiteralPath $path -PathType Container) {
@@ -71,8 +82,8 @@ function Update-LocalFolder([string]$Folder) {
     }
 }
 
-# Re-lists $Folder until $Condition holds. Polls a little slower than the
-# provider's 1 s listing reuse window, so every poll is a fresh server listing.
+# Until $Condition holds: a background sync run of the client (it waits for
+# the run to finish), then a listing of $Folder, the way Explorer shows it.
 function Wait-Local {
     param(
         [string]$Folder,
@@ -88,9 +99,20 @@ function Wait-Local {
     # A check that throws counts as "not yet": while the client updates a
     # placeholder after a server change it holds a write handle for a few
     # milliseconds, and a read in that moment fails with a sharing violation.
-    $ok = Wait-ForCondition { Update-LocalFolder $localFolder; try { [bool](& $localCheck) } catch { $false } } `
-        -TimeoutSeconds $TimeoutSeconds -PollMilliseconds 1200
+    $ok = Wait-ForCondition {
+        if ($(try { [bool](& $localCheck) } catch { $false })) { return $true }
+        Sync-Remote
+        Update-LocalFolder $localFolder
+        try { [bool](& $localCheck) } catch { $false }
+    } -TimeoutSeconds $TimeoutSeconds -PollMilliseconds 200
     if (-not $ok) { throw $Because }
+}
+
+# The attributes Windows gives a folder that is not fully populated: listing it
+# asks the provider, and Explorer shows it as online-only (the cloud icon).
+function Test-OnlineOnlyFolder([string]$Relative) {
+    $attributes = [int](Get-Item -LiteralPath (Get-LocalPath $Relative) -Force).Attributes
+    return ($attributes -band 0x400000) -ne 0
 }
 
 function Wait-Remote {
@@ -149,6 +171,21 @@ function Assert-RemoteText([string]$Path, [string]$Expected) {
         throw "Server '$Path' is $actual, expected '$Expected'."
     }
 }
+
+# The one conflict copy of "$BaseName.*" in $Folder (named as Nextcloud names
+# them: "name (conflicted copy 2026-11-03 175504).txt"), as a relative path.
+function Get-ConflictCopy([string]$Folder, [string]$BaseName) {
+    $copies = @(Get-ChildItem -LiteralPath (Get-LocalPath $Folder) -Force -File |
+        Where-Object { $_.Name -like "$BaseName (conflicted copy *)*" })
+    if ($copies.Count -ne 1) {
+        throw "Expected one conflict copy of $BaseName in '$Folder', found $($copies.Count): $($copies.Name -join ', ')"
+    }
+    return $(if ($Folder) { "$Folder/$($copies[0].Name)" } else { $copies[0].Name })
+}
+
+# Whether the server can hold a folder with nothing in it (S3 cannot: a
+# folder there is only a part of file names).
+function Test-ServerKeepsEmptyFolders { return $script:E2EBackend -ne "s3" }
 
 function Assert-RemoteMissing([string]$Path) {
     Wait-Remote { -not (Test-RemoteItem $Path) } "Server still has '$Path'."
@@ -244,7 +281,7 @@ function Read-LogSlice([string]$Path, [long]$From, [long]$To) {
 # Windows asked it to download and any error it logged.
 function Measure-ServiceActivity([string]$ServiceLog, [string]$RcloneLog) {
     $activity = [ordered]@{
-        Uploads = 0; DownloadBytes = 0L; ServerRenames = 0; ServerDeletes = 0
+        Uploads = 0; DownloadBytes = 0L; ServerRenames = 0; ServerDeletes = 0; ServerFolders = 0
         Listings = 0; Lookups = 0; OtherCalls = 0; Errors = 0
     }
     $lines = New-Object System.Collections.Generic.List[string]
@@ -257,6 +294,7 @@ function Measure-ServiceActivity([string]$ServiceLog, [string]$RcloneLog) {
             '^operations/uploadfile$' { $activity.Uploads++ }
             '^(operations/movefile|operations/moveto|sync/move)$' { $activity.ServerRenames++ }
             '^(operations/deletefile|operations/rmdirs?|operations/purge|operations/delete)$' { $activity.ServerDeletes++ }
+            '^operations/mkdir$' { $activity.ServerFolders++ }
             '^operations/list$' { $activity.Listings++ }
             '^operations/stat$' { $activity.Lookups++ }
             default { $activity.OtherCalls++ }
@@ -280,8 +318,8 @@ function Measure-ServiceActivity([string]$ServiceLog, [string]$RcloneLog) {
 }
 
 function Format-Activity($Counts) {
-    return "up {0}, down {1} B, mv {2}, rm {3}, list {4}, stat {5}, other {6}, err {7}" -f `
-        $Counts.Uploads, $Counts.DownloadBytes, $Counts.ServerRenames, $Counts.ServerDeletes,
+    return "up {0}, down {1} B, mv {2}, rm {3}, mkdir {4}, list {5}, stat {6}, other {7}, err {8}" -f `
+        $Counts.Uploads, $Counts.DownloadBytes, $Counts.ServerRenames, $Counts.ServerDeletes, $Counts.ServerFolders,
         $Counts.Listings, $Counts.Lookups, $Counts.OtherCalls, $Counts.Errors
 }
 
@@ -409,28 +447,32 @@ function Get-E2EScenarios {
             Wait-Local "s14-many" { @(Get-ChildItem -LiteralPath (Get-LocalPath "s14-many") -File).Count -eq 40 } "s14-many does not have 40 files locally."
             Assert-Local "s14-many/f40.txt" "s14-40"
         }
-        # Conflicts: the server wins. The local edit is discarded, never sent:
-        # no upload, and only the server check before it (one lookup).
-        New-E2EScenario "S15" "both sides edit the same file: the server's version wins" -Budget @{ DownloadBytes = 33; Lookups = 1 } -CloudOnly {
+        # Conflicts keep both, as in Nextcloud and OneDrive: the server's
+        # version keeps the name, the local edit is kept beside it as a
+        # conflict copy and uploaded as a file of its own (its two lookups,
+        # plus the check that found the conflict).
+        New-E2EScenario "S15" "both sides edit the same file: both versions are kept" -Budget @{ DownloadBytes = 33; Uploads = 1; Lookups = 3 } -CloudOnly {
             Set-RemoteFile "s15.txt" "s15-server-v1"
             Wait-Local "" { Test-Local "s15.txt" } "s15.txt did not appear locally."
             Assert-Local "s15.txt" "s15-server-v1"
             Set-RemoteFile "s15.txt" "s15-server-v2-longer"
             Write-Local "s15.txt" "s15-local-edit"
-            Update-LocalFolder ""
             Wait-Local "" { (Read-Local "s15.txt") -eq "s15-server-v2-longer" } "s15.txt did not take the server's version."
+            $copy = Get-ConflictCopy "" "s15"
+            Assert-Local $copy "s15-local-edit"
+            Assert-RemoteText $copy "s15-local-edit"
             Assert-RemoteText "s15.txt" "s15-server-v2-longer"
         }
-        New-E2EScenario "S16" "server deletes a file that has an unsynced local edit: the server wins, the local file goes" -Budget @{ DownloadBytes = 6; Lookups = 1 } -CloudOnly {
+        # Nextcloud restores it: the edit is the only copy left.
+        New-E2EScenario "S16" "server deletes a file that has an unsynced local edit: the edit is kept and uploaded again" -Budget @{ DownloadBytes = 6; Uploads = 1; Lookups = 2 } -CloudOnly {
             Set-RemoteFile "s16.txt" "s16-v1"
             Wait-Local "" { Test-Local "s16.txt" } "s16.txt did not appear locally."
             Assert-Local "s16.txt" "s16-v1"
             Remove-RemoteFile "s16.txt"
             Write-Local "s16.txt" "s16-local-edit"
-            Update-LocalFolder ""
-            Wait-Local "" { -not (Test-Local "s16.txt") } "s16.txt is still there locally."
-            Start-Sleep -Seconds 2
-            if (Test-RemoteItem "s16.txt") { throw "The local edit reached the server; the server's delete should have won." }
+            Assert-RemoteText "s16.txt" "s16-local-edit"
+            Sync-Remote
+            Assert-Local "s16.txt" "s16-local-edit"
         }
         New-E2EScenario "S17" "client pins a 300 MB server file (Always keep on this device)" -Budget @{ DownloadBytes = 300MB + 1234 } -CloudOnly {
             # Pinning asks for the whole file in one request. It is larger
@@ -470,10 +512,12 @@ function Get-E2EScenarios {
             if ($peak -ge $size) { throw "The service's peak memory ($peak bytes) reached the file size: it buffered the whole file." }
         }
         # Offline the way a lost network is: the server stops answering while
-        # the client's rclone keeps running. The first listing waits for it in
-        # vain (the one error allowed) and puts the drive offline; from then
-        # on, as in Nextcloud and OneDrive, folders show what is local at once.
-        # Using the drive checks the server again, so back online it lists it.
+        # the client's rclone keeps running. An opened folder is listed from
+        # disk and never waits; the first listing of a folder never opened
+        # waits for the server in vain (the one error allowed) and puts the
+        # drive offline; from then on, as in Nextcloud and OneDrive, folders
+        # show what is local at once. Using the drive checks the server again,
+        # so back online opening it lists it.
         New-E2EScenario "S18" "offline: an opened folder keeps what is local, an unopened one is empty, back online lists the server" -Budget @{ DownloadBytes = 9; Errors = 1 } -CloudOnly {
             Set-RemoteFile "s18-seen/cached.txt" "seen"
             Set-RemoteFile "s18-unseen/later.txt" "later"
@@ -483,8 +527,6 @@ function Get-E2EScenarios {
 
             Suspend-E2EBackend
             try {
-                # Past the listing reuse window, so the next listings ask the server.
-                Start-Sleep -Milliseconds 1500
                 $clock = [System.Diagnostics.Stopwatch]::StartNew()
                 $seen = @(Get-ChildItem -LiteralPath (Get-LocalPath "s18-seen") -Force | ForEach-Object Name)
                 $seenMs = $clock.ElapsedMilliseconds
@@ -505,6 +547,69 @@ function Get-E2EScenarios {
             Wait-Local "s18-unseen" { Test-Local "s18-unseen/later.txt" } "Back online, s18-unseen was not listed from the server." -TimeoutSeconds 60
             Assert-Local "s18-unseen/later.txt" "later"
         }
+        # Nextcloud keeps the edited file, and its folder, and uploads it again.
+        New-E2EScenario "S19" "server deletes a folder while a file in it has an unsynced local edit: that file stays and goes back, the rest goes" -Budget @{ DownloadBytes = 6; Uploads = 1; Lookups = 2 } -CloudOnly {
+            Set-RemoteFile "s19-dir/edited.txt" "s19-v1"
+            Set-RemoteFile "s19-dir/other.txt" "other"
+            Wait-Local "" { Test-Local "s19-dir" } "s19-dir did not appear locally."
+            Wait-Local "s19-dir" { (Test-Local "s19-dir/edited.txt") -and (Test-Local "s19-dir/other.txt") } "s19-dir's files did not appear locally."
+            Assert-Local "s19-dir/edited.txt" "s19-v1"
+            Remove-RemoteFolder "s19-dir"
+            Write-Local "s19-dir/edited.txt" "s19-local-edit"
+            Assert-RemoteText "s19-dir/edited.txt" "s19-local-edit"
+            Wait-Local "s19-dir" { -not (Test-Local "s19-dir/other.txt") } "s19-dir\other.txt is still there locally."
+            Assert-Local "s19-dir/edited.txt" "s19-local-edit"
+            if (Test-RemoteItem "s19-dir/other.txt") { throw "s19-dir/other.txt came back on the server." }
+        }
+        # A delete here does not throw away a change the server made since
+        # this client last saw the file: that version comes back instead.
+        New-E2EScenario "S20" "client deletes a file the server changed meanwhile: the server's version comes back" -Budget @{ DownloadBytes = 15; Lookups = 1 } -CloudOnly {
+            Set-RemoteFile "s20.txt" "s20-v1"
+            Wait-Local "" { Test-Local "s20.txt" } "s20.txt did not appear locally."
+            Set-RemoteFile "s20.txt" "s20-version-two"
+            Remove-Item -LiteralPath (Get-LocalPath "s20.txt") -Force
+            Wait-Local "" { Test-Local "s20.txt" } "s20.txt did not come back with the server's version."
+            Assert-Local "s20.txt" "s20-version-two"
+            Assert-RemoteText "s20.txt" "s20-version-two"
+        }
+        # The same new path on both sides, different files (Nextcloud's
+        # new/new conflict): the server's file keeps the name, this PC's is
+        # kept as a conflict copy and uploaded.
+        New-E2EScenario "S21" "client and server add different files at the same new path: both are kept" -Budget @{ DownloadBytes = 10; Uploads = 1; Lookups = 3 } -CloudOnly {
+            Set-RemoteFile "s21.txt" "s21-server"
+            Write-Local "s21.txt" "s21-local"
+            Wait-Local "" { (Read-Local "s21.txt") -eq "s21-server" } "s21.txt did not take the server's file."
+            $copy = Get-ConflictCopy "" "s21"
+            Assert-Local $copy "s21-local"
+            Assert-RemoteText $copy "s21-local"
+            Assert-RemoteText "s21.txt" "s21-server"
+        }
+        # A folder Windows has listed stays fully populated: Explorer shows it
+        # as available, not with the cloud icon, and the background sync
+        # keeps it current.
+        New-E2EScenario "S22" "a folder once listed shows as available, not online-only, and gets what the server adds" -CloudOnly {
+            Set-RemoteFile "s22-dir/f.txt" "s22"
+            Wait-Local "" { Test-Local "s22-dir" } "s22-dir did not appear locally."
+            if (-not (Test-OnlineOnlyFolder "s22-dir")) { throw "s22-dir shows as available before it was ever listed." }
+            Wait-Local "s22-dir" { Test-Local "s22-dir/f.txt" } "s22-dir\f.txt did not appear locally."
+            if (Test-OnlineOnlyFolder "s22-dir") { throw "s22-dir still shows as online-only after it was listed." }
+            Set-RemoteFile "s22-dir/g.txt" "g"
+            Wait-Local "s22-dir" { Test-Local "s22-dir/g.txt" } "s22-dir\g.txt, added on the server later, did not appear."
+            if (Test-OnlineOnlyFolder "s22-dir") { throw "s22-dir went back to online-only." }
+        }
+        New-E2EScenario "S23" "server adds and renames files with Arabic names" -Budget @{ DownloadBytes = 20 } -CloudOnly {
+            $folder = "s23-" + (Get-ArabicName 0x0645, 0x062C, 0x0644, 0x062F)          # "folder"
+            $file = (Get-ArabicName 0x062A, 0x0642, 0x0631, 0x064A, 0x0631) + ".txt"     # "report"
+            $renamed = (Get-ArabicName 0x0645, 0x0644, 0x0641) + ".txt"                 # "file"
+            $text = Get-ArabicName 0x0645, 0x0631, 0x062D, 0x0628, 0x0627               # "hello"
+            Set-RemoteFile "$folder/$file" $text
+            Wait-Local "" { Test-Local $folder } "$folder did not appear locally."
+            Wait-Local $folder { Test-Local "$folder/$file" } "$folder\$file did not appear locally."
+            Assert-Local "$folder/$file" $text
+            Move-RemoteFile "$folder/$file" "$folder/$renamed"
+            Wait-Local $folder { (-not (Test-Local "$folder/$file")) -and (Test-Local "$folder/$renamed") } "The rename did not reach the local side."
+            Assert-Local "$folder/$renamed" $text
+        }
 
         # ---------------- client side -> server ----------------
         New-E2EScenario "C01" "client adds a file" -Budget @{ Uploads = 1; Lookups = 2 } {
@@ -515,7 +620,8 @@ function Get-E2EScenarios {
             Write-Local "docs/c02.txt" "c02"
             Assert-RemoteText "docs/c02.txt" "c02"
         }
-        New-E2EScenario "C03" "client adds nested folders with a file" -Budget @{ Uploads = 1; Lookups = 2 } {
+        # Each new folder is created on the server first, as Nextcloud does (MKCOL).
+        New-E2EScenario "C03" "client adds nested folders with a file" -Budget @{ Uploads = 1; Lookups = 2; ServerFolders = 2 } {
             New-Item -ItemType Directory -Path (Get-LocalPath "c03-dir/sub") -Force | Out-Null
             Write-Local "c03-dir/sub/c03.txt" "c03"
             Assert-RemoteText "c03-dir/sub/c03.txt" "c03"
@@ -594,16 +700,16 @@ function Get-E2EScenarios {
             $expected = Get-Sha256Hex $bytes
             Wait-Remote { (Get-Sha256Hex (Get-RemoteBytes "c16.bin")) -eq $expected } "The server's c16.bin does not match the local bytes."
         }
-        New-E2EScenario "C17" "client adds 40 files at once" -Budget @{ Uploads = 40; Lookups = 80 } {
+        New-E2EScenario "C17" "client adds 40 files at once" -Budget @{ Uploads = 40; Lookups = 80; ServerFolders = 1 } {
             New-Item -ItemType Directory -Path (Get-LocalPath "c17-many") -Force | Out-Null
             1..40 | ForEach-Object { Write-Local "c17-many/f$_.txt" "c17-$_" }
             Wait-Remote { @(Get-RemoteListing | Where-Object { $_ -like "c17-many/*.txt" }).Count -eq 40 } "The server does not have all 40 files of c17-many."
             Assert-RemoteText "c17-many/f40.txt" "c17-40"
         }
-        # No listing in between, so only the check before the upload can see
+        # No sync run in between, so only the check before the upload can see
         # the server's change. The file is opened before the server changes
-        # it, so saving looks up no name (which could list the folder).
-        New-E2EScenario "C18" "the server changes a file that is open locally, then it is saved: the server's version wins" -Budget @{ DownloadBytes = 29; Lookups = 1 } {
+        # it, so saving looks up no name. Both versions are kept.
+        New-E2EScenario "C18" "the server changes a file that is open locally, then it is saved: both versions are kept" -Budget @{ DownloadBytes = 29; Uploads = 1; Lookups = 3 } {
             Wait-Local "client" { Test-Local "client/conflict.txt" } "client\conflict.txt did not appear locally."
             $stream = [System.IO.File]::Open((Get-LocalPath "client/conflict.txt"), 'Open', 'ReadWrite', 'ReadWrite')
             try {
@@ -619,6 +725,9 @@ function Get-E2EScenarios {
                 -TimeoutSeconds 30 -PollMilliseconds 500
             if (-not $won) { throw "client\conflict.txt did not take the server's version (it reads '$(Read-Local "client/conflict.txt")')." }
             Assert-RemoteText "client/conflict.txt" "conflict-server-v2"
+            $copy = Get-ConflictCopy "client" "conflict"
+            Assert-Local $copy "conflict-local-edit"
+            Assert-RemoteText $copy "conflict-local-edit"
         }
         # A rename must not look like a server change to the check before an
         # upload, or the edit after it would be discarded.
@@ -637,6 +746,91 @@ function Get-E2EScenarios {
             $expected = ("p" * 4096) + "-edited"
             Wait-Remote { [System.Text.Encoding]::UTF8.GetString((Get-RemoteBytes "client/page.txt")) -eq $expected } `
                 "The server's client/page.txt does not end in the appended '-edited'."
+        }
+        # Folders are created on the server like files are uploaded, empty
+        # ones too (Nextcloud and OneDrive sync them). S3 keeps no empty
+        # folders; there the folder stays here, never taken for deleted.
+        New-E2EScenario "C21" "client creates an empty folder" -Budget @{ ServerFolders = 1 } {
+            New-Item -ItemType Directory -Path (Get-LocalPath "c21-empty") | Out-Null
+            if (Test-ServerKeepsEmptyFolders) {
+                Wait-Remote { Test-RemoteItem "c21-empty" } "The empty folder c21-empty did not reach the server."
+            } else {
+                Wait-ServiceQuiet
+            }
+            Sync-Remote
+            if (-not (Test-Local "c21-empty")) { throw "c21-empty is gone locally after a sync run." }
+        }
+        New-E2EScenario "C22" "client creates a folder and renames it right away (Explorer's New folder)" -Budget @{ ServerFolders = 1 } {
+            New-Item -ItemType Directory -Path (Get-LocalPath "c22-New folder") | Out-Null
+            Rename-Item -LiteralPath (Get-LocalPath "c22-New folder") -NewName "c22-renamed"
+            if (Test-ServerKeepsEmptyFolders) {
+                Wait-Remote { Test-RemoteItem "c22-renamed" } "c22-renamed did not reach the server."
+            }
+            Wait-ServiceQuiet
+            if (Test-RemoteItem "c22-New folder") { throw "The folder's first name reached the server." }
+        }
+        # Moved in from outside, a folder is reported alone, without what it holds.
+        New-E2EScenario "C23" "client moves a folder with files and a subfolder in from outside the drive" -Budget @{ Uploads = 2; Lookups = 4; ServerFolders = 2 } {
+            $outside = Get-OutsidePath "c23-moved-in"
+            New-Item -ItemType Directory -Path (Join-Path $outside "sub") -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $outside "a.txt"), "c23-a")
+            [System.IO.File]::WriteAllText((Join-Path $outside "sub\b.txt"), "c23-b")
+            Move-Item -LiteralPath $outside -Destination (Get-LocalPath "c23-moved-in")
+            Assert-RemoteText "c23-moved-in/a.txt" "c23-a"
+            Assert-RemoteText "c23-moved-in/sub/b.txt" "c23-b"
+        }
+        # Offline the way a lost network is (see S18). A sync run finds the
+        # server gone, then a delete and a rename made here are kept, in the
+        # order made, and sent once it answers; nothing comes back meanwhile.
+        New-E2EScenario "C24" "offline: the client deletes and renames files; both reach the server once it answers" -Budget @{ ServerDeletes = 1; ServerRenames = 1; DownloadBytes = 14; Lookups = 1 } -CloudOnly {
+            Wait-Local "client" { (Test-Local "client/offline-delete.txt") -and (Test-Local "client/offline-rename.txt") } "The offline fixtures did not appear locally."
+            Suspend-E2EBackend
+            try {
+                Sync-Remote -TimeoutSeconds 60
+                Remove-Item -LiteralPath (Get-LocalPath "client/offline-delete.txt") -Force
+                Rename-Item -LiteralPath (Get-LocalPath "client/offline-rename.txt") -NewName "offline-renamed.txt"
+                $kept = Wait-ForCondition {
+                    $log = Read-LogText $script:E2EServiceLog
+                    $log.Contains("Offline: 'client/offline-delete.txt' is deleted on the server once it answers.") -and
+                        $log.Contains("Offline: 'client/offline-rename.txt' is renamed to 'client/offline-renamed.txt'")
+                } -TimeoutSeconds 30 -PollMilliseconds 200
+                if (-not $kept) { throw "The delete and rename were not kept for the server while offline." }
+            } finally {
+                Resume-E2EBackend
+            }
+            Wait-Remote { Sync-Remote; -not (Test-RemoteItem "client/offline-delete.txt") } "The delete made offline did not reach the server."
+            Wait-Remote { (Test-RemoteItem "client/offline-renamed.txt") -and -not (Test-RemoteItem "client/offline-rename.txt") } "The rename made offline did not reach the server."
+            Sync-Remote
+            if (Test-Local "client/offline-delete.txt") { throw "The file deleted offline came back locally." }
+            Assert-Local "client/offline-renamed.txt" "offline-rename"
+        }
+        # Never the only copy of a change: OneDrive uploads it first, then frees it.
+        New-E2EScenario "C25" "free up space on a file with an unsynced edit: it is uploaded first, then freed" -Budget @{ DownloadBytes = 20; Uploads = 1; Lookups = 2 } -CloudOnly {
+            $path = Get-LocalPath "client/free-after-upload.txt"
+            Assert-Local "client/free-after-upload.txt" "free-after-upload-v1"
+            [System.IO.File]::AppendAllText($path, "-edited")
+            & attrib.exe -P +U $path | Out-Null
+            Assert-RemoteText "client/free-after-upload.txt" "free-after-upload-v1-edited"
+            if (-not (Wait-ForAttributes $path { ((Get-Item -LiteralPath $path -Force).Attributes -band 0x400000) -ne 0 })) {
+                throw "client\free-after-upload.txt was not freed once its edit was uploaded."
+            }
+            & attrib.exe -U $path | Out-Null
+        }
+        New-E2EScenario "C26" "client creates a folder, an empty folder and a file with Arabic names, and renames the file" -Budget @{ Uploads = 1; Lookups = 2; ServerFolders = 2; ServerRenames = 1 } {
+            $folder = "c26-" + (Get-ArabicName 0x0645, 0x062C, 0x0644, 0x062F)          # "folder"
+            $empty = Get-ArabicName 0x0641, 0x0627, 0x0631, 0x063A                      # "empty"
+            $file = (Get-ArabicName 0x062A, 0x0642, 0x0631, 0x064A, 0x0631) + ".txt"     # "report"
+            $renamed = (Get-ArabicName 0x0645, 0x0644, 0x0641) + ".txt"                 # "file"
+            $text = Get-ArabicName 0x0645, 0x0631, 0x062D, 0x0628, 0x0627               # "hello"
+            New-Item -ItemType Directory -Path (Get-LocalPath "$folder/$empty") -Force | Out-Null
+            Write-Local "$folder/$file" $text
+            Assert-RemoteText "$folder/$file" $text
+            if (Test-ServerKeepsEmptyFolders) {
+                Wait-Remote { Test-RemoteItem "$folder/$empty" } "The empty folder $folder/$empty did not reach the server."
+            }
+            Rename-Item -LiteralPath (Get-LocalPath "$folder/$file") -NewName $renamed
+            Assert-RemoteText "$folder/$renamed" $text
+            Assert-RemoteMissing "$folder/$file"
         }
     )
 }

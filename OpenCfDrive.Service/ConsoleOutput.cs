@@ -27,6 +27,17 @@ internal static class ConsoleOutput
         // output handle reports that as redirected, and its output is lost.
         if (HasStandardOutput() || AttachConsole(AttachParentProcess))
         {
+            // UTF-8 like the service's own log file, or names in other
+            // scripts (Arabic, Hebrew) come out as '?' in the console code page.
+            try
+            {
+                Console.OutputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+            }
+            catch (IOException)
+            {
+                // A console that refuses it keeps its own code page.
+            }
+
             return;
         }
 

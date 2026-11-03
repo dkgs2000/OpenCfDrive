@@ -65,8 +65,8 @@ public sealed class SyncRootConnection : IDisposable
         new(StringComparer.OrdinalIgnoreCase);
     private readonly TimeSpan _listingReuseWindow;
     private readonly ConcurrentDictionary<string, DateTimeOffset> _lastListed = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _listedOk = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _listingGates = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, byte> _repopulationPending = new(StringComparer.OrdinalIgnoreCase);
     private readonly CloudPlaceholderService _placeholders = new();
     private readonly List<CF_CALLBACK> _callbackRoots = [];
     // Full local path -> hydrations in flight and when the last one began or ended.
@@ -85,9 +85,8 @@ public sealed class SyncRootConnection : IDisposable
     /// </param>
     /// <param name="listingReuseWindow">
     /// How long one remote listing answers further FETCH_PLACEHOLDERS for the
-    /// same directory (default 1 s), and how long a directory stays marked
-    /// fully populated after an answer before refreshes are switched back on.
-    /// A re-list after the window sees the live remote again.
+    /// same directory (default 1 s): requests that were already waiting when
+    /// it was answered get nothing new.
     /// </param>
     /// <param name="server">
     /// Whether the server answers. While it does not, listings show what is
@@ -130,13 +129,6 @@ public sealed class SyncRootConnection : IDisposable
     /// block: the shell is still waiting for the enumeration to finish.
     /// </summary>
     public event Action<string>? DirectoryListed;
-
-    /// <summary>
-    /// Raised when refreshes are switched back on for a directory after an
-    /// answer (see <see cref="ScheduleRepopulation"/>): from then on its next
-    /// listing asks the server again. The argument is sync-root-relative.
-    /// </summary>
-    public event Action<string>? RefreshesResumed;
 
     public sealed record HydrationCompleted(string LocalPath, string RemotePath, long Offset, long Length);
 
@@ -445,15 +437,16 @@ public sealed class SyncRootConnection : IDisposable
     }
 
     /// <summary>
-    /// Answers a directory enumeration (or a name lookup, such as creating a
-    /// new file) with a live remote listing. The answer marks the directory
-    /// fully populated, which the platform needs before it lets a new name be
-    /// created there: left "partially populated", it re-issues the create
-    /// after every answer until it gives up with ERROR_CANT_RESOLVE_FILENAME
-    /// ("The name of the file cannot be resolved by the system"). Shortly
-    /// afterwards on-demand population is switched back on (see
-    /// <see cref="ScheduleRepopulation"/>), so the next listing asks the
-    /// server again and server-side changes are still picked up.
+    /// Answers the first enumeration of a directory (or a name lookup in it,
+    /// such as creating a new file) with a live remote listing. The answer
+    /// marks the directory fully populated, and it stays so, as Nextcloud's
+    /// and OneDrive's folders do: Windows lists it from disk from then on and
+    /// shows it as available rather than online-only, and the background sync
+    /// (see <see cref="SyncScheduler"/>) keeps it up to date with the server.
+    /// The platform also needs a populated directory before it lets a new
+    /// name be created there: left "partially populated", it re-issues the
+    /// create after every answer until it gives up with
+    /// ERROR_CANT_RESOLVE_FILENAME.
     /// </summary>
     private void OnFetchPlaceholders(IntPtr callbackInfoPtr, IntPtr callbackParametersPtr)
     {
@@ -470,7 +463,7 @@ public sealed class SyncRootConnection : IDisposable
             if (directory is null || _listDirectory is null)
             {
                 _log?.Invoke($"FETCH_PLACEHOLDERS for unknown directory '{normalized}'; completing with failure.");
-                TransferPlaceholders(info, [], StatusUnsuccessful);
+                TransferPlaceholders(info, [], StatusUnsuccessful, populated: false);
                 return;
             }
 
@@ -482,8 +475,10 @@ public sealed class SyncRootConnection : IDisposable
 
             var clock = Stopwatch.StartNew();
             var (entries, listed) = ListCoalesced(directory, requester);
-            TransferPlaceholders(info, entries, StatusSuccess);
-            ScheduleRepopulation(directory);
+
+            // Offline, a folder never listed shows what is local and stays
+            // unlisted, so opening it once the server answers lists it.
+            TransferPlaceholders(info, entries, StatusSuccess, populated: listed || IsListedRecently(directory));
             if (listed)
             {
                 _log?.Invoke(
@@ -498,7 +493,7 @@ public sealed class SyncRootConnection : IDisposable
             _log?.Invoke($"FETCH_PLACEHOLDERS failed: {ex.Message}");
             try
             {
-                TransferPlaceholders(info, [], StatusUnsuccessful);
+                TransferPlaceholders(info, [], StatusUnsuccessful, populated: false);
             }
             catch
             {
@@ -545,6 +540,7 @@ public sealed class SyncRootConnection : IDisposable
             {
                 var entries = _listDirectory!(directory, timeout.Token).GetAwaiter().GetResult();
                 _server?.Succeeded();
+                _listedOk[directory] = DateTimeOffset.UtcNow;
                 return (entries, true);
             }
             catch (Exception ex)
@@ -570,49 +566,12 @@ public sealed class SyncRootConnection : IDisposable
     }
 
     /// <summary>
-    /// Switches on-demand population back on for a directory one reuse window
-    /// after it was answered, so the next listing goes to the server again.
-    /// The pending marker is cleared before the switch, so an answer that
-    /// lands while it happens schedules its own switch and the directory can
-    /// never stay marked fully populated.
+    /// Whether the directory's last listing succeeded within the reuse window:
+    /// a request that waited for it is answered from it, so the directory
+    /// stays marked fully populated.
     /// </summary>
-    private void ScheduleRepopulation(string directory)
-    {
-        if (!_repopulationPending.TryAdd(directory, 0))
-        {
-            return;
-        }
-
-        var path = directory.Length == 0
-            ? _syncRootPath
-            : Path.Combine(_syncRootPath, directory.Replace('/', Path.DirectorySeparatorChar));
-
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(_listingReuseWindow).ConfigureAwait(false);
-            _repopulationPending.TryRemove(directory, out _);
-
-            // Retried: the switch needs a short exclusive handle, which a
-            // program holding the folder open can briefly prevent.
-            for (var attempt = 1; attempt <= 10; attempt++)
-            {
-                if (!_connected || !Directory.Exists(path))
-                {
-                    return;
-                }
-
-                if (_placeholders.EnableOnDemandPopulation(path))
-                {
-                    RefreshesResumed?.Invoke(directory);
-                    return;
-                }
-
-                await Task.Delay(TimeSpan.FromSeconds(attempt)).ConfigureAwait(false);
-            }
-
-            _log?.Invoke($"Could not switch refreshes back on for '{directory}'; it shows server changes again after a restart.");
-        });
-    }
+    private bool IsListedRecently(string directory) =>
+        _listedOk.TryGetValue(directory, out var at) && DateTimeOffset.UtcNow - at < _listingReuseWindow;
 
     /// <summary>The program whose I/O raised a callback, as "name (pid)".</summary>
     private static string RequesterOf(CF_CALLBACK_INFO info)
@@ -658,7 +617,8 @@ public sealed class SyncRootConnection : IDisposable
         return null;
     }
 
-    private void TransferPlaceholders(CF_CALLBACK_INFO info, IReadOnlyList<PlaceholderEntry> entries, int status)
+    /// <param name="populated">Marks the directory fully populated (see OnFetchPlaceholders).</param>
+    private void TransferPlaceholders(CF_CALLBACK_INFO info, IReadOnlyList<PlaceholderEntry> entries, int status, bool populated)
     {
         const int HRESULT_ALREADY_EXISTS = unchecked((int)0x800700B7);
 
@@ -696,10 +656,9 @@ public sealed class SyncRootConnection : IDisposable
                 ParamSize = 8 + (uint)Marshal.SizeOf<CF_OPERATION_TRANSFER_PLACEHOLDERS>(),
                 TransferPlaceholders = new CF_OPERATION_TRANSFER_PLACEHOLDERS
                 {
-                    // A successful answer marks the directory fully populated
-                    // (see OnFetchPlaceholders); ScheduleRepopulation turns
-                    // refreshes back on afterwards.
-                    Flags = status == StatusSuccess
+                    // A listed directory is marked fully populated for good
+                    // (see OnFetchPlaceholders).
+                    Flags = populated && status == StatusSuccess
                         ? CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS.CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION
                         : CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS.CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
                     CompletionStatus = status,

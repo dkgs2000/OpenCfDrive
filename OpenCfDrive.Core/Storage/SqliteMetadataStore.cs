@@ -95,6 +95,21 @@ public sealed class SqliteMetadataStore
             );
         ";
         configTable.ExecuteNonQuery();
+
+        // Deletes and renames the user made that could not reach the server
+        // (offline), in the order they were made. Kept across restarts, like
+        // Nextcloud's journal, until they are sent.
+        using var pendingTable = connection.CreateCommand();
+        pendingTable.CommandText = @"
+            CREATE TABLE IF NOT EXISTS PendingChanges (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                Kind TEXT NOT NULL,
+                RemotePath TEXT NOT NULL,
+                LocalPath TEXT NOT NULL,
+                NewLocalPath TEXT
+            );
+        ";
+        pendingTable.ExecuteNonQuery();
     }
 
     private static void EnsureColumn(SqliteConnection connection, string name, string definition)
@@ -388,6 +403,22 @@ public sealed class SqliteMetadataStore
         return Convert.ToInt32(command.ExecuteScalar());
     }
 
+    /// <summary>The tracked folders (their rows end in '/').</summary>
+    public IReadOnlyList<FileRecord> GetDirectories()
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM Files WHERE IsDirectory = 1 ORDER BY Id;";
+        using var reader = command.ExecuteReader();
+        var results = new List<FileRecord>();
+        while (reader.Read())
+        {
+            results.Add(FileRecord.FromReader(reader));
+        }
+
+        return results;
+    }
+
     public IReadOnlyList<FileRecord> GetAll()
     {
         using var connection = Open();
@@ -422,7 +453,69 @@ public sealed class SqliteMetadataStore
         var scalar = command.ExecuteScalar();
         return scalar is null ? defaultValue : (string)scalar;
     }
+
+    /// <summary>
+    /// Keeps a delete or rename for the server until it can be sent. The same
+    /// change of the same item is kept once.
+    /// </summary>
+    /// <param name="remotePath">The item's server path (folders end in '/').</param>
+    /// <param name="localPath">Where it was; for a rename, <paramref name="newLocalPath"/> is where it is now.</param>
+    public void AddPendingChange(PendingChangeKind kind, string remotePath, string localPath, string? newLocalPath = null)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = @"
+            INSERT INTO PendingChanges(Kind, RemotePath, LocalPath, NewLocalPath)
+            SELECT @kind, @remotePath, @localPath, @newLocalPath
+             WHERE NOT EXISTS (
+                SELECT 1 FROM PendingChanges
+                 WHERE Kind = @kind AND RemotePath = @remotePath AND IFNULL(NewLocalPath, '') = IFNULL(@newLocalPath, ''));";
+        command.Parameters.AddWithValue("@kind", kind.ToString());
+        command.Parameters.AddWithValue("@remotePath", remotePath);
+        command.Parameters.AddWithValue("@localPath", localPath);
+        command.Parameters.AddWithValue("@newLocalPath", newLocalPath ?? (object)DBNull.Value);
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>The changes waiting for the server, oldest first.</summary>
+    public IReadOnlyList<PendingChange> GetPendingChanges()
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT Id, Kind, RemotePath, LocalPath, NewLocalPath FROM PendingChanges ORDER BY Id;";
+        using var reader = command.ExecuteReader();
+        var results = new List<PendingChange>();
+        while (reader.Read())
+        {
+            results.Add(new PendingChange(
+                reader.GetInt64(0),
+                Enum.Parse<PendingChangeKind>(reader.GetString(1)),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.IsDBNull(4) ? null : reader.GetString(4)));
+        }
+
+        return results;
+    }
+
+    public void RemovePendingChange(long id)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM PendingChanges WHERE Id = @id;";
+        command.Parameters.AddWithValue("@id", id);
+        command.ExecuteNonQuery();
+    }
 }
+
+public enum PendingChangeKind
+{
+    Delete,
+    Rename,
+}
+
+/// <summary>A delete or rename the user made that has not reached the server yet.</summary>
+public sealed record PendingChange(long Id, PendingChangeKind Kind, string RemotePath, string LocalPath, string? NewLocalPath);
 
 public sealed class FileRecord
 {

@@ -9,16 +9,17 @@ using Xunit.Abstractions;
 namespace OpenCfDrive.Tests;
 
 /// <summary>
-/// Pins the on-demand population contract against the real platform: every
-/// directory enumeration is answered by FETCH_PLACEHOLDERS, and because the
-/// provider never marks a directory fully populated, the platform asks again
-/// on the next enumeration. That is what makes files added on the server
-/// visible in Explorer without restarting the service.
+/// Pins the population contract against the real platform, the model
+/// Nextcloud's and OneDrive's folders follow: the first enumeration of a
+/// folder is answered by FETCH_PLACEHOLDERS, which leaves the folder fully
+/// populated for good. Windows then lists it from disk (and shows it as
+/// available, not online-only); what the server adds later is handed out by
+/// the background sync as placeholders of its own.
 /// </summary>
 public class FetchPlaceholdersContractTest(ITestOutputHelper output)
 {
     [SkippableFact]
-    public void EveryEnumeration_PicksUpEntriesAddedOnTheRemote()
+    public void FirstEnumeration_ListsTheFolder_WhichThenStaysPopulated()
     {
         Skip.IfNot(
             Prerequisites.CloudFilesAvailable,
@@ -59,35 +60,13 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
 
         using var connection = new SyncRootConnection(
             store, serve, output.WriteLine, listDirectory: ListDirectory);
-        var resumed = new ConcurrentDictionary<string, AutoResetEvent>(StringComparer.OrdinalIgnoreCase);
-        connection.RefreshesResumed += directory => resumed.GetOrAdd(directory, _ => new AutoResetEvent(false)).Set();
-
-        // Until the connection has switched refreshes back on for a directory
-        // ("partially populated" again), which it does in the background a
-        // moment after each answer; only then does a listing reach the server.
-        void WaitUntilRefreshable(string directory)
-        {
-            var signal = resumed.GetOrAdd(directory, _ => new AutoResetEvent(false));
-            var path = directory.Length == 0 ? syncRoot : Path.Combine(syncRoot, directory);
-            var clock = Stopwatch.StartNew();
-            while (!new CloudPlaceholderService().QueryState(path).Partial)
-            {
-                var left = TimeSpan.FromSeconds(30) - clock.Elapsed;
-                Assert.True(left > TimeSpan.Zero && signal.WaitOne(left), $"Refreshes were not switched back on for '{path}'.");
-            }
-
-            output.WriteLine($"refreshable again after {clock.ElapsedMilliseconds} ms: '{directory}'");
-        }
+        var placeholders = new CloudPlaceholderService();
 
         try
         {
             Assert.True(connection.Connect(syncRoot), "CfConnectSyncRoot failed.");
-
-            // Same step the engine runs after its startup population.
-            var placeholders = new CloudPlaceholderService();
-            output.WriteLine($"root state before: 0x{placeholders.QueryState(syncRoot).RawState:X}");
             Assert.True(placeholders.EnableOnDemandPopulation(syncRoot), "Could not enable on-demand population on the root.");
-            output.WriteLine($"root state after: 0x{placeholders.QueryState(syncRoot).RawState:X}");
+            Assert.True(placeholders.QueryState(syncRoot).Partial, "A root never listed must be partially populated.");
 
             var now = DateTimeOffset.UtcNow;
             Add("", new PlaceholderEntry("first.txt", false, 5, now, "first.txt"));
@@ -96,47 +75,40 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
             var first = Enumerate(syncRoot);
             Assert.Contains("first.txt", first);
             Assert.Contains("docs", first);
+            Assert.False(placeholders.QueryState(syncRoot).Partial, "The listed root must stay fully populated.");
 
-            // Added "on the server" after the first listing. Until refreshes
-            // are switched back on, the shell is answered from the previous
-            // listing, so wait for that the way a user's next refresh would.
+            // Listed once: from now on Windows lists it from disk, so a server
+            // addition only shows once the provider hands it out itself.
             Add("", new PlaceholderEntry("late.txt", false, 4, now, "late.txt"));
-            WaitUntilRefreshable("");
-            var second = Enumerate(syncRoot);
-            Assert.Contains("first.txt", second);
-            Assert.Contains("late.txt", second);
+            var listings = calls.Count;
+            Assert.DoesNotContain("late.txt", Enumerate(syncRoot));
+            Assert.Equal(listings, calls.Count);
 
-            // A nested directory placeholder is refreshed the same way.
+            // ...as the background sync does: a placeholder made in the folder,
+            // which stays fully populated.
+            var created = placeholders.CreatePlaceholders(syncRoot, [new RcloneItemMetadata("late.txt", "late.txt", 4, now, false)]);
+            Assert.Equal(1, created.Created);
+            Assert.Contains("late.txt", Enumerate(syncRoot));
+            Assert.False(placeholders.QueryState(syncRoot).Partial);
+
+            // A folder handed out is listed on its own first enumeration.
             var docs = Path.Combine(syncRoot, "docs");
+            Assert.True(placeholders.QueryState(docs).Partial, "A folder never opened must be partially populated.");
             Add("docs", new PlaceholderEntry("nested.txt", false, 6, now, "docs/nested.txt"));
-            var nested = Enumerate(docs);
-            Assert.Contains("nested.txt", nested);
+            Assert.Contains("nested.txt", Enumerate(docs));
+            Assert.False(placeholders.QueryState(docs).Partial);
 
-            Add("docs", new PlaceholderEntry("nested-late.txt", false, 6, now, "docs/nested-late.txt"));
-            WaitUntilRefreshable("docs");
-            var nestedAgain = Enumerate(docs);
-            Assert.Contains("nested.txt", nestedAgain);
-            Assert.Contains("nested-late.txt", nestedAgain);
-
-            // Creating a new name makes the platform ask for the directory
-            // first. If the answer leaves the directory "partially
-            // populated", the create is retried until it fails with "The
+            // Creating a new name needs a populated folder; in a partially
+            // populated one the create is retried until it fails with "The
             // name of the file cannot be resolved by the system".
-            WaitUntilRefreshable("");
             CreateFileFromAnotherProcess(Path.Combine(syncRoot, "created-locally.txt"));
-            WaitUntilRefreshable("docs");
             CreateFileFromAnotherProcess(Path.Combine(docs, "created-locally.txt"));
 
-            // ...and refreshes keep working after a local create.
-            Add("", new PlaceholderEntry("after-create.txt", false, 3, now, "after-create.txt"));
-            WaitUntilRefreshable("");
-            Assert.Contains("after-create.txt", Enumerate(syncRoot));
-
-            // One enumeration raises hundreds of FETCH_PLACEHOLDERS callbacks;
-            // the remote must see roughly one listing per enumeration.
+            // One enumeration raises many FETCH_PLACEHOLDERS callbacks; the
+            // remote must see one listing per folder, once.
             output.WriteLine($"remote listings: {string.Join(", ", calls.Select(c => $"'{c}'"))}");
-            Assert.InRange(calls.Count(c => c.Length == 0), 3, 5);
-            Assert.InRange(calls.Count(c => c == "docs"), 2, 4);
+            Assert.Equal(1, calls.Count(c => c.Length == 0));
+            Assert.Equal(1, calls.Count(c => c == "docs"));
         }
         finally
         {
@@ -155,12 +127,13 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
     }
 
     /// <summary>
-    /// Offline (the server could not be reached), a folder shows what is on
-    /// this PC at once and the server is not asked, as in Nextcloud and
-    /// OneDrive; once a check reaches the server, listings go to it again.
+    /// Offline (the server could not be reached), a folder never listed shows
+    /// what is on this PC at once and the server is not asked, as in Nextcloud
+    /// and OneDrive. It is left unlisted, so once a check reaches the server
+    /// opening it lists it.
     /// </summary>
     [SkippableFact]
-    public void Offline_AFolderShowsWhatIsLocal_WithoutAskingTheServer()
+    public void Offline_AFolderShowsWhatIsLocal_AndIsListedOnceTheServerAnswers()
     {
         Skip.IfNot(
             Prerequisites.CloudFilesAvailable,
@@ -170,19 +143,12 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
         var syncRoot = Path.Combine(root, "drive");
         Directory.CreateDirectory(syncRoot);
         var now = DateTimeOffset.UtcNow;
-        var remote = new ConcurrentQueue<PlaceholderEntry>([new PlaceholderEntry("first.txt", false, 5, now, "first.txt")]);
         var calls = new ConcurrentQueue<string>();
 
         Task<IReadOnlyList<PlaceholderEntry>> ListDirectory(string directory, CancellationToken cancellationToken)
         {
             calls.Enqueue(directory);
-            var entries = new List<PlaceholderEntry>();
-            while (remote.TryDequeue(out var entry))
-            {
-                entries.Add(entry);
-            }
-
-            return Task.FromResult<IReadOnlyList<PlaceholderEntry>>(entries);
+            return Task.FromResult<IReadOnlyList<PlaceholderEntry>>([new PlaceholderEntry("first.txt", false, 5, now, "first.txt")]);
         }
 
         // The server answers checks only once the test says it is back.
@@ -203,47 +169,24 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
         var registrar = new SyncRootRegistrar();
         Assert.True(registrar.Register(syncRoot, Guid.NewGuid(), Guid.NewGuid()).Success);
         using var connection = new SyncRootConnection(store, serve, output.WriteLine, listDirectory: ListDirectory, server: server);
-        var resumed = new AutoResetEvent(false);
-        connection.RefreshesResumed += directory =>
-        {
-            if (directory.Length == 0)
-            {
-                resumed.Set();
-            }
-        };
-
-        void WaitUntilRefreshable()
-        {
-            var clock = Stopwatch.StartNew();
-            while (!new CloudPlaceholderService().QueryState(syncRoot).Partial)
-            {
-                var left = TimeSpan.FromSeconds(30) - clock.Elapsed;
-                Assert.True(left > TimeSpan.Zero && resumed.WaitOne(left), "Refreshes were not switched back on for the root.");
-            }
-        }
+        var placeholders = new CloudPlaceholderService();
 
         try
         {
             Assert.True(connection.Connect(syncRoot), "CfConnectSyncRoot failed.");
-            Assert.True(new CloudPlaceholderService().EnableOnDemandPopulation(syncRoot));
-            Assert.Contains("first.txt", Enumerate(syncRoot));
+            Assert.True(placeholders.EnableOnDemandPopulation(syncRoot));
 
             server.Failed("the test took it offline");
-            remote.Enqueue(new PlaceholderEntry("while-offline.txt", false, 3, now, "while-offline.txt"));
-            WaitUntilRefreshable();
-            calls.Clear();
-
-            var offline = Enumerate(syncRoot);
-            Assert.Contains("first.txt", offline);
-            Assert.DoesNotContain("while-offline.txt", offline);
+            Assert.Empty(Enumerate(syncRoot));
             Assert.Empty(calls);
+            Assert.True(placeholders.QueryState(syncRoot).Partial, "An offline answer must leave the folder unlisted.");
 
             // Using the drive started a check; the server is back.
             serverBack.SetResult();
             Assert.True(online.Task.Wait(TimeSpan.FromSeconds(30)), "The drive did not go back online.");
-            WaitUntilRefreshable();
-            Assert.Contains("while-offline.txt", Enumerate(syncRoot));
+            Assert.Contains("first.txt", Enumerate(syncRoot));
             Assert.Single(calls);
+            Assert.False(placeholders.QueryState(syncRoot).Partial);
         }
         finally
         {
