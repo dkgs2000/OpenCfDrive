@@ -56,6 +56,7 @@ internal sealed record DriveSnapshot(
             var (health, headline, detail) = Status.State switch
             {
                 ServiceState.Starting => (Health.Busy, "Starting", Status.Detail),
+                ServiceState.Offline => (Health.Busy, "Offline", Status.Detail),
                 ServiceState.Unavailable => (Health.Problem, "Cloud Files unavailable", Status.Detail),
                 ServiceState.Failed when ownRclone?.State == "NotFound" => (Health.Problem, "rclone not found", Status.Detail),
                 ServiceState.Failed => (Health.Problem, "Problem", Status.Detail),

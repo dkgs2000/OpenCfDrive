@@ -321,9 +321,10 @@ F5, and expects the local side to match:
   whole file, streamed in 4 MB chunks, byte-exact, and the service's memory
   stays far below the file size
 - offline (the server process is paused, so requests hang as on a lost
-  network): an opened folder still lists its local entries and a downloaded
-  file still opens, a folder never opened is empty, both answer well inside the
-  platform's 60 s limit, and back online the unopened folder lists the server
+  network): the first listing waits for it in vain and puts the drive offline,
+  after which an opened folder lists its local entries at once and a
+  downloaded file still opens, a folder never opened is empty, and back online
+  (using the drive checks the server) the unopened folder lists the server
 
 Mock mode skips these. It is a test stand-in over a plain folder, with no way
 to know when a folder is opened, so it copies the server once at startup.
@@ -400,8 +401,19 @@ namespace up front, OpenCfDrive fills each folder on demand.
   gets no answer within 10 s (offline usually means rclone is up but keeps
   retrying an unreachable server), is answered with nothing new and no server
   comparison. The folder then shows what is already local, so nothing local is
-  deleted; a folder never opened shows empty. The next listing asks the server
-  again.
+  deleted; a folder never opened shows empty.
+- **Offline is a state, as in Nextcloud and OneDrive.** A request that cannot
+  reach the server (no answer in time, no connection to rclone, or rclone's
+  own network error) puts the drive offline (`ServerConnection`). Until the
+  server answers again, every folder shows what is local at once instead of
+  waiting 10 s per folder (Windows may ask for a folder's parent too, which
+  would double that), an online-only file fails to open at once, as in
+  Nextcloud, and edits wait and are uploaded once the server answers, as on
+  Nextcloud's next sync. The server is checked again when Windows reports a
+  network change, when the drive is used, and on Nextcloud's schedule: 62 s
+  after going offline, then one more 62 s per failed check, at most 8 × 62 s.
+  The app shows "Offline". Deletes and renames made offline are not yet kept
+  for later: they fail, and the server's copy stays.
 - **Answered folders are marked full, then switched back.** The answer sets
   `CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION`, because
   creating a new name in a "partially populated" folder makes the platform ask
@@ -559,7 +571,9 @@ remote does report are kept.
   the previous one reuses that listing. Folders that are never opened are not
   refreshed, and are empty while the server cannot be reached.
 - Offline, a file that was never downloaded cannot be opened; only downloaded
-  files (and ones kept with "Always keep on this device") are readable.
+  files (and ones kept with "Always keep on this device") are readable. Edits
+  are uploaded once the server answers again, but deletes and renames made
+  offline are not kept for later yet.
 - A local edit that has not reached the server yet is discarded if the server
   copy changed or was deleted in the meantime: the server wins (see
   [Conflicts](#conflicts)). A file open in another program is updated on a
