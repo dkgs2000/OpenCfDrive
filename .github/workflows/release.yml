@@ -46,11 +46,13 @@ jobs:
           if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "A version looks like 1.2.3, not '$version'." }
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$version`n")
 
+      # The app updates itself from this repository's releases.
       - name: Build the installers
         shell: powershell
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: .\installer\Build-Installer.ps1 -Version $env:VERSION -OutputDir artifacts
+          REPOSITORY: ${{ github.repository }}
+        run: .\installer\Build-Installer.ps1 -Version $env:VERSION -Repository $env:REPOSITORY -OutputDir artifacts
 
       - name: Keep the installers
         uses: actions/upload-artifact@v7

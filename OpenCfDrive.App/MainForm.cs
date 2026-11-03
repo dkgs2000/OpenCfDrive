@@ -3,6 +3,7 @@ using OpenCfDrive.Core.Configuration;
 using OpenCfDrive.Core.Control;
 using OpenCfDrive.Core.Services;
 using OpenCfDrive.Core.Storage;
+using OpenCfDrive.Core.Updates;
 
 namespace OpenCfDrive.App;
 
@@ -42,6 +43,11 @@ internal sealed class MainForm : Form
     private readonly Button _restart = ActionButton("Restart");
     private readonly Button _viewLog = ActionButton("View log");
     private readonly Button _viewRcloneLog = ActionButton("rclone's log");
+    private readonly Label _version = ValueLabel();
+    private readonly Label _update = ValueLabel();
+    private readonly Button _checkUpdates = ActionButton("Check for updates");
+    private readonly Button _installUpdate = ActionButton("Restart and update");
+    private readonly LinkLabel _releasePage = new() { Text = "Release page", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(8, 6, 0, 0) };
     private readonly ListView _activity = new()
     {
         Dock = DockStyle.Fill,
@@ -81,6 +87,7 @@ internal sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _describeSoon = new() { Interval = 600 };
     private readonly TextBox _rcdCommand = new() { Dock = DockStyle.Fill, ReadOnly = true, BorderStyle = BorderStyle.None };
     private readonly CheckBox _signIn = new() { Text = "Start OpenCfDrive when I sign in to Windows", AutoSize = true };
+    private readonly CheckBox _autoUpdate = new() { Text = "Check for new versions and download them (every 10 hours, from GitHub)", AutoSize = true };
     private readonly Label _overrides = new() { AutoSize = true, ForeColor = BusyColor, Visible = false };
     private readonly Label _settingsFile = Hint("");
     private readonly Button _save = ActionButton("Save");
@@ -248,17 +255,35 @@ internal sealed class MainForm : Form
             ("Kind", _remoteKind),
             ("Space", _remoteSpace));
 
+        _version.Text = $"OpenCfDrive {GitHubReleases.Format(_app.Updates.Current)}";
+        _checkUpdates.Click += async (_, _) => await _app.Updates.CheckNowAsync();
+        _installUpdate.Click += async (_, _) => await _app.InstallUpdateAsync();
+        _releasePage.LinkClicked += (_, _) =>
+        {
+            if (_app.Updates.Status.Page is { Length: > 0 } page)
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(page) { UseShellExecute = true })?.Dispose();
+            }
+        };
+        var updateButtons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top, Margin = new Padding(0, 6, 0, 0), WrapContents = false };
+        updateButtons.Controls.AddRange([_checkUpdates, _installUpdate, _releasePage]);
+        var updates = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1 };
+        updates.Controls.Add(Grid(("Version", _version), ("Updates", _update)));
+        updates.Controls.Add(updateButtons);
+
         _activity.Columns.Add("Time", 70);
         _activity.Columns.Add("What happened", 400);
         _activity.SizeChanged += (_, _) => FitActivityColumns();
 
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4 };
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.Controls.Add(Group("Sync service", serviceBox), 0, 0);
         layout.Controls.Add(Group("rclone", rclone), 0, 1);
-        layout.Controls.Add(Group("Recent activity", _activity, fill: true), 0, 2);
+        layout.Controls.Add(Group("OpenCfDrive", updates), 0, 2);
+        layout.Controls.Add(Group("Recent activity", _activity, fill: true), 0, 3);
         page.Controls.Add(layout);
         return page;
     }
@@ -292,6 +317,7 @@ internal sealed class MainForm : Form
 
         _rcUrlBox.TextChanged += (_, _) => ShowRcdCommand();
         _signIn.CheckedChanged += (_, _) => ClearSaveResult();
+        _autoUpdate.CheckedChanged += (_, _) => ClearSaveResult();
         _manageRclone.CheckedChanged += (_, _) =>
         {
             ClearSaveResult();
@@ -377,6 +403,7 @@ internal sealed class MainForm : Form
         Note(Hint("A remote in rclone's config, optionally with a path: myremote: or myremote:backup. " +
                   "Another remote needs a new or empty drive folder. Create remotes with: rclone config"));
         Note(_signIn);
+        Note(_autoUpdate);
         Note(_overrides);
         Note(_settingsFile);
 
@@ -456,6 +483,27 @@ internal sealed class MainForm : Form
         }
 
         ShowOverrides(snapshot.Settings);
+    }
+
+    /// <summary>Where updating stands: checked, downloading, ready to install, or why not.</summary>
+    public void ShowUpdate(UpdateStatus status)
+    {
+        _update.Text = status.CheckedAt is { } checkedAt && status.Stage is UpdateStage.UpToDate or UpdateStage.Ready
+            ? $"{status.Detail} (Checked {checkedAt.LocalDateTime:g}.)"
+            : status.Detail;
+        _update.ForeColor = status.Stage switch
+        {
+            UpdateStage.UpToDate => GoodColor,
+            UpdateStage.Ready or UpdateStage.Checking or UpdateStage.Downloading => BusyColor,
+            UpdateStage.Failed => ProblemColor,
+            _ => SystemColors.ControlText,
+        };
+        _checkUpdates.Visible = status.Stage != UpdateStage.Unavailable;
+        _checkUpdates.Enabled = status.Stage is not (UpdateStage.Checking or UpdateStage.Downloading);
+        _installUpdate.Visible = status.Stage == UpdateStage.Ready;
+        _installUpdate.Text = status.Available is { } version ? $"Restart and update to {GitHubReleases.Format(version)}" : "Restart and update";
+        _releasePage.Visible = status.Page is { Length: > 0 } && status.Stage is UpdateStage.Ready or UpdateStage.Failed;
+        _autoUpdate.Enabled = status.Stage != UpdateStage.Unavailable;
     }
 
     private void ShowService(DriveSnapshot snapshot)
@@ -771,6 +819,7 @@ internal sealed class MainForm : Form
             _programBox.Text = saved.RclonePath ?? "";
             _configBox.Text = saved.RcloneConfig ?? "";
             _signIn.Checked = SignInStartup.IsEnabled;
+            _autoUpdate.Checked = saved.CheckForUpdates != false;
             if (snapshot.Rclone?.Remotes is { } remotes)
             {
                 FillRemotes(remotes);
@@ -808,10 +857,11 @@ internal sealed class MainForm : Form
 
     /// <summary>What the Settings fields hold, to tell whether the user changed any.</summary>
     private sealed record FieldSet(
-        string Folder, string Remote, string RcUrl, bool SignIn, bool ManageRclone, string Program, string Config);
+        string Folder, string Remote, string RcUrl, bool SignIn, bool AutoUpdate, bool ManageRclone, string Program, string Config);
 
     private FieldSet FieldValues => new(
-        _folderBox.Text, _remoteBox.Text, _rcUrlBox.Text, _signIn.Checked, _manageRclone.Checked, _programBox.Text, _configBox.Text);
+        _folderBox.Text, _remoteBox.Text, _rcUrlBox.Text, _signIn.Checked, _autoUpdate.Checked, _manageRclone.Checked, _programBox.Text,
+        _configBox.Text);
 
     /// <summary>The fields differ from what was loaded into them: the user is editing.</summary>
     private bool Edited => _loaded is { } loaded && loaded != FieldValues;
@@ -979,6 +1029,7 @@ internal sealed class MainForm : Form
             RclonePath = program,
             RcloneConfig = config,
             StartAtSignIn = _signIn.Checked,
+            CheckForUpdates = _autoUpdate.Checked,
         };
         var before = snapshot.Settings;
         var after = DriveSettingsFile.Resolve(settings);

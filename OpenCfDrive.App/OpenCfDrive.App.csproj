@@ -13,6 +13,12 @@
     <ApplicationVisualStyles>true</ApplicationVisualStyles>
   </PropertyGroup>
 
+  <!-- The GitHub repository (owner/name) whose releases the app updates from;
+       installer\Build-Installer.ps1 passes it. A build without it does not update. -->
+  <ItemGroup Condition="'$(UpdateRepository)' != ''">
+    <AssemblyMetadata Include="UpdateRepository" Value="$(UpdateRepository)" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\OpenCfDrive.Core\OpenCfDrive.Core.csproj" />
     <EmbeddedResource Include="..\assets\opencfdrive.ico" LogicalName="OpenCfDrive.ico" />

@@ -9,12 +9,18 @@
 # administrator rights.
 #
 # Usage:
-#   .\installer\Build-Installer.ps1 -Version 1.2.3
+#   .\installer\Build-Installer.ps1 -Version 1.2.3 [-Repository owner/name]
+#
+# -Repository is the GitHub repository whose releases the app updates itself
+# from (the release workflow passes its own). Without it, the app does not
+# check for updates.
 
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$Version,
+    [ValidatePattern('^$|^[\w.-]+/[\w.-]+$')]
+    [string]$Repository = "",
     [string]$OutputDir = ""
 )
 
@@ -44,13 +50,16 @@ foreach ($project in "OpenCfDrive.Service", "OpenCfDrive.App") {
         # on disk instead of about 240, for a fraction of a second at start.
         "-p:EnableCompressionInSingleFile=true",
         "-p:DebugType=None", "-p:DebugSymbols=false",
-        "-p:Version=$Version", "-o", $publishDir, "-nologo"
+        "-p:Version=$Version", "-p:UpdateRepository=$Repository", "-o", $publishDir, "-nologo"
     )
 }
 
+# Not incremental: WiX's up-to-date check goes by the files the last build
+# bound, so after building another version it skips compiling and then
+# finds no installer under the new name.
 Write-Host "Building the MSI..." -ForegroundColor Cyan
 Invoke-Dotnet @(
-    "build", (Join-Path $PSScriptRoot "msi\OpenCfDrive.Msi.wixproj"),
+    "build", (Join-Path $PSScriptRoot "msi\OpenCfDrive.Msi.wixproj"), "--no-incremental",
     "-c", "Release", "-p:Version=$Version", "-p:PublishDir=$publishDir\", "-o", $OutputDir, "-nologo"
 )
 $msi = Join-Path $OutputDir "OpenCfDrive-$Version-x64.msi"
@@ -58,7 +67,7 @@ if (-not (Test-Path $msi)) { throw "The MSI was not built: $msi" }
 
 Write-Host "Building the .exe installer..." -ForegroundColor Cyan
 Invoke-Dotnet @(
-    "build", (Join-Path $PSScriptRoot "bundle\OpenCfDrive.Bundle.wixproj"),
+    "build", (Join-Path $PSScriptRoot "bundle\OpenCfDrive.Bundle.wixproj"), "--no-incremental",
     "-c", "Release", "-p:Version=$Version", "-p:MsiPath=$msi", "-o", $OutputDir, "-nologo"
 )
 $exe = Join-Path $OutputDir "OpenCfDrive-$Version-x64-setup.exe"
