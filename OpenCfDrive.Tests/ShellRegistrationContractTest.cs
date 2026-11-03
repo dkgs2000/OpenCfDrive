@@ -123,12 +123,34 @@ public class ShellRegistrationContractTest(ITestOutputHelper output)
             var registered = registrar.Register(syncRoot, Guid.NewGuid(), Guid.NewGuid());
             output.WriteLine(registered.Message);
             Assert.True(registered.ShellIntegrated, registered.Message);
-            var created = new CloudPlaceholderService().CreatePlaceholders(syncRoot,
-            [
-                new RcloneItemMetadata("d/", "d", 0, DateTimeOffset.UtcNow, IsDirectory: true),
-                new RcloneItemMetadata("d/g.txt", "d/g.txt", 5, DateTimeOffset.UtcNow, IsDirectory: false),
-                new RcloneItemMetadata("f.txt", "f.txt", 5, DateTimeOffset.UtcNow, IsDirectory: false),
-            ]);
+
+            // Placeholders are created by the drive's provider, the process
+            // that connected it, as the engine does. Unconnected, Windows
+            // refuses a file inside the folder placeholder (0x801F0005), unless
+            // another test in this process happens to have a drive connected.
+            // Unregistering then runs with no provider, as on uninstall.
+            Assert.True(CfApi.Succeeded(CfApi.CfConnectSyncRoot(
+                syncRoot,
+                [new CF_CALLBACK_REGISTRATION { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NONE }],
+                IntPtr.Zero,
+                CF_CONNECT_FLAGS.CF_CONNECT_FLAG_NONE,
+                out var key)));
+            PlaceholderCreationResult created;
+            try
+            {
+                created = new CloudPlaceholderService().CreatePlaceholders(syncRoot,
+                [
+                    new RcloneItemMetadata("d/", "d", 0, DateTimeOffset.UtcNow, IsDirectory: true),
+                    new RcloneItemMetadata("d/g.txt", "d/g.txt", 5, DateTimeOffset.UtcNow, IsDirectory: false),
+                    new RcloneItemMetadata("f.txt", "f.txt", 5, DateTimeOffset.UtcNow, IsDirectory: false),
+                ]);
+            }
+            finally
+            {
+                CfApi.CfDisconnectSyncRoot(key);
+            }
+
+            created.Errors.ToList().ForEach(output.WriteLine);
             Assert.Equal(3, created.Created);
 
             if (orphanedFirst)

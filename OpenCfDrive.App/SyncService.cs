@@ -102,37 +102,51 @@ internal static class SyncService
         }
 
         var status = await ServiceControl.GetStatusAsync(syncRoot, TimeSpan.FromSeconds(2));
+        using var process = status is null ? null : ProcessById(status.ProcessId);
         await ServiceControl.RequestStopAsync(syncRoot, TimeSpan.FromSeconds(2));
-        if (await WaitUntilStoppedAsync(syncRoot, TimeSpan.FromSeconds(15)))
+        if (await WaitUntilStoppedAsync(syncRoot, process, TimeSpan.FromSeconds(15)))
         {
             return null;
         }
 
         // It did not answer or did not finish: end it the way the installer does.
-        if (status is not null)
+        try
         {
-            try
-            {
-                using var process = Process.GetProcessById(status.ProcessId);
-                process.Kill();
-            }
-            catch (Exception ex) when (ex is ArgumentException or Win32Exception or InvalidOperationException)
-            {
-                // Already gone.
-            }
+            process?.Kill();
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
+        {
+            // Already gone.
         }
 
-        return await WaitUntilStoppedAsync(syncRoot, TimeSpan.FromSeconds(10))
+        return await WaitUntilStoppedAsync(syncRoot, process, TimeSpan.FromSeconds(10))
             ? null
             : "The service did not stop.";
     }
 
-    private static async Task<bool> WaitUntilStoppedAsync(string syncRoot, TimeSpan timeout)
+    private static Process? ProcessById(int id)
+    {
+        try
+        {
+            return Process.GetProcessById(id);
+        }
+        catch (ArgumentException)
+        {
+            return null; // already gone
+        }
+    }
+
+    /// <summary>
+    /// Until the drive's service no longer runs and, when known, its process
+    /// has ended: it gives up its instance mutex a moment before it exits and
+    /// closes its state database, which saving may delete next.
+    /// </summary>
+    private static async Task<bool> WaitUntilStoppedAsync(string syncRoot, Process? process, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
-            if (!ServiceControl.IsRunning(syncRoot))
+            if (!ServiceControl.IsRunning(syncRoot) && (process is null || process.HasExited))
             {
                 return true;
             }

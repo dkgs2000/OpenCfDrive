@@ -258,6 +258,13 @@ internal sealed class TrayApp : ApplicationContext
                 return notStopped;
             }
 
+            // First, while nothing else has changed yet: the state of a folder
+            // that held another remote's drive no longer applies.
+            if (change.DiscardOldState)
+            {
+                SqliteMetadataStore.Delete(SyncStatePaths.DatabasePath(after.SyncRoot.Value));
+            }
+
             if (change.OldSyncRootToUnregister is { } oldRoot && SyncRootRegistrar.IsSyncRoot(oldRoot))
             {
                 var result = await Task.Run(() => new SyncRootRegistrar().Unregister(oldRoot));
@@ -265,11 +272,6 @@ internal sealed class TrayApp : ApplicationContext
                 {
                     return $"The old drive folder could not be unregistered: {result.Message}";
                 }
-            }
-
-            if (change.DiscardOldState)
-            {
-                DeleteState(after.SyncRoot.Value);
             }
 
             DriveSettingsFile.Save(settings);
@@ -332,16 +334,6 @@ internal sealed class TrayApp : ApplicationContext
         else
         {
             ShowProblem($"There is no rclone log yet ({log}).");
-        }
-    }
-
-    /// <summary>The state of a folder that held another remote's drive: it no longer applies.</summary>
-    private static void DeleteState(string syncRoot)
-    {
-        var database = SyncStatePaths.DatabasePath(syncRoot);
-        foreach (var file in new[] { database, database + "-wal", database + "-shm" })
-        {
-            File.Delete(file);
         }
     }
 
