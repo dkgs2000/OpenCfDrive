@@ -44,6 +44,7 @@ function Initialize-E2EScenarioFixtures {
     Set-RemoteFile "client-folder-rename/z.txt" "z"
     Set-RemoteFile "client/conflict.txt" "conflict-v1"
     Set-RemoteFile "client/rename-edit.txt" "rename-edit-v1"
+    Set-RemoteFile "client/page.txt" ("p" * 4096)
     # For the unregister / register again check in E2E-Common.ps1.
     Set-RemoteFile "restart/never-opened.txt" "never-opened"
 }
@@ -624,6 +625,16 @@ function Get-E2EScenarios {
             Assert-RemoteText "client/renamed-edit.txt" "rename-edit-v1"
             [System.IO.File]::AppendAllText((Get-LocalPath "client/renamed-edit.txt"), "-edited")
             Assert-RemoteText "client/renamed-edit.txt" "rename-edit-v1-edited"
+        }
+        # Windows does not clear in-sync for an append that starts on a page
+        # boundary, so the client must tell the edit by the file's size and
+        # write time, as other sync clients do.
+        New-E2EScenario "C20" "client appends to a downloaded file that ends on a page boundary: the edit is uploaded" -Budget @{ DownloadBytes = 4096; Uploads = 1; Lookups = 2 } {
+            if ((Read-Local "client/page.txt").Length -ne 4096) { throw "client\page.txt did not download whole." }
+            [System.IO.File]::AppendAllText((Get-LocalPath "client/page.txt"), "-edited")
+            $expected = ("p" * 4096) + "-edited"
+            Wait-Remote { [System.Text.Encoding]::UTF8.GetString((Get-RemoteBytes "client/page.txt")) -eq $expected } `
+                "The server's client/page.txt does not end in the appended '-edited'."
         }
     )
 }

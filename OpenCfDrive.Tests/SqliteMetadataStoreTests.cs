@@ -56,6 +56,34 @@ public class SqliteMetadataStoreTests
     }
 
     [Fact]
+    public void SyncedLocalState_IsTheServersUntilAnUploadRecordsTheFilesOwn()
+    {
+        var store = new SqliteMetadataStore(TempDbPath());
+        store.Initialize();
+        var serverTime = new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero).AddTicks(1234567);
+
+        // A placeholder made from the listing has the server's size and time.
+        store.UpsertFile("a.txt", @"C:\drive\a.txt", "a.txt", 0, true, false, 10, serverTime, inSync: true);
+        Assert.Equal<(long, DateTime)?>((10, serverTime.UtcDateTime), store.GetByRemotePath("a.txt")!.SyncedLocalState);
+
+        // An upload records the file's own: the server stamps its time.
+        var written = new DateTime(2026, 3, 4, 5, 6, 7, DateTimeKind.Utc).AddTicks(42);
+        store.UpsertFile("a.txt", @"C:\drive\a.txt", "a.txt", 0, true, false, 12, serverTime.AddMinutes(1), inSync: true,
+            localSize: 11, localWriteUtc: written);
+        Assert.Equal<(long, DateTime)?>((11, written), store.GetByRemotePath("a.txt")!.SyncedLocalState);
+
+        // A rename keeps it; a server update gives the file the server's again.
+        store.RenameRemotePath("a.txt", "b.txt", @"C:\drive\b.txt", "b.txt");
+        Assert.Equal<(long, DateTime)?>((11, written), store.GetByRemotePath("b.txt")!.SyncedLocalState);
+        store.UpdateRemoteMetadata("b.txt", 20, serverTime.AddMinutes(2), dehydrated: true);
+        Assert.Equal<(long, DateTime)?>((20, serverTime.AddMinutes(2).UtcDateTime), store.GetByRemotePath("b.txt")!.SyncedLocalState);
+
+        // Without a server time there is nothing to compare with.
+        store.UpsertFile("c.txt", @"C:\drive\c.txt", "c.txt", 0, true, false, 5, null, inSync: true);
+        Assert.Null(store.GetByRemotePath("c.txt")!.SyncedLocalState);
+    }
+
+    [Fact]
     public void Upsert_AndLookups_RoundTrip()
     {
         var store = new SqliteMetadataStore(TempDbPath());

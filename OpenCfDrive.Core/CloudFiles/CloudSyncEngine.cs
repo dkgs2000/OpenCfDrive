@@ -755,7 +755,26 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         }
 
         var state = _placeholders.QueryState(localPath);
-        return !state.IsPlaceholder || !state.InSync;
+        return !state.IsPlaceholder || !state.InSync || !MatchesLastSync(localPath, _store.GetByLocalPath(localPath));
+    }
+
+    /// <summary>
+    /// Whether a file still has the size and write time it had when it was
+    /// last in sync. In-sync alone does not prove a file unchanged: Windows
+    /// does not clear it for every write (an append that starts on a page
+    /// boundary leaves it set). So, like other sync clients (Nextcloud
+    /// compares both with its journal), an edit is also told by these. True
+    /// when the record cannot say, which leaves it to in-sync.
+    /// </summary>
+    private static bool MatchesLastSync(string localPath, FileRecord? record)
+    {
+        if (record is null || record.IsDirectory || record.SyncedLocalState is not { } synced)
+        {
+            return true;
+        }
+
+        var info = new FileInfo(localPath);
+        return info.Exists && info.Length == synced.Size && info.LastWriteTimeUtc == synced.WriteUtc;
     }
 
     private bool IsProviderWrite(string localPath)
@@ -1448,18 +1467,20 @@ public sealed class CloudSyncEngine : IAsyncDisposable
 
     /// <summary>
     /// After a rename has reached the server: gives the placeholder its new
-    /// identity, and marks it in sync again if it was in sync just before the
-    /// rename and has not been written since (the platform clears in-sync on
-    /// every rename, which would otherwise make it look edited and get it
-    /// downloaded and uploaded again). An item that had local changes keeps
-    /// waiting for its upload.
+    /// identity, and marks it in sync again if it was unchanged just before
+    /// the rename (in sync and as it was synced, see MatchesLastSync) and has
+    /// not been written since (the platform clears in-sync on every rename,
+    /// which would otherwise make it look edited and get it downloaded and
+    /// uploaded again). An item that had local changes keeps waiting for its
+    /// upload.
     /// </summary>
     private void UpdateRenamedPlaceholder(string localPath, string identityPath, SyncRootConnection.RenameSource? source)
     {
         var identity = CloudPlaceholderService.BuildFileIdentity(identityPath);
         var unchanged = source is { InSync: true } &&
                         File.GetLastWriteTimeUtc(localPath) == source.LastWriteUtc &&
-                        (!File.Exists(localPath) || new FileInfo(localPath).Length == source.Length);
+                        (!File.Exists(localPath) || new FileInfo(localPath).Length == source.Length) &&
+                        (!File.Exists(localPath) || MatchesLastSync(localPath, _store.GetByRemotePath(identityPath)));
 
         if (unchanged)
         {
@@ -1581,11 +1602,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable
                 }
 
                 // Our own placeholder writes (new entries, server changes,
-                // free up space / keep on device) leave the file in sync; a
-                // user edit clears in-sync. So a recent provider write only
-                // suppresses the upload while the file is still in sync, and
+                // free up space / keep on device) leave the file as it was
+                // synced; a user edit does not. So a recent provider write
+                // only suppresses the upload while the file is unchanged, and
                 // an edit made right after one is still uploaded.
-                if (IsProviderWrite(localPath) && _placeholders.QueryState(localPath) is { IsPlaceholder: true, InSync: true })
+                if (IsProviderWrite(localPath) && !HasUnsyncedLocalChanges(localPath))
                 {
                     return;
                 }
@@ -1635,6 +1656,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         }
 
         var info = new FileInfo(localPath);
+        var sent = (Length: info.Length, WriteUtc: info.LastWriteTimeUtc);
         var relative = Path.GetRelativePath(_syncRootPath, localPath).Replace('\\', '/');
         var record = _store.GetByLocalPath(localPath);
 
@@ -1643,12 +1665,12 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         var state = _placeholders.QueryState(localPath);
         if (!IsSimulated)
         {
-            // Cloud Files tracks it: any local write clears in-sync, while
-            // downloading, freeing space and server updates keep it (and a
-            // rename is marked in sync again once it reaches the server). A
-            // dehydrated placeholder is in sync, so its empty local copy is
-            // never sent over good server data.
-            if (state is { IsPlaceholder: true, InSync: true })
+            // Unchanged means in sync and still as it was synced (see
+            // MatchesLastSync): downloading, freeing space and server updates
+            // keep both, and a rename is marked in sync again once it reaches
+            // the server. A dehydrated placeholder is unchanged, so its empty
+            // local copy is never sent over good server data.
+            if (state is { IsPlaceholder: true, InSync: true } && MatchesLastSync(localPath, record))
             {
                 return false;
             }
@@ -1704,6 +1726,9 @@ public sealed class CloudSyncEngine : IAsyncDisposable
         // The store holds the server's metadata, which is what later listings
         // are compared against. Most remotes stamp their own modification
         // time on upload, so the local one would read as a server-side change.
+        // The file's own size and time as sent are kept beside it: what an
+        // edit is told by from now on. Taken before the upload, so a write
+        // during it still counts as an edit.
         var (serverSize, serverTime) = await GetServerMetadataAsync(relative, cancellationToken).ConfigureAwait(false);
 
         _store.UpsertFile(
@@ -1713,9 +1738,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable
             fileId: state.FileId != 0 ? state.FileId : record?.FileId ?? 0,
             isPlaceholder: true,
             isDirectory: false,
-            size: serverSize ?? info.Length,
-            modifiedUtc: serverTime ?? new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero),
-            inSync: true);
+            size: serverSize ?? sent.Length,
+            modifiedUtc: serverTime ?? new DateTimeOffset(sent.WriteUtc, TimeSpan.Zero),
+            inSync: true,
+            localSize: sent.Length,
+            localWriteUtc: sent.WriteUtc);
         _localChangeAt[relative] = DateTimeOffset.UtcNow;
         RememberSyncedState(localPath);
 

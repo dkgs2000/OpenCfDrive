@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.Data.Sqlite;
 
 namespace OpenCfDrive.Core.Storage;
@@ -53,6 +54,8 @@ public sealed class SqliteMetadataStore
                 IsDirectory INTEGER NOT NULL DEFAULT 0,
                 Size INTEGER NOT NULL DEFAULT 0,
                 ModifiedUtc TEXT,
+                LocalSize INTEGER,
+                LocalWriteUtc INTEGER,
                 CreatedUtc TEXT NOT NULL DEFAULT (datetime('now'))
             );
         ";
@@ -64,6 +67,8 @@ public sealed class SqliteMetadataStore
         EnsureColumn(connection, "FileId", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn(connection, "IsHydrated", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn(connection, "InSync", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn(connection, "LocalSize", "INTEGER");
+        EnsureColumn(connection, "LocalWriteUtc", "INTEGER");
 
         // Legacy builds stored a GUID string in FileId; normalise before indexing.
         using (var normalise = connection.CreateCommand())
@@ -115,6 +120,13 @@ public sealed class SqliteMetadataStore
         return connection;
     }
 
+    /// <param name="size">The server's size.</param>
+    /// <param name="modifiedUtc">The server's modification time.</param>
+    /// <param name="localSize">
+    /// The local file's size when it was last in sync, with
+    /// <paramref name="localWriteUtc"/> its write time; null when it has the
+    /// server's (as a placeholder made from the listing does).
+    /// </param>
     public void UpsertFile(
         string remotePath,
         string localPath,
@@ -124,13 +136,15 @@ public sealed class SqliteMetadataStore
         bool isDirectory,
         long size,
         DateTimeOffset? modifiedUtc,
-        bool inSync = false)
+        bool inSync = false,
+        long? localSize = null,
+        DateTime? localWriteUtc = null)
     {
         using var connection = Open();
         using var command = connection.CreateCommand();
         command.CommandText = @"
-            INSERT INTO Files(RemotePath, LocalPath, FileIdentity, FileId, IsPlaceholder, IsDirectory, Size, ModifiedUtc, InSync)
-            VALUES (@remotePath, @localPath, @fileIdentity, @fileId, @isPlaceholder, @isDirectory, @size, @modifiedUtc, @inSync)
+            INSERT INTO Files(RemotePath, LocalPath, FileIdentity, FileId, IsPlaceholder, IsDirectory, Size, ModifiedUtc, InSync, LocalSize, LocalWriteUtc)
+            VALUES (@remotePath, @localPath, @fileIdentity, @fileId, @isPlaceholder, @isDirectory, @size, @modifiedUtc, @inSync, @localSize, @localWriteUtc)
             ON CONFLICT(RemotePath) DO UPDATE SET
                 LocalPath = excluded.LocalPath,
                 FileIdentity = excluded.FileIdentity,
@@ -139,7 +153,9 @@ public sealed class SqliteMetadataStore
                 IsDirectory = excluded.IsDirectory,
                 Size = excluded.Size,
                 ModifiedUtc = excluded.ModifiedUtc,
-                InSync = excluded.InSync;
+                InSync = excluded.InSync,
+                LocalSize = excluded.LocalSize,
+                LocalWriteUtc = excluded.LocalWriteUtc;
         ";
         command.Parameters.AddWithValue("@remotePath", remotePath);
         command.Parameters.AddWithValue("@localPath", localPath);
@@ -150,6 +166,8 @@ public sealed class SqliteMetadataStore
         command.Parameters.AddWithValue("@size", size);
         command.Parameters.AddWithValue("@modifiedUtc", modifiedUtc?.UtcDateTime.ToString("O") ?? (object)DBNull.Value);
         command.Parameters.AddWithValue("@inSync", inSync ? 1 : 0);
+        command.Parameters.AddWithValue("@localSize", localSize ?? (object)DBNull.Value);
+        command.Parameters.AddWithValue("@localWriteUtc", localWriteUtc?.ToUniversalTime().Ticks ?? (object)DBNull.Value);
         command.ExecuteNonQuery();
     }
 
@@ -224,8 +242,9 @@ public sealed class SqliteMetadataStore
     }
 
     /// <summary>
-    /// Records the server's current metadata for a file. <paramref name="dehydrated"/>
-    /// is true when the local copy was dropped because the server content changed.
+    /// Records the server's current metadata for a file, which the local copy
+    /// now has too. <paramref name="dehydrated"/> is true when the local copy
+    /// was dropped because the server content changed.
     /// </summary>
     public void UpdateRemoteMetadata(string remotePath, long size, DateTimeOffset? modifiedUtc, bool dehydrated)
     {
@@ -235,6 +254,8 @@ public sealed class SqliteMetadataStore
             UPDATE Files
                SET Size = @size,
                    ModifiedUtc = @modifiedUtc,
+                   LocalSize = NULL,
+                   LocalWriteUtc = NULL,
                    InSync = 1,
                    IsHydrated = CASE WHEN @dehydrated = 1 THEN 0 ELSE IsHydrated END
              WHERE RemotePath = @remotePath;";
@@ -416,6 +437,20 @@ public sealed class FileRecord
     public bool IsDirectory { get; init; }
     public long Size { get; init; }
     public string? ModifiedUtc { get; init; }
+    public long? LocalSize { get; init; }
+    public DateTime? LocalWriteUtc { get; init; }
+
+    /// <summary>
+    /// The local file's size and write time when it was last in sync: the
+    /// server's unless an upload recorded the file's own (servers usually
+    /// stamp their own time), null when the server's time is unknown.
+    /// </summary>
+    public (long Size, DateTime WriteUtc)? SyncedLocalState =>
+        LocalSize is { } size && LocalWriteUtc is { } written
+            ? (size, written)
+            : DateTime.TryParse(ModifiedUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var modified)
+                ? (Size, modified.ToUniversalTime())
+                : null;
 
     internal static FileRecord FromReader(Microsoft.Data.Sqlite.SqliteDataReader reader) => new()
     {
@@ -430,5 +465,9 @@ public sealed class FileRecord
         IsDirectory = reader.GetInt64(reader.GetOrdinal("IsDirectory")) != 0,
         Size = reader.GetInt64(reader.GetOrdinal("Size")),
         ModifiedUtc = reader.IsDBNull(reader.GetOrdinal("ModifiedUtc")) ? null : reader.GetString(reader.GetOrdinal("ModifiedUtc")),
+        LocalSize = reader.IsDBNull(reader.GetOrdinal("LocalSize")) ? null : reader.GetInt64(reader.GetOrdinal("LocalSize")),
+        LocalWriteUtc = reader.IsDBNull(reader.GetOrdinal("LocalWriteUtc"))
+            ? null
+            : new DateTime(reader.GetInt64(reader.GetOrdinal("LocalWriteUtc")), DateTimeKind.Utc),
     };
 }
