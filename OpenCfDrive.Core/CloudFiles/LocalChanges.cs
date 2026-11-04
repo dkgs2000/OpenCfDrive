@@ -60,13 +60,23 @@ public sealed class LocalChanges(SqliteMetadataStore store)
         }
     }
 
+    /// <summary>
+    /// A file written or created, or a folder created. Reported again, it
+    /// keeps its place but is numbered anew: a run already sending it must
+    /// not finish this one too (an edit saved while the file was uploaded).
+    /// </summary>
     public void Changed(string localPath)
     {
         lock (_gate)
         {
-            if (!_changes.Any(c => c.Kind == LocalChangeKind.Changed && Same(c.LocalPath, localPath)))
+            var index = _changes.FindIndex(c => c.Kind == LocalChangeKind.Changed && Same(c.LocalPath, localPath));
+            if (index < 0)
             {
                 _changes.Add(new LocalChange(++_seq, LocalChangeKind.Changed, localPath, RecordedAt: DateTimeOffset.UtcNow));
+            }
+            else
+            {
+                _changes[index] = _changes[index] with { Seq = ++_seq };
             }
         }
 
@@ -145,6 +155,39 @@ public sealed class LocalChanges(SqliteMetadataStore store)
             return _changes.Any(c => c.Kind != LocalChangeKind.Changed &&
                                      (IsAtOrUnder(localPath, c.LocalPath) ||
                                       (c.NewLocalPath is not null && IsAtOrUnder(localPath, c.NewLocalPath))));
+        }
+    }
+
+    /// <summary>
+    /// The latest rename waiting for the server of the item at this server
+    /// path, or of a folder above it (by the server paths they were reported
+    /// with): null when there is none.
+    /// </summary>
+    public LocalChange? PendingRenameOf(string remotePath)
+    {
+        var path = remotePath.TrimEnd('/');
+        lock (_gate)
+        {
+            return _changes.LastOrDefault(c =>
+                c.Kind == LocalChangeKind.Renamed &&
+                c.RemotePath is { } renamed &&
+                (string.Equals(renamed.TrimEnd('/'), path, StringComparison.Ordinal) ||
+                 path.StartsWith(renamed.TrimEnd('/') + "/", StringComparison.Ordinal)));
+        }
+    }
+
+    /// <summary>
+    /// A delete or rename of this item itself is waiting for the server (a
+    /// folder above it does not count): what a folder renamed here is
+    /// listed into leaves alone.
+    /// </summary>
+    public bool IsPendingAt(string localPath)
+    {
+        lock (_gate)
+        {
+            return _changes.Any(c => c.Kind != LocalChangeKind.Changed &&
+                                     (Same(c.LocalPath, localPath) ||
+                                      (c.NewLocalPath is not null && Same(c.NewLocalPath, localPath))));
         }
     }
 

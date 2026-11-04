@@ -43,6 +43,8 @@ function Initialize-E2EScenarioFixtures {
     Set-RemoteFile "client-folder-delete/x.txt" "x"
     Set-RemoteFile "client-folder-delete/sub/y.txt" "y"
     Set-RemoteFile "client-folder-rename/z.txt" "z"
+    Set-RemoteFile "client-folder-listed/w.txt" "w"
+    Set-RemoteFile "client-folder-listed/sub/v.txt" "v"
     Set-RemoteFile "client/conflict.txt" "conflict-v1"
     Set-RemoteFile "client/rename-edit.txt" "rename-edit-v1"
     Set-RemoteFile "client/page.txt" ("p" * 4096)
@@ -1009,6 +1011,29 @@ function Get-E2EScenarios {
             }
             Assert-RemoteText "client/offline-edit.txt" "offline-edit-v2-saved-offline"
             Assert-Local "client/offline-edit.txt" "offline-edit-v2-saved-offline"
+        }
+        # A program can list a folder the moment it is renamed (Explorer's
+        # navigation pane does, to show whether it has subfolders), before
+        # the rename has reached the server. Listed from where the server
+        # still has it, the folder and the one inside it show their files;
+        # answered with nothing, they would stay empty (CI's C11 failure).
+        New-E2EScenario "C31" "client renames a folder never opened and lists it at once, as Explorer can: its files are there" -Budget @{ ServerRenames = 1; ServerDeletes = 1; DownloadBytes = 2 } -CloudOnly {
+            Rename-Item -LiteralPath (Get-LocalPath "client-folder-listed") -NewName "client-folder-listed-renamed"
+            $names = @(Get-ChildItem -LiteralPath (Get-LocalPath "client-folder-listed-renamed") -Force | ForEach-Object { $_.Name })
+            $inside = @(Get-ChildItem -LiteralPath (Get-LocalPath "client-folder-listed-renamed/sub") -Force | ForEach-Object { $_.Name })
+            if ($names -notcontains "w.txt" -or $names -notcontains "sub" -or $inside -notcontains "v.txt") {
+                throw "Listed right after the rename, the folder showed '$($names -join ', ')' and its subfolder '$($inside -join ', ')'."
+            }
+            # Opened before the move reaches the server: read from where the
+            # server still has it, and the move waits until the read began.
+            Assert-Local "client-folder-listed-renamed/w.txt" "w"
+            Assert-RemoteText "client-folder-listed-renamed/w.txt" "w"
+            Assert-RemoteText "client-folder-listed-renamed/sub/v.txt" "v"
+            Assert-RemoteMissing "client-folder-listed"
+            # Once the run that sent the move is done, what was listed opens
+            # from the new path.
+            Sync-Remote
+            Assert-Local "client-folder-listed-renamed/sub/v.txt" "v"
         }
     )
 }

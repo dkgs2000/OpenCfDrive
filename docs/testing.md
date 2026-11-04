@@ -138,7 +138,7 @@ Explorer does, and expects the local side to match:
 Mock mode skips these. It's a test stand-in over a plain folder, with no way
 to know when a folder is opened, so it copies the server once at startup.
 
-**Client side (`C01`–`C30`, both modes unless noted).** A local action in the
+**Client side (`C01`–`C31`, both modes unless noted).** A local action in the
 drive, after which the server is expected to match:
 
 - add a file; in an existing folder; in new nested folders
@@ -149,7 +149,9 @@ drive, after which the server is expected to match:
   whole, not cut at its old size
 - delete a file; delete a folder with files
 - rename a file; move a file to another folder; rename a folder (files inside
-  still open)
+  still open); rename a folder never opened and list it at once, as Explorer
+  can (cloud mode): it and the folder inside it show their files, and a file
+  in it opens, before the rename has reached the server
 - move a file out of the drive, like the Recycle Bin does (a server delete)
 - save through a temp file that replaces the original
 - copy or move a file in from outside the drive

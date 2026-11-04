@@ -261,8 +261,14 @@ public class LocalChangePlannerTests
         changes.Deleted(Local("gone.txt"), "gone.txt", 1, false);
         changes.Renamed(Local("old"), Local("new"), "old/", null);
         changes.Changed(Local("edited.txt"));
+        var taken = changes.Pending();
         changes.Changed(Local("edited.txt"));
         Assert.Equal(4, recorded);
+        Assert.Equal(3, changes.Pending().Count);
+
+        // Edited again while a run sends it: that run's end leaves the new one.
+        changes.Complete(taken.Where(c => c.Kind == LocalChangeKind.Changed));
+        Assert.Contains(changes.Pending(), c => c.Kind == LocalChangeKind.Changed && LocalChanges.Same(c.LocalPath, Local("edited.txt")));
         Assert.Equal(3, changes.Pending().Count);
 
         // Listings leave a deleted or renamed item, and what is below it, alone.
@@ -271,6 +277,20 @@ public class LocalChangePlannerTests
         Assert.True(changes.IsPending(Local(@"old\inside.txt")));
         Assert.False(changes.IsPending(Local("edited.txt")));
         Assert.False(changes.IsPending(Local("newer")));
+
+        // What the renamed folder is listed into counts only its own changes.
+        Assert.True(changes.IsPendingAt(Local("old")));
+        Assert.True(changes.IsPendingAt(Local("new")));
+        Assert.True(changes.IsPendingAt(Local("GONE.txt")));
+        Assert.False(changes.IsPendingAt(Local(@"old\inside.txt")));
+        Assert.False(changes.IsPendingAt(Local(@"new\inside.txt")));
+        Assert.False(changes.IsPendingAt(Local("edited.txt")));
+
+        // A download asks by server path whether a rename above it waits.
+        Assert.Equal(Local("new"), changes.PendingRenameOf("old/inside.txt")?.NewLocalPath);
+        Assert.Equal(Local("new"), changes.PendingRenameOf("old/")?.NewLocalPath);
+        Assert.Null(changes.PendingRenameOf("older/inside.txt"));
+        Assert.Null(changes.PendingRenameOf("gone.txt"));
 
         // A restart: the delete and the rename are still there, the edit is
         // found again by the look at the drive.

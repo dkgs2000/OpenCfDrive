@@ -209,6 +209,33 @@ The invariants below spell out how.
   renamed file would look edited and be downloaded and uploaded again.
 - **Folders renamed** locally are moved on the server (`sync/move`), and every
   row and placeholder identity below it is re-keyed so files inside still open.
+  A program can list such a folder for the first time before the move reaches
+  the server (Explorer's navigation pane does, the moment it's renamed). The
+  folder is then listed from the path the server still has, and its placeholder
+  still names. Its entries go into the folder under its new name, and the move
+  re-keys them with the rest. Such a listing and the move never overlap. A
+  listing waits for a move that's under way, then lists the folder where it
+  went. Answered with nothing, the folder would be marked fully populated and
+  stay empty.
+- **Downloads and moves don't overlap either.** A file renamed here, or in a
+  folder renamed here, whose move hasn't reached the server yet, is read from
+  the path its placeholder names, which the server still has. The move waits
+  until that read has begun. A read that comes while the move is under way
+  waits for it, then reads from where the move put the file. The move updates
+  the placeholders only after it lets reads go. Marking a file in sync waits
+  for a download of it that is still open, while a new identity doesn't
+  (`RenamedFolderContractTest`).
+- **A change to a file being downloaded waits for the download.** The drive
+  connects with `CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH`, without which
+  downloads come with no path and couldn't be told by their file. While a
+  download runs, a change to that file (or a delete of its folder) is kept
+  for later. When the download ends, sent or failed, the next run is asked
+  for. What a download writes is no edit either way: it leaves the file in
+  sync, which is what tells an edit.
+- **A change reported again while it's being sent isn't lost.** It keeps its
+  place, and the run that is sending the earlier one leaves it for the next
+  run. An edit saved while the previous version is uploading is sent once that
+  upload ends.
 - **Changes and deletes are applied after the reply.** `TRANSFER_PLACEHOLDERS`
   can only add entries, so the same listing is compared against the store (which
   holds the server's last known size and time, also after uploads). The next
@@ -324,6 +351,8 @@ Known limits:
   change that lands between them is overwritten by the upload.
 - A file the client is still uploading, or has just renamed, is skipped by a
   listing that may predate that change. The check before the upload covers it.
+- A file renamed or deleted here while it's being uploaded isn't a failed
+  upload. That change was recorded too, and the next run sends it.
 
 ## What tells a change
 
