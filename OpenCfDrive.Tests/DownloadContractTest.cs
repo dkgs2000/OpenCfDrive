@@ -191,13 +191,20 @@ public class DownloadContractTest(ITestOutputHelper output)
             using var process = Process.Start(start)!;
             var stdout = process.StandardOutput.ReadToEndAsync();
             var stderr = process.StandardError.ReadToEndAsync();
-            Assert.True(process.WaitForExit(TimeSpan.FromSeconds(70)), $"Reading {name} did not finish.");
-            _output.WriteLine($"type {name}: exit {process.ExitCode} {stderr.Result.Trim()}");
+            var finished = process.WaitForExit(TimeSpan.FromSeconds(70));
+            if (!finished)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+
+            // The service's side first, so a read that hangs (on CI) still shows why.
             foreach (var line in _log)
             {
                 _output.WriteLine(line);
             }
 
+            Assert.True(finished, $"Reading {name} did not finish.");
+            _output.WriteLine($"type {name}: exit {process.ExitCode} {stderr.Result.Trim()}");
             return stdout.Result;
         }
 
