@@ -88,21 +88,6 @@ internal static class CfApi
         IntPtr overlapped);
 
     [DllImport("cldapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
-    internal static extern int CfGetPlaceholderInfo(
-        IntPtr fileHandle,
-        CF_PLACEHOLDER_INFO_CLASS infoClass,
-        IntPtr infoBuffer,
-        uint infoBufferLength,
-        out uint returnedLength);
-
-    [DllImport("cldapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
-    internal static extern int CfSetInSyncState(
-        IntPtr fileHandle,
-        CF_IN_SYNC_STATE inSyncState,
-        CF_SET_IN_SYNC_FLAGS inSyncFlags,
-        out long inSyncUsn);
-
-    [DllImport("cldapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
     internal static extern int CfDehydratePlaceholder(
         IntPtr fileHandle,
         long startingOffset,
@@ -596,24 +581,6 @@ internal enum CF_CONVERT_FLAGS : uint
     CF_CONVERT_FLAG_MARK_IN_SYNC = 0x00000001,
     CF_CONVERT_FLAG_DEHYDRATE = 0x00000002,
     CF_CONVERT_FLAG_ENABLE_ON_DEMAND_POPULATION = 0x00000004,
-}
-
-internal enum CF_PLACEHOLDER_INFO_CLASS : uint
-{
-    CF_PLACEHOLDER_INFO_BASIC = 0,
-    CF_PLACEHOLDER_INFO_STANDARD = 1,
-}
-
-internal enum CF_IN_SYNC_STATE : uint
-{
-    CF_IN_SYNC_STATE_NOT_IN_SYNC = 0,
-    CF_IN_SYNC_STATE_IN_SYNC = 1,
-}
-
-[Flags]
-internal enum CF_SET_IN_SYNC_FLAGS : uint
-{
-    CF_SET_IN_SYNC_FLAG_NONE = 0x00000000,
 }
 
 [Flags]

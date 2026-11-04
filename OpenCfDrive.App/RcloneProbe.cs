@@ -13,13 +13,23 @@ namespace OpenCfDrive.App;
 /// (the default; the app runs it directly, so this works before the service
 /// starts), or through a remote control the user runs at <paramref name="RcUrl"/>.
 /// </summary>
-internal sealed record RcloneAccess(bool Managed, string? ChosenProgram, string? ConfigPath, string RcUrl)
+internal sealed record RcloneAccess(
+    bool Managed, string? ChosenProgram, string? ConfigPath, string RcUrl, string? RcUser = null, string? RcPassword = null)
 {
     public static RcloneAccess From(EffectiveSettings settings) =>
-        new(settings.ManageRclone, settings.RclonePath, settings.RcloneConfig, settings.RcUrl.Value);
+        new(settings.ManageRclone, settings.RclonePath, settings.RcloneConfig, settings.RcUrl.Value, settings.RcUser, settings.RcPassword);
 
-    /// <summary>Two probes with the same key asked the same rclone.</summary>
-    public string Key => Managed ? $"run|{ChosenProgram}|{ConfigPath}" : $"url|{RcUrl}";
+    /// <summary>Two probes with the same key asked the same rclone, with the same login.</summary>
+    public string Key => Managed
+        ? $"run|{ChosenProgram}|{ConfigPath}"
+        : $"url|{RcUrl}|{RcUser}|{(RcPassword is null ? 0 : StringComparer.Ordinal.GetHashCode(RcPassword))}";
+
+    /// <summary>The remote control at <see cref="RcUrl"/>, with the login.</summary>
+    public RcloneEndpoint Endpoint => new(RcUrl, RcUser, RcUser is null ? null : RcPassword ?? "");
+
+    /// <summary>Never the password.</summary>
+    public override string ToString() =>
+        $"{nameof(RcloneAccess)} {{ Managed = {Managed}, ChosenProgram = {ChosenProgram}, ConfigPath = {ConfigPath}, RcUrl = {RcUrl}, RcUser = {RcUser} }}";
 }
 
 /// <summary>What rclone answered.</summary>
@@ -100,11 +110,14 @@ internal static class RcloneProbe
         string? version;
         try
         {
-            using var response = await PostAsync(baseUri, "core/version");
+            using var response = await PostAsync(access, baseUri, "core/version");
             if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
             {
                 return new RcloneProbeResult(key, true, false, null,
-                    "rclone asks for a login, which OpenCfDrive does not send. Run rclone rcd with --rc-no-auth.", null);
+                    access.RcUser is null
+                        ? "rclone asks for a login: enter the user and password it was started with."
+                        : "rclone does not accept this login: enter the user and password it was started with (--rc-user and --rc-pass).",
+                    null);
             }
 
             if (!response.IsSuccessStatusCode)
@@ -125,16 +138,18 @@ internal static class RcloneProbe
         }
 
         // Listing remotes needs the same access as syncing: rclone allows it
-        // only with --rc-no-auth (or a login, which OpenCfDrive does not send).
+        // only to a login (or to anyone, with --rc-no-auth, which lets any
+        // program on the PC at the remotes and is not suggested).
         try
         {
-            using var response = await PostAsync(baseUri, "config/listremotes");
+            using var response = await PostAsync(access, baseUri, "config/listremotes");
             var body = await response.Content.ReadFromJsonAsync<JsonElement>();
             if (!response.IsSuccessStatusCode)
             {
                 var error = body.TryGetProperty("error", out var e) ? e.GetString() : response.ReasonPhrase;
                 return new RcloneProbeResult(key, true, false, version,
-                    $"rclone refuses OpenCfDrive's requests ({error}). Run rclone rcd with --rc-no-auth.", null);
+                    $"rclone refuses OpenCfDrive's requests ({error}). Start rclone rcd with a login (--rc-user and --rc-pass) and enter it here.",
+                    null);
             }
 
             var remotes = body.TryGetProperty("remotes", out var list) && list.ValueKind == JsonValueKind.Array
@@ -167,7 +182,7 @@ internal static class RcloneProbe
     /// remote is chosen or the window opens, not on every refresh.
     /// </summary>
     public static Task<RemoteInfo> DescribeAsync(RcloneAccess access, string remote) =>
-        access.Managed ? DescribeWithProgramAsync(access, remote) : DescribeWithRemoteControlAsync(access.RcUrl, remote);
+        access.Managed ? DescribeWithProgramAsync(access, remote) : DescribeWithRemoteControlAsync(access, remote);
 
     private static async Task<RemoteInfo> DescribeWithProgramAsync(RcloneAccess access, string remote)
     {
@@ -201,9 +216,9 @@ internal static class RcloneProbe
         }
     }
 
-    private static async Task<RemoteInfo> DescribeWithRemoteControlAsync(string rcUrl, string remote)
+    private static async Task<RemoteInfo> DescribeWithRemoteControlAsync(RcloneAccess access, string remote)
     {
-        if (!Uri.TryCreate(rcUrl, UriKind.Absolute, out var baseUri))
+        if (!Uri.TryCreate(access.RcUrl, UriKind.Absolute, out var baseUri))
         {
             return new RemoteInfo(remote, null, null, null, "rclone's address is not valid.");
         }
@@ -214,7 +229,7 @@ internal static class RcloneProbe
         {
             try
             {
-                using var response = await PostAsync(baseUri, "config/get", new { name });
+                using var response = await PostAsync(access, baseUri, "config/get", new { name });
                 var config = await response.Content.ReadFromJsonAsync<JsonElement>();
                 if (!response.IsSuccessStatusCode || config.ValueKind != JsonValueKind.Object)
                 {
@@ -242,7 +257,7 @@ internal static class RcloneProbe
 
         try
         {
-            using var response = await PostAsync(baseUri, "operations/about", new { fs = remote }, SlowHttp);
+            using var response = await PostAsync(access, baseUri, "operations/about", new { fs = remote }, SlowHttp);
             var about = await response.Content.ReadFromJsonAsync<JsonElement>();
             if (!response.IsSuccessStatusCode)
             {
@@ -307,10 +322,17 @@ internal static class RcloneProbe
         return kind.ToString();
     }
 
-    private static Task<HttpResponseMessage> PostAsync(Uri baseUri, string command, object? body = null, HttpClient? http = null) =>
-        (http ?? Http).PostAsync(
-            new Uri(baseUri.AbsoluteUri.TrimEnd('/') + "/" + command),
-            new StringContent(body is null ? "{}" : JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
+    /// <summary>One command to the remote control, with the login when there is one.</summary>
+    private static async Task<HttpResponseMessage> PostAsync(
+        RcloneAccess access, Uri baseUri, string command, object? body = null, HttpClient? http = null)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, new Uri(baseUri.AbsoluteUri.TrimEnd('/') + "/" + command))
+        {
+            Content = new StringContent(body is null ? "{}" : JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"),
+        };
+        request.Headers.Authorization = access.Endpoint.Authorization;
+        return await (http ?? Http).SendAsync(request);
+    }
 }
 
 /// <summary>What rclone says about the chosen remote.</summary>

@@ -45,6 +45,14 @@ public sealed class SyncWorker(
         logger.LogInformation(
             "Drive '{SyncRoot}' for {Remote} through {Rclone} (settings: {SettingsPath})",
             syncRoot, remote, settings.ManageRclone ? "an rclone it runs itself" : $"the rclone at {rcUrl}", DriveSettingsFile.Path);
+        foreach (var (retired, replacement) in DriveSettingsFile.RetiredVariables)
+        {
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(retired)))
+            {
+                logger.LogWarning("{Retired} is set but no longer read; {Replacement} replaced it.", retired, replacement);
+            }
+        }
+
         if (!settings.HasRemote)
         {
             logger.LogWarning("No rclone remote is configured, so '{Remote}' is used. Choose one in the OpenCfDrive app.", remote);
@@ -154,7 +162,7 @@ public sealed class SyncWorker(
         {
             _rcloneStatus = new RcloneStatus(
                 false, settings.RcUrl.Value, null, null, null, null, "External", "rclone runs outside OpenCfDrive.", null);
-            return new RcloneEndpoint(settings.RcUrl.Value);
+            return settings.RcEndpoint;
         }
 
         var program = RcloneLocator.Find(settings.RclonePath);

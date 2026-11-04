@@ -61,6 +61,8 @@ internal sealed class MainForm : Form
     private readonly TextBox _folderBox = new() { Dock = DockStyle.Fill, AccessibleName = "Drive folder" };
     private readonly ComboBox _remoteBox = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDown, AccessibleName = "rclone remote" };
     private readonly TextBox _rcUrlBox = new() { Dock = DockStyle.Fill, AccessibleName = "rclone remote control" };
+    private readonly TextBox _rcUserBox = new() { Dock = DockStyle.Fill, AccessibleName = "rclone remote control user" };
+    private readonly TextBox _rcPasswordBox = new() { Dock = DockStyle.Fill, AccessibleName = "rclone remote control password", UseSystemPasswordChar = true };
     private readonly RadioButton _manageRclone = new() { Text = "OpenCfDrive runs it", AutoSize = true, Checked = true };
     private readonly RadioButton _ownRclone = new() { Text = "I run rclone rcd myself", AutoSize = true };
     private readonly TextBox _programBox = new()
@@ -80,7 +82,9 @@ internal sealed class MainForm : Form
     private readonly Button _download = ActionButton("Download rclone from rclone.org");
     private readonly Button _test = ActionButton("Test");
     private readonly Label _downloadProgress = new() { AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = SystemColors.GrayText };
-    private readonly Label _rcdHint = Hint("Where your rclone rcd listens. Run it with --rc-serve and --rc-no-auth, for example:");
+    private readonly Label _rcdHint = Hint(
+        "Where your rclone rcd listens, and the login it was started with. Start it with --rc-serve and that login, for example " +
+        "(never --rc-no-auth: it lets any program on this PC use your remotes):");
     private readonly System.Windows.Forms.Timer _checkSoon = new() { Interval = 800 };
     private readonly Label _rcTest = Hint("");
     private readonly Label _remoteDetails = Hint("");
@@ -310,12 +314,13 @@ internal sealed class MainForm : Form
         browseConfig.Click += (_, _) => BrowseForFile(_configBox, "Choose rclone's config file", "rclone config|*.conf|All files|*.*");
         _download.Click += async (_, _) => await DownloadRcloneAsync();
 
-        foreach (var input in new Control[] { _folderBox, _remoteBox, _rcUrlBox, _programBox, _configBox })
+        foreach (var input in new Control[] { _folderBox, _remoteBox, _rcUrlBox, _rcUserBox, _rcPasswordBox, _programBox, _configBox })
         {
             input.TextChanged += (_, _) => ClearSaveResult();
         }
 
         _rcUrlBox.TextChanged += (_, _) => ShowRcdCommand();
+        _rcUserBox.TextChanged += (_, _) => ShowRcdCommand();
         _signIn.CheckedChanged += (_, _) => ClearSaveResult();
         _autoUpdate.CheckedChanged += (_, _) => ClearSaveResult();
         _manageRclone.CheckedChanged += (_, _) =>
@@ -326,12 +331,12 @@ internal sealed class MainForm : Form
         _rcTest.Visible = false; // until Test is pressed
 
         // The chosen remote's details, and the chosen rclone, once typing pauses.
-        foreach (var input in new Control[] { _remoteBox, _rcUrlBox, _programBox, _configBox })
+        foreach (var input in new Control[] { _remoteBox, _rcUrlBox, _rcUserBox, _rcPasswordBox, _programBox, _configBox })
         {
             input.TextChanged += (_, _) => DescribeSoon();
         }
 
-        foreach (var input in new Control[] { _rcUrlBox, _programBox, _configBox })
+        foreach (var input in new Control[] { _rcUrlBox, _rcUserBox, _rcPasswordBox, _programBox, _configBox })
         {
             input.TextChanged += (_, _) => CheckSoon();
         }
@@ -395,6 +400,8 @@ internal sealed class MainForm : Form
         Row("rclone config", _configBox, browseConfig);
         Note(_configNote);
         Row("Remote control", _rcUrlBox, _test);
+        Row("User", _rcUserBox, new Label { AutoSize = true });
+        Row("Password", _rcPasswordBox, new Label { AutoSize = true });
         Note(_rcTest);
         Note(_rcdHint);
         Note(_rcdCommand);
@@ -430,6 +437,8 @@ internal sealed class MainForm : Form
         _configBox.Enabled = managed;
         _download.Enabled = managed && _busy is null;
         _rcUrlBox.Enabled = !managed;
+        _rcUserBox.Enabled = !managed;
+        _rcPasswordBox.Enabled = !managed;
         _test.Enabled = !managed;
         _rcdHint.Visible = !managed;
         _rcdCommand.Visible = !managed;
@@ -680,7 +689,9 @@ internal sealed class MainForm : Form
         _manageRclone.Checked,
         Blank(_programBox.Text),
         Blank(_configBox.Text),
-        _rcUrlBox.Text.Trim());
+        _rcUrlBox.Text.Trim(),
+        Blank(_rcUserBox.Text),
+        Blank(_rcUserBox.Text) is null ? null : _rcPasswordBox.Text);
 
     private static string? Blank(string text) => string.IsNullOrWhiteSpace(text) ? null : text.Trim();
 
@@ -770,6 +781,10 @@ internal sealed class MainForm : Form
             .Where(s => s.Source == SettingSource.Environment)
             .Select(s => s.EnvironmentVariable)
             .ToList();
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(DriveSettingsFile.RcUserVariable)))
+        {
+            overridden.Add($"{DriveSettingsFile.RcUserVariable} and {DriveSettingsFile.RcPasswordVariable}");
+        }
         _overrides.Visible = overridden.Count > 0;
         _overrides.Text = overridden.Count == 0
             ? ""
@@ -814,6 +829,8 @@ internal sealed class MainForm : Form
             _folderBox.Text = saved.SyncRoot ?? snapshot.Settings.SyncRoot.Value;
             _remoteBox.Text = saved.Remote ?? "";
             _rcUrlBox.Text = saved.RcUrl ?? DriveSettingsFile.DefaultRcUrl;
+            _rcUserBox.Text = saved.RcUser ?? "";
+            _rcPasswordBox.Text = UserSecret.Unprotect(saved.RcPasswordProtected) ?? "";
             _manageRclone.Checked = saved.ManageRclone != false;
             _ownRclone.Checked = saved.ManageRclone == false;
             _programBox.Text = saved.RclonePath ?? "";
@@ -857,11 +874,16 @@ internal sealed class MainForm : Form
 
     /// <summary>What the Settings fields hold, to tell whether the user changed any.</summary>
     private sealed record FieldSet(
-        string Folder, string Remote, string RcUrl, bool SignIn, bool AutoUpdate, bool ManageRclone, string Program, string Config);
+        string Folder, string Remote, string RcUrl, string RcUser, string RcPassword, bool SignIn, bool AutoUpdate, bool ManageRclone,
+        string Program, string Config)
+    {
+        /// <summary>Never the password.</summary>
+        public override string ToString() => $"{nameof(FieldSet)} {{ Folder = {Folder}, Remote = {Remote}, RcUrl = {RcUrl}, RcUser = {RcUser} }}";
+    }
 
     private FieldSet FieldValues => new(
-        _folderBox.Text, _remoteBox.Text, _rcUrlBox.Text, _signIn.Checked, _autoUpdate.Checked, _manageRclone.Checked, _programBox.Text,
-        _configBox.Text);
+        _folderBox.Text, _remoteBox.Text, _rcUrlBox.Text, _rcUserBox.Text, _rcPasswordBox.Text, _signIn.Checked, _autoUpdate.Checked,
+        _manageRclone.Checked, _programBox.Text, _configBox.Text);
 
     /// <summary>The fields differ from what was loaded into them: the user is editing.</summary>
     private bool Edited => _loaded is { } loaded && loaded != FieldValues;
@@ -891,7 +913,8 @@ internal sealed class MainForm : Form
         var address = Uri.TryCreate(_rcUrlBox.Text.Trim(), UriKind.Absolute, out var uri)
             ? $"{uri.Host}:{uri.Port}"
             : "127.0.0.1:5572";
-        _rcdCommand.Text = $"rclone rcd --rc-serve --rc-no-auth --rc-addr {address}";
+        var user = Blank(_rcUserBox.Text) ?? "opencfdrive";
+        _rcdCommand.Text = $"rclone rcd --rc-serve --rc-addr {address} --rc-user {user} --rc-pass <your password>";
     }
 
     private void BrowseForFolder()
@@ -988,6 +1011,8 @@ internal sealed class MainForm : Form
         var root = _folderBox.Text.Trim();
         var remote = _remoteBox.Text.Trim();
         var rcUrl = _rcUrlBox.Text.Trim();
+        var rcUser = Blank(_rcUserBox.Text);
+        var rcPassword = _rcPasswordBox.Text;
         var managed = _manageRclone.Checked;
         var program = Blank(_programBox.Text);
         var config = Blank(_configBox.Text);
@@ -1013,6 +1038,10 @@ internal sealed class MainForm : Form
         {
             invalid = "The remote control address must be an http:// address, like http://127.0.0.1:5572.";
         }
+        else if (!managed && (rcUser is null || rcPassword.Length == 0))
+        {
+            invalid = "Enter the user and password your rclone rcd was started with (--rc-user and --rc-pass).";
+        }
 
         if (invalid is not null)
         {
@@ -1025,6 +1054,8 @@ internal sealed class MainForm : Form
             SyncRoot = root,
             Remote = remote,
             RcUrl = rcUrl,
+            RcUser = rcUser,
+            RcPasswordProtected = rcUser is null || rcPassword.Length == 0 ? null : UserSecret.Protect(rcPassword),
             ManageRclone = managed,
             RclonePath = program,
             RcloneConfig = config,

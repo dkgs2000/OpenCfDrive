@@ -128,11 +128,6 @@ public sealed class SyncRootConnection : IDisposable
         _server = server;
     }
 
-    public bool IsConnected => _connected;
-
-    /// <summary>Raised after a successful hydration so callers/tests can observe progress.</summary>
-    public event Action<HydrationCompleted>? Hydrated;
-
     /// <summary>
     /// Raised with the file's full local path once a download of it has
     /// ended, sent or failed, and no longer counts in <see cref="IsHydrating"/>.
@@ -146,8 +141,6 @@ public sealed class SyncRootConnection : IDisposable
     /// block: the shell is still waiting for the enumeration to finish.
     /// </summary>
     public event Action<string>? DirectoryListed;
-
-    public sealed record HydrationCompleted(string LocalPath, string RemotePath, long Offset, long Length);
 
     /// <summary>
     /// A placeholder's state just before a rename. The platform clears
@@ -295,11 +288,6 @@ public sealed class SyncRootConnection : IDisposable
 
             _server?.Succeeded();
             _store.MarkHydrated(remotePath);
-            Hydrated?.Invoke(new HydrationCompleted(
-                normalizedPath,
-                remotePath,
-                fetch.RequiredFileOffset,
-                fetch.RequiredLength));
         }
         catch (Exception ex)
         {

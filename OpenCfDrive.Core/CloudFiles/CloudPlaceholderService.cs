@@ -44,9 +44,6 @@ public sealed class CloudPlaceholderService
 {
     private const uint FILE_ATTRIBUTE_ARCHIVE = 0x00000020;
     private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
-    private const uint IO_REPARSE_TAG_CLOUD_MASK = 0xFFFF0000;
-    private const uint IO_REPARSE_TAG_CLOUD = 0x90000000;
-    private const uint IO_REPARSE_TAG_CLOUD_1 = 0x90001000;
     private const int HRESULT_ALREADY_EXISTS = unchecked((int)0x800700B7);
 
     /// <summary>Identity blob attached to every placeholder; this is what cfapi hands back in callbacks.</summary>
@@ -638,16 +635,6 @@ public sealed class CloudPlaceholderService
         {
             Marshal.FreeHGlobal(identityPtr);
         }
-    }
-
-    public static bool IsCloudPlaceholder(uint attributes, uint reparseTag)
-    {
-        if ((reparseTag & IO_REPARSE_TAG_CLOUD_MASK) != IO_REPARSE_TAG_CLOUD)
-        {
-            return false;
-        }
-
-        return reparseTag == IO_REPARSE_TAG_CLOUD || reparseTag == IO_REPARSE_TAG_CLOUD_1;
     }
 
     private static long ToFileTime(DateTimeOffset? value) =>

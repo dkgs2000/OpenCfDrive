@@ -351,7 +351,7 @@ internal sealed class TrayApp : ApplicationContext
             before.ManageRclone != after.ManageRclone ||
             (after.ManageRclone
                 ? before.RclonePath != after.RclonePath || before.RcloneConfig != after.RcloneConfig
-                : before.RcUrl.Value != after.RcUrl.Value);
+                : before.RcUrl.Value != after.RcUrl.Value || before.RcUser != after.RcUser || before.RcPassword != after.RcPassword);
 
         return await RunAsync("Applying the settings", async () =>
         {

@@ -36,8 +36,7 @@ two ways:
   (`E2E-Run.ps1`), or the engine in mock mode over a plain folder
   (`E2E-Run-Mock.ps1`).
 - **Backend:** `-Backend webdav` (the default) or `-Backend s3` (a plain S3
-  server with a bucket mapped to the drive). `E2E-Run-S3.ps1` is the shortcut
-  for the cloud run on S3.
+  server with a bucket mapped to the drive).
 
 The server is rclone's own: `rclone serve webdav` or `rclone serve s3` over a
 folder in the run's temp folder, in a process of its own. It isn't the
@@ -46,7 +45,7 @@ as it would any server.
 
 ```powershell
 .\scripts\tests\E2E-Run.ps1                  # cloud mode, WebDAV
-.\scripts\tests\E2E-Run-S3.ps1               # cloud mode, S3
+.\scripts\tests\E2E-Run.ps1 -Backend s3      # cloud mode, S3
 .\scripts\tests\E2E-Run-Mock.ps1             # mock mode, WebDAV (add -Backend s3 for S3)
 .\scripts\tests\E2E-Run.ps1 -Only "S0*,C11"  # only some scenarios
 ```

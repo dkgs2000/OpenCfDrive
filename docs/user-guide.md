@@ -83,12 +83,20 @@ chose another folder.
 ### Using an rclone you run yourself
 
 By default OpenCfDrive runs rclone itself. To use an `rclone rcd` you run
-yourself, choose **I run rclone rcd myself** and enter its address. Start it
-with `--rc-serve --rc-no-auth`, because OpenCfDrive doesn't send it a login:
+yourself, choose **I run rclone rcd myself**, and enter its address and the
+login you start it with. Start it with `--rc-serve` and a login. rclone reads
+the login from `RCLONE_RC_USER` and `RCLONE_RC_PASS` too, which keeps the
+password out of the process list:
 
 ```powershell
-rclone rcd --rc-serve --rc-no-auth --rc-addr 127.0.0.1:5572
+$env:RCLONE_RC_USER = "opencfdrive"
+$env:RCLONE_RC_PASS = "<a password of your own>"
+rclone rcd --rc-serve --rc-addr 127.0.0.1:5572
 ```
+
+Don't start it with `--rc-no-auth`. It lets any program on your PC use every
+remote in your rclone config, and read the config's secrets. OpenCfDrive saves
+the password encrypted for your Windows user.
 
 ## The app
 

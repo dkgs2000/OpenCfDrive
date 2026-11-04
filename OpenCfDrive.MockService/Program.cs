@@ -1,4 +1,6 @@
 using OpenCfDrive.Core.CloudFiles;
+using OpenCfDrive.Core.Configuration;
+using OpenCfDrive.Core.Services;
 using OpenCfDrive.Core.Storage;
 
 namespace OpenCfDrive.MockService;
@@ -12,9 +14,10 @@ namespace OpenCfDrive.MockService;
 /// root is a normal directory and placeholders are real hydrated files.
 ///
 /// Environment (identical to the real service):
-///   OPENCFDRIVE_ROOT  - local sync folder
-///   RCLONE_FS         - rclone remote spec, e.g. "e2e:"
-///   RCLONE_RC_URL     - rclone RC base URL, e.g. "http://127.0.0.1:5572"
+///   OPENCFDRIVE_ROOT    - local sync folder
+///   OPENCFDRIVE_REMOTE  - rclone remote spec, e.g. "e2e:"
+///   OPENCFDRIVE_RC_URL  - rclone RC base URL, e.g. "http://127.0.0.1:5572"
+///   OPENCFDRIVE_RC_USER, OPENCFDRIVE_RC_PASS - the login it was started with
 /// </summary>
 internal static class Program
 {
@@ -29,8 +32,8 @@ internal static class Program
             ? Path.Combine(Path.GetTempPath(), "OpenCfDriveMock", "drive")
             : envRoot;
 
-        var envRemote = Environment.GetEnvironmentVariable("RCLONE_FS");
-        var envRcUrl = Environment.GetEnvironmentVariable("RCLONE_RC_URL");
+        var envRemote = Environment.GetEnvironmentVariable(DriveSettingsFile.RemoteVariable);
+        var envRcUrl = Environment.GetEnvironmentVariable(DriveSettingsFile.RcUrlVariable);
 
         try
         {
@@ -106,10 +109,15 @@ internal static class Program
         };
         AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
 
+        // With the login the remote control was started with, if any.
+        var rcUser = Environment.GetEnvironmentVariable(DriveSettingsFile.RcUserVariable);
+        var endpoint = string.IsNullOrWhiteSpace(rcUser)
+            ? new RcloneEndpoint(rcUrl)
+            : new RcloneEndpoint(rcUrl, rcUser, Environment.GetEnvironmentVariable(DriveSettingsFile.RcPasswordVariable) ?? "");
         var engine = new CloudSyncEngine(
             syncRoot,
             remote,
-            rcUrl,
+            endpoint,
             dbPath,
             Log,
             forceSimulation: true);

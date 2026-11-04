@@ -11,7 +11,7 @@ page, [Testing](testing.md), and so does the design:
 - [How the service runs rclone](#how-the-service-runs-rclone)
 - [State and the status channel](#state-and-the-status-channel)
 - [Project layout](#project-layout)
-- [Developer scripts](#developer-scripts)
+- [Checking a running drive](#checking-a-running-drive)
 - [Installers](#installers)
 - [The updater](#the-updater)
 - [CI and releases](#ci-and-releases)
@@ -23,8 +23,8 @@ page, [Testing](testing.md), and so does the design:
   `net10.0-windows10.0.19041.0` for the Windows storage provider APIs.
 - The [.NET 10 SDK](https://dotnet.microsoft.com/download).
 - [rclone](https://rclone.org), on `PATH`. You can also drop `rclone.exe` into
-  the repository root, where git ignores it. The tests and the demo backend use
-  rclone as their server too.
+  the repository root, where git ignores it. The tests use rclone as their
+  server too.
 
 None of this needs an elevated shell. Run everything as the user who owns the
 drive, because the drive's registration is per user.
@@ -60,7 +60,7 @@ console it was started from, or to redirected output, or, with neither (as
 from the Start Menu), to `%LOCALAPPDATA%\OpenCfDrive\logs\OpenCfDrive.log`.
 One copy runs per drive.
 
-Command-line options, used by the installer and the scripts:
+Command-line options, used by the installer and the tests:
 
 | Program | Option | What it does |
 | --- | --- | --- |
@@ -80,11 +80,12 @@ set.
 | Setting | `settings.json` | Environment variable | Default |
 | --- | --- | --- | --- |
 | Drive folder | `SyncRoot` | `OPENCFDRIVE_ROOT` | `%USERPROFILE%\OpenCfDrive` |
-| rclone remote | `Remote` | `RCLONE_FS` | none (the service then uses `e2e:`, the demo backend's) |
-| OpenCfDrive runs rclone | `ManageRclone` | | yes; setting `RCLONE_RC_URL` means no |
+| rclone remote | `Remote` | `OPENCFDRIVE_REMOTE` | none (the service then uses `e2e:`, the name the tests give their remote) |
+| OpenCfDrive runs rclone | `ManageRclone` | | yes; setting `OPENCFDRIVE_RC_URL` means no |
 | rclone program | `RclonePath` | `OPENCFDRIVE_RCLONE` | on `PATH`, else the downloaded copy |
 | rclone config file | `RcloneConfig` | | rclone's own default |
-| Remote control you run | `RcUrl` | `RCLONE_RC_URL` | `http://127.0.0.1:5572` |
+| Remote control you run | `RcUrl` | `OPENCFDRIVE_RC_URL` | `http://127.0.0.1:5572` |
+| Its login | `RcUser`, `RcPasswordProtected` | `OPENCFDRIVE_RC_USER`, `OPENCFDRIVE_RC_PASS` | none |
 | Start at sign-in | `StartAtSignIn` | | on for the installed app |
 | Check for updates | `CheckForUpdates` | | on |
 | Background sync interval | | `OPENCFDRIVE_REMOTE_POLL_SECONDS` | 30 s |
@@ -92,8 +93,11 @@ set.
 `OPENCFDRIVE_SETTINGS` points both the app and the service at another
 settings file.
 
-The rclone program's variable isn't `RCLONE_...` on purpose: rclone reads every
-`RCLONE_<NAME>` variable as its `--<name>` flag.
+None of these variables is `RCLONE_...`, on purpose: rclone reads every
+`RCLONE_<NAME>` variable as its `--<name>` flag, and the rclone the service runs
+inherits them. `RCLONE_FS` and `RCLONE_RC_URL`, the names the remote and the
+remote control address had before, are no longer read; the service logs a
+warning when one is set.
 
 ## How the service runs rclone
 
@@ -110,7 +114,13 @@ With **OpenCfDrive runs it** (the default), the service starts
 - Its log is `%LOCALAPPDATA%\OpenCfDrive\logs\rclone.log`.
 
 With **I run rclone rcd myself**, the service uses the remote control at
-`RcUrl` and sends no login, so that rclone needs `--rc-serve --rc-no-auth`.
+`RcUrl` with the login it was started with (`--rc-user`, `--rc-pass`). The app
+saves the password encrypted for the Windows user (DPAPI), so the settings
+file never holds it in plain text. A login in the environment comes whole from
+there: user and password together. Never run it with `--rc-no-auth`: that lets
+any program on the PC, and possibly a web page, use every remote in its config
+and read the config's secrets. The end-to-end tests run their rclone with a
+login too.
 
 ## State and the status channel
 
@@ -139,73 +149,30 @@ answer is one line of JSON.
 | `OpenCfDrive.Service` | The background service that registers and serves the sync root |
 | `OpenCfDrive.MockService` | Test host: the same engine in mock mode, over a plain folder |
 | `OpenCfDrive.Tests` | Unit and contract tests: interop layout, Cloud Files behaviour, SQLite, the rclone API |
-| `scripts\drive` | Developer scripts for running a drive from a build (see below) |
 | `scripts\tests` | The end-to-end tests (see [Testing](testing.md)) |
 | `scripts\assets` | `Build-Icon.ps1`, which rebuilds the icons from `logo.svg` |
 | `assets` | `logo.svg` (the source), `opencfdrive.ico` (the app's and service's icon, which Explorer also shows for the drive), and `logo-64.png` (the `.exe` installer's logo) |
 | `installer` | `Build-Installer.ps1`, the WiX projects for the MSI (`msi`) and the `.exe` bootstrapper (`bundle`), and the third-party notices installed with the app |
 | `.github` | The Test and Release workflows and their shared setup step |
 
-## Developer scripts
+## Checking a running drive
 
-`scripts\drive` runs a drive straight from a build, without the app or the
-installer. The scripts share their defaults, so you can run them in order
-without arguments:
-
-| Value | Default |
-| --- | --- |
-| Sync root | `%USERPROFILE%\OpenCfDrive` |
-| rclone remote | `e2e:` (the demo backend; pass `-Remote` for your own) |
-| rclone RC URL | `http://127.0.0.1:5572` |
-
-```powershell
-.\scripts\drive\Install-OpenCfDrive.ps1              # build and publish to .\publish, create the sync root
-.\scripts\drive\Setup-OpenCfDrive-Environment.ps1    # optional: demo backend (rclone WebDAV server + rclone rcd)
-.\scripts\drive\Start-OpenCfDrive.ps1                # start the service, wait for "Mode: cloud"
-# open %USERPROFILE%\OpenCfDrive in Explorer, read and write files
-.\scripts\drive\Uninstall-OpenCfDrive.ps1            # stop the service, unregister the sync root
-```
-
-To use your own remote instead of the demo backend, run rclone's remote control
-yourself and point the service at it:
-
-```powershell
-rclone rcd --rc-serve --rc-no-auth --rc-addr 127.0.0.1:5572
-.\scripts\drive\Start-OpenCfDrive.ps1 -Remote "myremote:" -RcUrl "http://127.0.0.1:5572"
-```
-
-What each script does:
-
-- **Install** builds the solution, publishes `OpenCfDrive.Service` to
-  `.\publish`, and creates the sync-root folder. It writes nothing else.
-- **Setup** starts a WebDAV server, `rclone serve webdav` on port 5573 (user
-  `demo`, password `demo`), over `%LOCALAPPDATA%\OpenCfDrive\demo-server`, so
-  the "server" files survive re-runs. It writes the rclone config to
-  `%TEMP%\opencfdrive-setup\rclone.conf` with an obscured password, and starts
-  `rclone rcd --rc-serve` on port 5572. Both keep running in the background. A
-  re-run replaces only the two rclone processes it started itself.
-- **Start** passes `OPENCFDRIVE_ROOT`, `RCLONE_FS` and `RCLONE_RC_URL` to the
-  service process only (never machine-wide), writes the service log to
-  `%TEMP%\opencfdrive-service\`, and waits for the `Mode: cloud | ... items=N`
-  line.
-- **Uninstall** stops the service and unregisters the sync root. That also
-  removes its Explorer entry and any online-only placeholders, and leaves a
-  normal folder. It never deletes the sync root, which is user data. Pass
-  `-RemovePublish` to delete `.\publish` too.
-
-Sign out or restart Explorer after uninstalling, so the drive disappears from
-the navigation pane.
-
-Once `Start-OpenCfDrive.ps1` reports `Mode: cloud | ... registered=True |
-connected=True`, Explorer should list the folder instantly. Dehydrated files
-show the cloud icon, and opening one downloads it (the service log shows a
-`FETCH_DATA` line). A quick check:
+Once the service logs `Mode: cloud | ... registered=True | connected=True`,
+Explorer should list the drive folder instantly. Online-only files show the
+cloud icon, and opening one downloads it (the service log shows a `FETCH_DATA`
+line). A quick check:
 
 ```powershell
 $sw = [Diagnostics.Stopwatch]::StartNew()
 Get-ChildItem "$env:USERPROFILE\OpenCfDrive" -Force | Format-Table Name, Attributes
 $sw.ElapsedMilliseconds   # must be milliseconds, never ~60000
 ```
+
+To remove a drive run from source, stop the service and run it once with
+`--unregister`. That removes its Explorer entry and any online-only
+placeholders and leaves a normal folder; the folder itself, which is user
+data, is never deleted. Sign out or restart Explorer afterwards, so the drive
+disappears from the navigation pane.
 
 A sync root registered by an older build is upgraded in place the next time the
 service starts: registering an existing id updates its policies without
@@ -292,8 +259,7 @@ installed or downloaded separately and keeps its own license:
   OpenCfDrive runs it as a separate program and talks to it over its HTTP
   Remote Control API. No rclone code is included. OpenCfDrive runs a copy
   that's already installed, or downloads the official release from rclone.org
-  when asked. The tests and the demo backend also run it as their WebDAV or S3
-  server.
+  when asked. The tests also run it as their WebDAV or S3 server.
 - **NuGet packages** listed in the project files (`Microsoft.Data.Sqlite`,
   `SQLitePCLRaw`, `Microsoft.Extensions.Hosting`, and the xunit test packages),
   restored at build time.
