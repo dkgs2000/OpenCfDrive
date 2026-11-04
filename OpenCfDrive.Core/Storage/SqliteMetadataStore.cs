@@ -56,6 +56,7 @@ public sealed class SqliteMetadataStore
                 ModifiedUtc TEXT,
                 LocalSize INTEGER,
                 LocalWriteUtc INTEGER,
+                Hash TEXT,
                 CreatedUtc TEXT NOT NULL DEFAULT (datetime('now'))
             );
         ";
@@ -69,6 +70,7 @@ public sealed class SqliteMetadataStore
         EnsureColumn(connection, "InSync", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn(connection, "LocalSize", "INTEGER");
         EnsureColumn(connection, "LocalWriteUtc", "INTEGER");
+        EnsureColumn(connection, "Hash", "TEXT");
 
         // Legacy builds stored a GUID string in FileId; normalise before indexing.
         using (var normalise = connection.CreateCommand())
@@ -142,6 +144,7 @@ public sealed class SqliteMetadataStore
     /// <paramref name="localWriteUtc"/> its write time; null when it has the
     /// server's (as a placeholder made from the listing does).
     /// </param>
+    /// <param name="hash">The server's content hash ("type:value"), null when unknown.</param>
     public void UpsertFile(
         string remotePath,
         string localPath,
@@ -153,13 +156,14 @@ public sealed class SqliteMetadataStore
         DateTimeOffset? modifiedUtc,
         bool inSync = false,
         long? localSize = null,
-        DateTime? localWriteUtc = null)
+        DateTime? localWriteUtc = null,
+        string? hash = null)
     {
         using var connection = Open();
         using var command = connection.CreateCommand();
         command.CommandText = @"
-            INSERT INTO Files(RemotePath, LocalPath, FileIdentity, FileId, IsPlaceholder, IsDirectory, Size, ModifiedUtc, InSync, LocalSize, LocalWriteUtc)
-            VALUES (@remotePath, @localPath, @fileIdentity, @fileId, @isPlaceholder, @isDirectory, @size, @modifiedUtc, @inSync, @localSize, @localWriteUtc)
+            INSERT INTO Files(RemotePath, LocalPath, FileIdentity, FileId, IsPlaceholder, IsDirectory, Size, ModifiedUtc, InSync, LocalSize, LocalWriteUtc, Hash)
+            VALUES (@remotePath, @localPath, @fileIdentity, @fileId, @isPlaceholder, @isDirectory, @size, @modifiedUtc, @inSync, @localSize, @localWriteUtc, @hash)
             ON CONFLICT(RemotePath) DO UPDATE SET
                 LocalPath = excluded.LocalPath,
                 FileIdentity = excluded.FileIdentity,
@@ -170,8 +174,10 @@ public sealed class SqliteMetadataStore
                 ModifiedUtc = excluded.ModifiedUtc,
                 InSync = excluded.InSync,
                 LocalSize = excluded.LocalSize,
-                LocalWriteUtc = excluded.LocalWriteUtc;
+                LocalWriteUtc = excluded.LocalWriteUtc,
+                Hash = excluded.Hash;
         ";
+        command.Parameters.AddWithValue("@hash", hash ?? (object)DBNull.Value);
         command.Parameters.AddWithValue("@remotePath", remotePath);
         command.Parameters.AddWithValue("@localPath", localPath);
         command.Parameters.AddWithValue("@fileIdentity", fileIdentity);
@@ -261,7 +267,7 @@ public sealed class SqliteMetadataStore
     /// now has too. <paramref name="dehydrated"/> is true when the local copy
     /// was dropped because the server content changed.
     /// </summary>
-    public void UpdateRemoteMetadata(string remotePath, long size, DateTimeOffset? modifiedUtc, bool dehydrated)
+    public void UpdateRemoteMetadata(string remotePath, long size, DateTimeOffset? modifiedUtc, bool dehydrated, string? hash = null)
     {
         using var connection = Open();
         using var command = connection.CreateCommand();
@@ -269,6 +275,7 @@ public sealed class SqliteMetadataStore
             UPDATE Files
                SET Size = @size,
                    ModifiedUtc = @modifiedUtc,
+                   Hash = @hash,
                    LocalSize = NULL,
                    LocalWriteUtc = NULL,
                    InSync = 1,
@@ -277,7 +284,28 @@ public sealed class SqliteMetadataStore
         command.Parameters.AddWithValue("@remotePath", remotePath);
         command.Parameters.AddWithValue("@size", size);
         command.Parameters.AddWithValue("@modifiedUtc", modifiedUtc?.UtcDateTime.ToString("O") ?? (object)DBNull.Value);
+        command.Parameters.AddWithValue("@hash", hash ?? (object)DBNull.Value);
         command.Parameters.AddWithValue("@dehydrated", dehydrated ? 1 : 0);
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>Records the server's hash of a file this client knew without one.</summary>
+    public void SetHash(string remotePath, string hash)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE Files SET Hash = @hash WHERE RemotePath = @remotePath;";
+        command.Parameters.AddWithValue("@remotePath", remotePath);
+        command.Parameters.AddWithValue("@hash", hash);
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>Forgets every hash: the remote now keeps another kind (it was reconfigured).</summary>
+    public void ClearHashes()
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE Files SET Hash = NULL WHERE Hash IS NOT NULL;";
         command.ExecuteNonQuery();
     }
 
@@ -460,7 +488,8 @@ public sealed class SqliteMetadataStore
     /// </summary>
     /// <param name="remotePath">The item's server path (folders end in '/').</param>
     /// <param name="localPath">Where it was; for a rename, <paramref name="newLocalPath"/> is where it is now.</param>
-    public void AddPendingChange(PendingChangeKind kind, string remotePath, string localPath, string? newLocalPath = null)
+    /// <returns>The change's id, the one kept before when it is already there.</returns>
+    public long AddPendingChange(PendingChangeKind kind, string remotePath, string localPath, string? newLocalPath = null)
     {
         using var connection = Open();
         using var command = connection.CreateCommand();
@@ -469,12 +498,14 @@ public sealed class SqliteMetadataStore
             SELECT @kind, @remotePath, @localPath, @newLocalPath
              WHERE NOT EXISTS (
                 SELECT 1 FROM PendingChanges
-                 WHERE Kind = @kind AND RemotePath = @remotePath AND IFNULL(NewLocalPath, '') = IFNULL(@newLocalPath, ''));";
+                 WHERE Kind = @kind AND RemotePath = @remotePath AND IFNULL(NewLocalPath, '') = IFNULL(@newLocalPath, ''));
+            SELECT Id FROM PendingChanges
+             WHERE Kind = @kind AND RemotePath = @remotePath AND IFNULL(NewLocalPath, '') = IFNULL(@newLocalPath, '');";
         command.Parameters.AddWithValue("@kind", kind.ToString());
         command.Parameters.AddWithValue("@remotePath", remotePath);
         command.Parameters.AddWithValue("@localPath", localPath);
         command.Parameters.AddWithValue("@newLocalPath", newLocalPath ?? (object)DBNull.Value);
-        command.ExecuteNonQuery();
+        return (long)command.ExecuteScalar()!;
     }
 
     /// <summary>The changes waiting for the server, oldest first.</summary>
@@ -533,6 +564,9 @@ public sealed class FileRecord
     public long? LocalSize { get; init; }
     public DateTime? LocalWriteUtc { get; init; }
 
+    /// <summary>The server's content hash when last seen ("type:value"), null when the remote keeps none.</summary>
+    public string? Hash { get; init; }
+
     /// <summary>
     /// The local file's size and write time when it was last in sync: the
     /// server's unless an upload recorded the file's own (servers usually
@@ -562,5 +596,6 @@ public sealed class FileRecord
         LocalWriteUtc = reader.IsDBNull(reader.GetOrdinal("LocalWriteUtc"))
             ? null
             : new DateTime(reader.GetInt64(reader.GetOrdinal("LocalWriteUtc")), DateTimeKind.Utc),
+        Hash = reader.IsDBNull(reader.GetOrdinal("Hash")) ? null : reader.GetString(reader.GetOrdinal("Hash")),
     };
 }

@@ -11,7 +11,8 @@ namespace OpenCfDrive.Tests;
 /// download the whole new file when it is opened again. The platform keeps
 /// its own record of a placeholder's size, which a write does not change:
 /// marking the file in sync without the new size leaves the old one, and the
-/// next download fills only that much (the rest reads as zeros).
+/// next download of a file the edit made bigger fills only that much (the
+/// rest reads as zeros).
 /// </summary>
 public class EditedPlaceholderContractTest(ITestOutputHelper output)
 {
