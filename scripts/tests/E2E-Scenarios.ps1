@@ -49,6 +49,10 @@ function Initialize-E2EScenarioFixtures {
     Set-RemoteFile "client/offline-delete.txt" "offline-delete"
     Set-RemoteFile "client/offline-rename.txt" "offline-rename"
     Set-RemoteFile "client/free-after-upload.txt" "free-after-upload-v1"
+    Set-RemoteFile "client/edit-same.txt" "same-v1"
+    Set-RemoteFile "client/edit-shorter.txt" "edit-shorter-original"
+    Set-RemoteFile "client/edit-longer.txt" "grow-v1"
+    Set-RemoteFile "client/offline-edit.txt" "offline-edit-v1"
     # For the unregister / register again check in E2E-Common.ps1.
     Set-RemoteFile "restart/never-opened.txt" "never-opened"
 }
@@ -148,8 +152,36 @@ function Read-Local([string]$Relative) {
     }
 }
 
+# Saves by replacing the file, as File.WriteAllText and many programs do:
+# over a placeholder, the result is a plain file.
 function Write-Local([string]$Relative, [string]$Content) {
     [System.IO.File]::WriteAllText((Get-LocalPath $Relative), $Content)
+}
+
+# Saves into the same file, as Notepad does: opened, emptied and written. A
+# placeholder stays one, and Windows' own record of its size does not follow
+# the new content (EditedPlaceholderContractTest).
+function Edit-Local([string]$Relative, [string]$Content) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Content)
+    $stream = [System.IO.File]::Open((Get-LocalPath $Relative), 'Open', 'Write', 'ReadWrite')
+    try {
+        $stream.SetLength(0)
+        $stream.Write($bytes, 0, $bytes.Length)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+# Free up space on a file, then open it again: it must come back whole, as
+# the server has it.
+function Assert-FreedAndOpened([string]$Relative, [string]$Expected) {
+    $path = Get-LocalPath $Relative
+    & attrib.exe -P +U $path | Out-Null
+    if (-not (Wait-ForAttributes $path { ((Get-Item -LiteralPath $path -Force).Attributes -band 0x400000) -ne 0 })) {
+        throw "$Relative was not freed."
+    }
+    & attrib.exe -U $path | Out-Null
+    Assert-Local $Relative $Expected
 }
 
 function Get-LocalLength([string]$Relative) {
@@ -186,6 +218,34 @@ function Get-ConflictCopy([string]$Folder, [string]$BaseName) {
 # Whether the server can hold a folder with nothing in it (S3 cannot: a
 # folder there is only a part of file names).
 function Test-ServerKeepsEmptyFolders { return $script:E2EBackend -ne "s3" }
+
+# S3 keeps an MD5 of every file; the WebDAV server keeps no hashes (rclone
+# reads them from WebDAV only on Nextcloud and ownCloud).
+function Test-ServerHasHashes { return $script:E2EBackend -eq "s3" }
+
+# On S3 each file's time costs a request of its own, so a folder listed
+# before is listed without times: a sync run looks up the time of each file
+# it finds new or changed (the listing with times paid one per file, changed
+# or not).
+function Test-ServerListsWithoutTimes { return $script:E2EBackend -eq "s3" }
+
+# A budget for what differs by server. -TimeLookups: files a sync run finds
+# new or changed, each one lookup more on S3. -HashesLocal: a conflict, where
+# the server keeps hashes, first hashes the local file (it may hold the
+# server's content already, which is no conflict).
+function Get-Budget([hashtable]$Budget, [int]$TimeLookups = 0, [switch]$HashesLocal) {
+    $budget = $Budget.Clone()
+    if ($TimeLookups -gt 0 -and (Test-ServerListsWithoutTimes)) { $budget.Lookups = $budget.Lookups + $TimeLookups }
+    if ($HashesLocal -and (Test-ServerHasHashes)) { $budget.LocalHashes = 1 }
+    return $budget
+}
+
+# The client's requests to the server for one file's own metadata (S3 HEADs,
+# logged only on S3) since a point in rclone's log.
+function Get-ServerHeads([long]$From, [string]$Under) {
+    $text = Read-LogSlice $script:E2ERcloneLog $From (Get-LogLength $script:E2ERcloneLog)
+    return @($text -split "`r?`n" | Where-Object { $_ -match "DEBUG : HEAD /\S*$([regex]::Escape($Under))" })
+}
 
 function Assert-RemoteMissing([string]$Path) {
     Wait-Remote { -not (Test-RemoteItem $Path) } "Server still has '$Path'."
@@ -282,7 +342,7 @@ function Read-LogSlice([string]$Path, [long]$From, [long]$To) {
 function Measure-ServiceActivity([string]$ServiceLog, [string]$RcloneLog) {
     $activity = [ordered]@{
         Uploads = 0; DownloadBytes = 0L; ServerRenames = 0; ServerDeletes = 0; ServerFolders = 0
-        Listings = 0; Lookups = 0; OtherCalls = 0; Errors = 0
+        Listings = 0; Lookups = 0; LocalHashes = 0; OtherCalls = 0; Errors = 0
     }
     $lines = New-Object System.Collections.Generic.List[string]
 
@@ -297,6 +357,7 @@ function Measure-ServiceActivity([string]$ServiceLog, [string]$RcloneLog) {
             '^operations/mkdir$' { $activity.ServerFolders++ }
             '^operations/list$' { $activity.Listings++ }
             '^operations/stat$' { $activity.Lookups++ }
+            '^operations/hashsumfile$' { $activity.LocalHashes++ }
             default { $activity.OtherCalls++ }
         }
         if ($parameters.Length -gt 160) { $parameters = $parameters.Substring(0, 160) + "..." }
@@ -305,8 +366,8 @@ function Measure-ServiceActivity([string]$ServiceLog, [string]$RcloneLog) {
 
     foreach ($line in ($ServiceLog -split "`r?`n")) {
         $text = $line.Trim()
-        if ($text -match "FETCH_DATA '[^']*' offset=\d+ length=(\d+)") {
-            $activity.DownloadBytes += [long]$Matches[1]
+        if ($text -match "FETCH_DATA '[^']*' (for .+ )?offset=\d+ length=(?<length>\d+)") {
+            $activity.DownloadBytes += [long]$Matches['length']
         } elseif ($text -match "FETCH_DATA failed|propagation failed|Upload failed|reported failure|handler failed|Could not delete remote|Skipped upload|remote listing failed") {
             $activity.Errors++
         } else {
@@ -318,9 +379,9 @@ function Measure-ServiceActivity([string]$ServiceLog, [string]$RcloneLog) {
 }
 
 function Format-Activity($Counts) {
-    return "up {0}, down {1} B, mv {2}, rm {3}, mkdir {4}, list {5}, stat {6}, other {7}, err {8}" -f `
+    return "up {0}, down {1} B, mv {2}, rm {3}, mkdir {4}, list {5}, stat {6}, hash {7}, other {8}, err {9}" -f `
         $Counts.Uploads, $Counts.DownloadBytes, $Counts.ServerRenames, $Counts.ServerDeletes, $Counts.ServerFolders,
-        $Counts.Listings, $Counts.Lookups, $Counts.OtherCalls, $Counts.Errors
+        $Counts.Listings, $Counts.Lookups, $Counts.LocalHashes, $Counts.OtherCalls, $Counts.Errors
 }
 
 # Throws if the client did more than the scenario's budget allows. Listings
@@ -451,7 +512,7 @@ function Get-E2EScenarios {
         # version keeps the name, the local edit is kept beside it as a
         # conflict copy and uploaded as a file of its own (its two lookups,
         # plus the check that found the conflict).
-        New-E2EScenario "S15" "both sides edit the same file: both versions are kept" -Budget @{ DownloadBytes = 33; Uploads = 1; Lookups = 3 } -CloudOnly {
+        New-E2EScenario "S15" "both sides edit the same file: both versions are kept" -Budget (Get-Budget @{ DownloadBytes = 33; Uploads = 1; Lookups = 3 } -TimeLookups 1 -HashesLocal) -CloudOnly {
             Set-RemoteFile "s15.txt" "s15-server-v1"
             Wait-Local "" { Test-Local "s15.txt" } "s15.txt did not appear locally."
             Assert-Local "s15.txt" "s15-server-v1"
@@ -464,7 +525,7 @@ function Get-E2EScenarios {
             Assert-RemoteText "s15.txt" "s15-server-v2-longer"
         }
         # Nextcloud restores it: the edit is the only copy left.
-        New-E2EScenario "S16" "server deletes a file that has an unsynced local edit: the edit is kept and uploaded again" -Budget @{ DownloadBytes = 6; Uploads = 1; Lookups = 2 } -CloudOnly {
+        New-E2EScenario "S16" "server deletes a file that has an unsynced local edit: the edit is kept and uploaded again" -Budget (Get-Budget @{ DownloadBytes = 6; Uploads = 1; Lookups = 2 } -TimeLookups 1) -CloudOnly {
             Set-RemoteFile "s16.txt" "s16-v1"
             Wait-Local "" { Test-Local "s16.txt" } "s16.txt did not appear locally."
             Assert-Local "s16.txt" "s16-v1"
@@ -548,7 +609,7 @@ function Get-E2EScenarios {
             Assert-Local "s18-unseen/later.txt" "later"
         }
         # Nextcloud keeps the edited file, and its folder, and uploads it again.
-        New-E2EScenario "S19" "server deletes a folder while a file in it has an unsynced local edit: that file stays and goes back, the rest goes" -Budget @{ DownloadBytes = 6; Uploads = 1; Lookups = 2 } -CloudOnly {
+        New-E2EScenario "S19" "server deletes a folder while a file in it has an unsynced local edit: that file stays and goes back, the rest goes" -Budget (Get-Budget @{ DownloadBytes = 6; Uploads = 1; Lookups = 2 } -TimeLookups 1) -CloudOnly {
             Set-RemoteFile "s19-dir/edited.txt" "s19-v1"
             Set-RemoteFile "s19-dir/other.txt" "other"
             Wait-Local "" { Test-Local "s19-dir" } "s19-dir did not appear locally."
@@ -563,7 +624,7 @@ function Get-E2EScenarios {
         }
         # A delete here does not throw away a change the server made since
         # this client last saw the file: that version comes back instead.
-        New-E2EScenario "S20" "client deletes a file the server changed meanwhile: the server's version comes back" -Budget @{ DownloadBytes = 15; Lookups = 1 } -CloudOnly {
+        New-E2EScenario "S20" "client deletes a file the server changed meanwhile: the server's version comes back" -Budget (Get-Budget @{ DownloadBytes = 15; Lookups = 1 } -TimeLookups 2) -CloudOnly {
             Set-RemoteFile "s20.txt" "s20-v1"
             Wait-Local "" { Test-Local "s20.txt" } "s20.txt did not appear locally."
             Set-RemoteFile "s20.txt" "s20-version-two"
@@ -575,7 +636,7 @@ function Get-E2EScenarios {
         # The same new path on both sides, different files (Nextcloud's
         # new/new conflict): the server's file keeps the name, this PC's is
         # kept as a conflict copy and uploaded.
-        New-E2EScenario "S21" "client and server add different files at the same new path: both are kept" -Budget @{ DownloadBytes = 10; Uploads = 1; Lookups = 3 } -CloudOnly {
+        New-E2EScenario "S21" "client and server add different files at the same new path: both are kept" -Budget (Get-Budget @{ DownloadBytes = 10; Uploads = 1; Lookups = 3 } -HashesLocal) -CloudOnly {
             Set-RemoteFile "s21.txt" "s21-server"
             Write-Local "s21.txt" "s21-local"
             Wait-Local "" { (Read-Local "s21.txt") -eq "s21-server" } "s21.txt did not take the server's file."
@@ -610,6 +671,79 @@ function Get-E2EScenarios {
             Wait-Local $folder { (-not (Test-Local "$folder/$file")) -and (Test-Local "$folder/$renamed") } "The rename did not reach the local side."
             Assert-Local "$folder/$renamed" $text
         }
+        # S15 and S16 with the edit saved in place (Edit-Local), as Notepad
+        # does: the file is still a placeholder, not a plain file, when the
+        # server's change meets it.
+        New-E2EScenario "S24" "both sides edit the same file, the local edit saved in place: both versions are kept" -Budget (Get-Budget @{ DownloadBytes = 33; Uploads = 1; Lookups = 3 } -TimeLookups 1 -HashesLocal) -CloudOnly {
+            Set-RemoteFile "s24.txt" "s24-server-v1"
+            Wait-Local "" { Test-Local "s24.txt" } "s24.txt did not appear locally."
+            Assert-Local "s24.txt" "s24-server-v1"
+            Set-RemoteFile "s24.txt" "s24-server-v2-longer"
+            Edit-Local "s24.txt" "s24-local-edit"
+            Wait-Local "" { (Read-Local "s24.txt") -eq "s24-server-v2-longer" } "s24.txt did not take the server's version."
+            $copy = Get-ConflictCopy "" "s24"
+            Assert-Local $copy "s24-local-edit"
+            Assert-RemoteText $copy "s24-local-edit"
+            Assert-RemoteText "s24.txt" "s24-server-v2-longer"
+        }
+        New-E2EScenario "S25" "server deletes a file with an unsynced edit saved in place: the edit is uploaded again, and opens whole after Free up space" -Budget (Get-Budget @{ DownloadBytes = 20; Uploads = 1; Lookups = 2 } -TimeLookups 1) -CloudOnly {
+            Set-RemoteFile "s25.txt" "s25-v1"
+            Wait-Local "" { Test-Local "s25.txt" } "s25.txt did not appear locally."
+            Assert-Local "s25.txt" "s25-v1"
+            Remove-RemoteFile "s25.txt"
+            Edit-Local "s25.txt" "s25-local-edit"
+            Assert-RemoteText "s25.txt" "s25-local-edit"
+            Sync-Remote
+            Assert-Local "s25.txt" "s25-local-edit"
+            Assert-FreedAndOpened "s25.txt" "s25-local-edit"
+        }
+        # Nextcloud's check before a conflict copy: the same content on both
+        # sides is no conflict. Only a remote that keeps hashes can tell; on
+        # the others the edit is kept as a conflict copy, which is safe.
+        New-E2EScenario "S26" "both sides make the same edit: no conflict copy where the server keeps hashes" -Budget $(
+            if (Test-ServerHasHashes) { @{ DownloadBytes = 6; Lookups = 3; LocalHashes = 1 } }
+            else { @{ DownloadBytes = 6; Uploads = 1; Lookups = 3 } }) -CloudOnly {
+            Set-RemoteFile "s26.txt" "s26-v1"
+            Wait-Local "" { Test-Local "s26.txt" } "s26.txt did not appear locally."
+            Assert-Local "s26.txt" "s26-v1"
+            Set-RemoteFile "s26.txt" "s26-same-edit"
+            Edit-Local "s26.txt" "s26-same-edit"
+            Sync-Remote
+            if (Test-ServerHasHashes) {
+                $copies = @(Get-ChildItem -LiteralPath (Get-LocalPath "") -Force -File | Where-Object { $_.Name -like "s26 (conflicted copy *)*" })
+                if ($copies.Count -gt 0) { throw "A conflict copy was made of a file with the same content on both sides: $($copies.Name -join ', ')" }
+                Assert-Local "s26.txt" "s26-same-edit"
+            } else {
+                Assert-Local (Get-ConflictCopy "" "s26") "s26-same-edit"
+            }
+            Assert-RemoteText "s26.txt" "s26-same-edit"
+        }
+        # A server writing the same content again (a re-upload, a copy) has
+        # not changed the file: where the remote keeps hashes it stays here.
+        # Elsewhere only the new time can tell, and the file goes online-only.
+        New-E2EScenario "S27" "server writes a file again with the same content: still local where the server keeps hashes" -Budget $(
+            if (Test-ServerHasHashes) { @{ DownloadBytes = 8 } } else { @{ DownloadBytes = 16 } }) -CloudOnly {
+            Set-RemoteFile "s27.txt" "s27-same"
+            Wait-Local "" { Test-Local "s27.txt" } "s27.txt did not appear locally."
+            Assert-Local "s27.txt" "s27-same"
+            Set-RemoteFile "s27.txt" "s27-same"
+            Sync-Remote
+            Assert-Local "s27.txt" "s27-same"
+        }
+        # On S3 a listing with times costs one request per file (a HEAD).
+        # A folder listed before is listed without them: its unchanged files
+        # are told by their MD5, so a sync run asks none of them anything.
+        New-E2EScenario "S28" "a sync run of a folder listed before asks no unchanged file for its time" -CloudOnly {
+            Set-RemoteFile "s28-dir/a.txt" "a"
+            Set-RemoteFile "s28-dir/b.txt" "b"
+            Set-RemoteFile "s28-dir/c.txt" "c"
+            Wait-Local "" { Test-Local "s28-dir" } "s28-dir did not appear locally."
+            Wait-Local "s28-dir" { (Test-Local "s28-dir/a.txt") -and (Test-Local "s28-dir/b.txt") -and (Test-Local "s28-dir/c.txt") } "s28-dir's files did not appear locally."
+            $from = Get-LogLength $script:E2ERcloneLog
+            Sync-Remote
+            $heads = @(Get-ServerHeads $from "s28-dir/")
+            if ($heads.Count -gt 0) { throw "The sync run asked $($heads.Count) unchanged file(s) of s28-dir for their time: $($heads -join ' | ')" }
+        }
 
         # ---------------- client side -> server ----------------
         New-E2EScenario "C01" "client adds a file" -Budget @{ Uploads = 1; Lookups = 2 } {
@@ -630,11 +764,11 @@ function Get-E2EScenarios {
             [System.IO.File]::AppendAllText((Get-LocalPath "client/edit-me.txt"), "-edited")
             Assert-RemoteText "client/edit-me.txt" "edit-me-v1-edited"
         }
-        New-E2EScenario "C05" "client overwrites a file with the same size" -Budget @{ Uploads = 1; Lookups = 2 } {
+        New-E2EScenario "C05" "client saves a file by replacing it, same size" -Budget @{ Uploads = 1; Lookups = 2 } {
             Write-Local "client/same-size.txt" "bbbb"
             Assert-RemoteText "client/same-size.txt" "bbbb"
         }
-        New-E2EScenario "C06" "client overwrites a file with shorter content" -Budget @{ Uploads = 1; Lookups = 2 } {
+        New-E2EScenario "C06" "client saves a file by replacing it, shorter" -Budget @{ Uploads = 1; Lookups = 2 } {
             Write-Local "client/overwrite.txt" "short"
             Assert-RemoteText "client/overwrite.txt" "short"
         }
@@ -679,7 +813,8 @@ function Get-E2EScenarios {
             Write-Local "client/safe-save.txt.tmp" "safe-save-v2"
             Move-Item -LiteralPath (Get-LocalPath "client/safe-save.txt.tmp") -Destination (Get-LocalPath "client/safe-save.txt") -Force
             Assert-RemoteText "client/safe-save.txt" "safe-save-v2"
-            Start-Sleep -Seconds 2
+            # A sync run sends every local change reported before it.
+            if ($script:E2EIsCloud) { Sync-Remote } else { Wait-ServiceQuiet }
             if (Test-RemoteItem "client/safe-save.txt.tmp") { throw "The temp file was left on the server." }
         }
         New-E2EScenario "C14" "client copies a file in from outside the drive" -Budget @{ Uploads = 1; Lookups = 2 } {
@@ -709,7 +844,7 @@ function Get-E2EScenarios {
         # No sync run in between, so only the check before the upload can see
         # the server's change. The file is opened before the server changes
         # it, so saving looks up no name. Both versions are kept.
-        New-E2EScenario "C18" "the server changes a file that is open locally, then it is saved: both versions are kept" -Budget @{ DownloadBytes = 29; Uploads = 1; Lookups = 3 } {
+        New-E2EScenario "C18" "the server changes a file that is open locally, then it is saved: both versions are kept" -Budget (Get-Budget @{ DownloadBytes = 29; Uploads = 1; Lookups = 3 } -HashesLocal) {
             Wait-Local "client" { Test-Local "client/conflict.txt" } "client\conflict.txt did not appear locally."
             $stream = [System.IO.File]::Open((Get-LocalPath "client/conflict.txt"), 'Open', 'ReadWrite', 'ReadWrite')
             try {
@@ -834,6 +969,46 @@ function Get-E2EScenarios {
             Rename-Item -LiteralPath (Get-LocalPath "$folder/$file") -NewName $renamed
             Assert-RemoteText "$folder/$renamed" $text
             Assert-RemoteMissing "$folder/$file"
+        }
+        # Saved in place, as Notepad does (Edit-Local): the file stays a
+        # placeholder, so the upload gives Windows the new size, or Free up
+        # space would bring back only the old size's worth and zeros after
+        # it. C05 and C06 save by replacing the file instead.
+        New-E2EScenario "C27" "client edits a downloaded file in place, same size: it is uploaded, and opens whole after Free up space" -Budget @{ DownloadBytes = 14; Uploads = 1; Lookups = 2 } {
+            Assert-Local "client/edit-same.txt" "same-v1"
+            Edit-Local "client/edit-same.txt" "same-v2"
+            Assert-RemoteText "client/edit-same.txt" "same-v2"
+            if ($script:E2EIsCloud) { Assert-FreedAndOpened "client/edit-same.txt" "same-v2" }
+        }
+        New-E2EScenario "C28" "client edits a downloaded file in place, shorter: it is uploaded, and opens whole after Free up space" -Budget @{ DownloadBytes = 28; Uploads = 1; Lookups = 2 } {
+            Assert-Local "client/edit-shorter.txt" "edit-shorter-original"
+            Edit-Local "client/edit-shorter.txt" "shorter"
+            Assert-RemoteText "client/edit-shorter.txt" "shorter"
+            if ($script:E2EIsCloud) { Assert-FreedAndOpened "client/edit-shorter.txt" "shorter" }
+        }
+        New-E2EScenario "C29" "client edits a downloaded file in place, longer: it is uploaded, and opens whole after Free up space" -Budget @{ DownloadBytes = 23; Uploads = 1; Lookups = 2 } {
+            Assert-Local "client/edit-longer.txt" "grow-v1"
+            Edit-Local "client/edit-longer.txt" "grow-v1-and-more"
+            Assert-RemoteText "client/edit-longer.txt" "grow-v1-and-more"
+            if ($script:E2EIsCloud) { Assert-FreedAndOpened "client/edit-longer.txt" "grow-v1-and-more" }
+        }
+        # Offline the way a lost network is (see S18): the edit waits, as in
+        # Nextcloud and OneDrive, and is uploaded once the server answers.
+        New-E2EScenario "C30" "offline: the client edits a file in place; it is uploaded once the server answers" -Budget @{ DownloadBytes = 15; Uploads = 1; Lookups = 2 } -CloudOnly {
+            Assert-Local "client/offline-edit.txt" "offline-edit-v1"
+            Suspend-E2EBackend
+            try {
+                Sync-Remote -TimeoutSeconds 60
+                Edit-Local "client/offline-edit.txt" "offline-edit-v2-saved-offline"
+                $kept = Wait-ForCondition {
+                    (Read-LogText $script:E2EServiceLog).Contains("Offline: 'client/offline-edit.txt' is uploaded once the server answers.")
+                } -TimeoutSeconds 30 -PollMilliseconds 200
+                if (-not $kept) { throw "The edit made offline was not kept for the server." }
+            } finally {
+                Resume-E2EBackend
+            }
+            Assert-RemoteText "client/offline-edit.txt" "offline-edit-v2-saved-offline"
+            Assert-Local "client/offline-edit.txt" "offline-edit-v2-saved-offline"
         }
     )
 }

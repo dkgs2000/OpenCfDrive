@@ -599,6 +599,7 @@ function Invoke-OpenCfDriveE2E {
     $serviceLog = Join-Path $TempRoot "service.log"
     $serviceErr = Join-Path $TempRoot "service.err"
     $proc = $null
+    $rcloneRc = $null
 
     try {
         $script:E2ESummaryLog = ""
@@ -658,7 +659,11 @@ function Invoke-OpenCfDriveE2E {
         # DEBUG logs every RC call the client makes; the scenario audit counts them.
         Write-E2ELog "Starting rclone RC on http://127.0.0.1:$script:E2ERcPort"
         $rcloneLog = Join-Path $TempRoot "rclone-rc.log"
-        Start-Process -FilePath $rclonePath -ArgumentList @(
+        # Kept, so cleanup stops this very process: a -TempRoot outside
+        # %TEMP%\opencfdrive-e2e* is not matched by Stop-StaleProcesses.
+        # On S3 every request to the server is logged too (--dump headers):
+        # a scenario counts the per-file HEADs a listing with times costs there.
+        $rcArgs = @(
             "--config", $rcloneConf,
             "rcd",
             "--rc-addr", "127.0.0.1:$($script:E2ERcPort)",
@@ -666,7 +671,9 @@ function Invoke-OpenCfDriveE2E {
             "--rc-serve",
             "--log-file", $rcloneLog,
             "--log-level", "DEBUG"
-        ) -WindowStyle Hidden | Out-Null
+        )
+        if ($Backend -eq "s3") { $rcArgs += @("--dump", "headers") }
+        $rcloneRc = Start-Process -FilePath $rclonePath -ArgumentList $rcArgs -WindowStyle Hidden -PassThru
 
         if (-not (Wait-ForCondition { Test-RcloneHealthy } -TimeoutSeconds 45)) {
             throw "rclone RC did not become healthy on http://127.0.0.1:$($script:E2ERcPort). Log: $(Read-LogText (Join-Path $TempRoot 'rclone-rc.log'))"
@@ -883,6 +890,13 @@ function Invoke-OpenCfDriveE2E {
 
         if ($isCloud -and -not $KeepRegistration -and (Test-Path $serviceExe)) {
             Invoke-ServiceUnregister -ServiceExe $serviceExe -SyncRoot $SyncRoot
+        }
+
+        if ($null -ne $rcloneRc -and -not $rcloneRc.HasExited) {
+            try {
+                Stop-Process -Id $rcloneRc.Id -Force -ErrorAction Stop
+                [void]$rcloneRc.WaitForExit(10000)
+            } catch { }
         }
 
         Stop-StaleProcesses

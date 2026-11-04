@@ -1,28 +1,29 @@
 namespace OpenCfDrive.Tests.TestSupport;
 
 /// <summary>
-/// A clock whose one timer fires only when the test says so, and which
-/// signals when the timer is next scheduled.
+/// A clock whose timers fire only when the test says so, and which signals
+/// when a timer is next scheduled. Timers are numbered in the order they were
+/// created; <see cref="DueIn"/> and <see cref="Fire()"/> are for the first.
 /// </summary>
 internal sealed class ManualTime : TimeProvider
 {
     private readonly object _gate = new();
-    private ManualTimer? _timer;
+    private readonly List<ManualTimer> _timers = [];
     private TaskCompletionSource? _scheduled;
 
-    /// <summary>When the timer is due, or null while it is off.</summary>
-    public TimeSpan? DueIn
+    /// <summary>When the first timer is due, or null while it is off.</summary>
+    public TimeSpan? DueIn => DueInFor(0);
+
+    /// <summary>When timer <paramref name="index"/> is due, or null while it is off.</summary>
+    public TimeSpan? DueInFor(int index)
     {
-        get
+        lock (_gate)
         {
-            lock (_gate)
-            {
-                return _timer?.Due;
-            }
+            return index < _timers.Count ? _timers[index].Due : null;
         }
     }
 
-    /// <summary>Completes when the timer is next scheduled.</summary>
+    /// <summary>Completes when any timer is next scheduled.</summary>
     public Task NextSchedule()
     {
         lock (_gate)
@@ -32,12 +33,19 @@ internal sealed class ManualTime : TimeProvider
         }
     }
 
-    public void Fire()
+    public void Fire() => Fire(0);
+
+    public void Fire(int index)
     {
         ManualTimer timer;
         lock (_gate)
         {
-            timer = _timer ?? throw new InvalidOperationException("No timer.");
+            if (index >= _timers.Count)
+            {
+                throw new InvalidOperationException("No timer.");
+            }
+
+            timer = _timers[index];
             Assert.NotNull(timer.Due);
         }
 
@@ -48,8 +56,9 @@ internal sealed class ManualTime : TimeProvider
     {
         lock (_gate)
         {
-            _timer = new ManualTimer(this, callback, state);
-            return _timer;
+            var timer = new ManualTimer(this, callback, state);
+            _timers.Add(timer);
+            return timer;
         }
     }
 

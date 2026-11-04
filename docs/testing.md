@@ -89,7 +89,14 @@ run has finished. So each scenario sees exactly the server calls it caused. The
 
 ## Scenario matrix
 
-**Server side (`S01`–`S23`, cloud mode only).** Another app changes the server.
+**Two ways to save.** Programs save a file in one of two ways, and the
+scenarios use both. Many replace it with a new file (.NET's
+`File.WriteAllText`, or a temp file renamed over it); over a placeholder that
+leaves a plain file. Others, Notepad among them, write into the same file,
+which stays a placeholder whose size Windows keeps a record of. The edit
+scenarios below are run both ways where the two take different paths.
+
+**Server side (`S01`–`S28`, cloud mode only).** Another app changes the server.
 The scenario then has the client run its background sync, lists the folder as
 Explorer does, and expects the local side to match:
 
@@ -100,9 +107,10 @@ Explorer does, and expects the local side to match:
 - rename a file; move a file to another folder; rename a folder
 - a 3 MB binary file (byte-exact); 40 files at once
 - both sides edit the same file: both are kept, the local edit as a conflict
-  copy that is uploaded too
+  copy that is uploaded too (the local edit saved both ways)
 - the server deletes a file that has an unsynced local edit: the edit is kept
-  and uploaded again
+  and uploaded again (saved both ways; saved in place, it also opens whole
+  after Free up space)
 - the server deletes a folder while a file in it has an unsynced edit: that
   file stays and goes back, the rest of the folder goes
 - the client deletes a file the server changed meanwhile: the server's version
@@ -120,15 +128,25 @@ Explorer does, and expects the local side to match:
   listing of a folder never opened waits for the server in vain and puts the
   drive offline, that folder is empty, and back online (using the drive checks
   the server) it lists the server
+- content hashes, where the server keeps them (S3 here; the WebDAV server
+  keeps none, so the same scenarios check the fallback): both sides making the
+  same edit is no conflict; the server writing a file again with the same
+  content leaves it local; and a sync run of a folder listed before sends no
+  per-file request for an unchanged file (counted from rclone's request log,
+  which the S3 run keeps with `--dump headers`)
 
 Mock mode skips these. It's a test stand-in over a plain folder, with no way
 to know when a folder is opened, so it copies the server once at startup.
 
-**Client side (`C01`–`C26`, both modes unless noted).** A local action in the
+**Client side (`C01`–`C30`, both modes unless noted).** A local action in the
 drive, after which the server is expected to match:
 
 - add a file; in an existing folder; in new nested folders
-- edit a file never opened; overwrite with the same size; overwrite shorter
+- edit a file never opened; save a file by replacing it, the same size and
+  shorter
+- edit a downloaded file in place, as Notepad does, the same size, shorter
+  and longer: it's uploaded, and after Free up space (cloud mode) it opens
+  whole, not cut at its old size
 - delete a file; delete a folder with files
 - rename a file; move a file to another folder; rename a folder (files inside
   still open)
@@ -149,7 +167,7 @@ drive, after which the server is expected to match:
 - folders and files with Arabic names, and a rename
 - offline (cloud mode): a delete and a rename made while the server can't be
   reached are kept and reach the server once it answers; nothing comes back
-  meanwhile
+  meanwhile. An edit saved in place offline is uploaded once it answers
 - Free up space on a file with an unsynced edit (cloud mode): it's uploaded
   first, then freed, and opens whole again
 
@@ -160,6 +178,11 @@ nothing the client leaves unlogged is missed) and the bytes Windows asked it to
 download. It fails the scenario if the cost went over, or if the scenario
 logged an error. For example, renaming a file must cost exactly one server
 move: no download, no upload. The results table shows what each scenario cost.
+
+Where the cost differs by server, the scenario says so. On S3 a sync run looks
+up the time of each file it finds new or changed (a listing with times would
+pay a request per file, changed or not), and a conflict hashes the local file
+first (`Get-Budget -TimeLookups`, `-HashesLocal`).
 
 ## Cloud-only mount checks
 
