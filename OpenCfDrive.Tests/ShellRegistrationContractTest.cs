@@ -103,7 +103,7 @@ public class ShellRegistrationContractTest(ITestOutputHelper output)
     /// <summary>
     /// Asks the Cloud Files driver directly. Placeholder attributes are not
     /// usable here: Windows masks them for processes outside the system
-    /// directories (see README, placeholder compatibility mode).
+    /// directories (see docs/architecture.md, placeholder compatibility mode).
     /// </summary>
     [SkippableTheory]
     [InlineData(false)]
