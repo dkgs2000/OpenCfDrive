@@ -29,25 +29,11 @@ public sealed class SyncRootConnection : IDisposable
     /// </summary>
     private static readonly TimeSpan HydrationGuard = TimeSpan.FromSeconds(5);
 
-    /// <summary>
-    /// How long a deleted or moved-out item may stay in place, with no
-    /// download running for it, before the delete or move counts as failed
-    /// and the server copy is kept.
-    /// </summary>
-    private static readonly TimeSpan LeaveTimeout = TimeSpan.FromSeconds(30);
-
-    /// <summary>
-    /// How long a deleted item's path must stay empty before the delete is
-    /// final. Some programs replace a file by deleting it and then renaming
-    /// another into place; that is an update, not a delete.
-    /// </summary>
-    private static readonly TimeSpan ReplaceGrace = TimeSpan.FromSeconds(1);
-
     private readonly SqliteMetadataStore _store;
     private readonly RcloneServeClient _serve;
     private readonly Action<string>? _log;
-    private readonly Func<string, Task>? _deleteRemote;
-    private readonly Func<string, string, RenameSource?, Task>? _renameRemote;
+    private readonly LocalDelete? _localDelete;
+    private readonly LocalRename? _localRename;
     private readonly Func<string, CancellationToken, Task<IReadOnlyList<PlaceholderEntry>>>? _listDirectory;
     private readonly ServerConnection? _server;
 
@@ -59,10 +45,6 @@ public sealed class SyncRootConnection : IDisposable
     /// </summary>
     internal static readonly TimeSpan ListingTimeout = TimeSpan.FromSeconds(10);
 
-    // Full local paths of deletes, moves and renames the user made that have
-    // not reached the server yet (count per path).
-    private readonly ConcurrentDictionary<string, int> _localChangesPending =
-        new(StringComparer.OrdinalIgnoreCase);
     private readonly TimeSpan _listingReuseWindow;
     private readonly ConcurrentDictionary<string, DateTimeOffset> _lastListed = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> _listedOk = new(StringComparer.OrdinalIgnoreCase);
@@ -78,6 +60,16 @@ public sealed class SyncRootConnection : IDisposable
     private string _syncRootPath = string.Empty;
     private string _syncRootVolumeRelative = string.Empty;
 
+    /// <summary>A local delete or move out of the drive, reported on the callback thread.</summary>
+    /// <param name="remotePath">The item's server path; folders end in '/'.</param>
+    /// <param name="fileId">Its NTFS file id, to tell it from what may replace it.</param>
+    public delegate void LocalDelete(string localPath, string remotePath, long fileId, bool isDirectory);
+
+    /// <summary>A local rename or move within the drive, reported on the callback thread.</summary>
+    public delegate void LocalRename(string oldLocalPath, string newLocalPath, string remotePath, RenameSource? source);
+
+    /// <param name="localDelete">Records a delete for the next sync run; called before it is let happen.</param>
+    /// <param name="localRename">Records a rename for the next sync run; called before it is let happen.</param>
     /// <param name="listDirectory">
     /// Answers FETCH_PLACEHOLDERS: given a sync-root-relative directory ('/'
     /// separated, empty for the root), returns the remote entries that do not
@@ -96,8 +88,8 @@ public sealed class SyncRootConnection : IDisposable
         SqliteMetadataStore store,
         RcloneServeClient serve,
         Action<string>? log = null,
-        Func<string, Task>? deleteRemote = null,
-        Func<string, string, RenameSource?, Task>? renameRemote = null,
+        LocalDelete? localDelete = null,
+        LocalRename? localRename = null,
         Func<string, CancellationToken, Task<IReadOnlyList<PlaceholderEntry>>>? listDirectory = null,
         TimeSpan? listingReuseWindow = null,
         ServerConnection? server = null)
@@ -105,8 +97,8 @@ public sealed class SyncRootConnection : IDisposable
         _store = store;
         _serve = serve;
         _log = log;
-        _deleteRemote = deleteRemote;
-        _renameRemote = renameRemote;
+        _localDelete = localDelete;
+        _localRename = localRename;
         _listDirectory = listDirectory;
         _listingReuseWindow = listingReuseWindow ?? TimeSpan.FromSeconds(1);
         _server = server;
@@ -117,12 +109,6 @@ public sealed class SyncRootConnection : IDisposable
     /// <summary>Raised after a successful hydration so callers/tests can observe progress.</summary>
     public event Action<HydrationCompleted>? Hydrated;
 
-    /// <summary>Raised after a local delete was propagated to the remote.</summary>
-    public event Action<RemoteDeleted>? Deleted;
-
-    /// <summary>Raised after a local rename was propagated to the remote.</summary>
-    public event Action<RemoteRenamed>? Renamed;
-
     /// <summary>
     /// Raised on the callback thread after a directory was listed from the
     /// remote and the platform received its new entries. Handlers must not
@@ -131,10 +117,6 @@ public sealed class SyncRootConnection : IDisposable
     public event Action<string>? DirectoryListed;
 
     public sealed record HydrationCompleted(string LocalPath, string RemotePath, long Offset, long Length);
-
-    public sealed record RemoteDeleted(string LocalPath, string RemotePath);
-
-    public sealed record RemoteRenamed(string OldLocalPath, string NewLocalPath, string OldRemotePath, string NewRemotePath);
 
     /// <summary>
     /// A placeholder's state just before a rename. The platform clears
@@ -237,7 +219,7 @@ public sealed class SyncRootConnection : IDisposable
             }
 
             _log?.Invoke(
-                $"[{DateTimeOffset.Now:HH:mm:ss.fff}] FETCH_DATA '{remotePath}' offset={fetch.RequiredFileOffset} length={fetch.RequiredLength} " +
+                $"[{DateTimeOffset.Now:HH:mm:ss.fff}] FETCH_DATA '{remotePath}' for {RequesterOf(info)} offset={fetch.RequiredFileOffset} length={fetch.RequiredLength} " +
                 $"optional={fetch.OptionalFileOffset}+{fetch.OptionalLength}");
 
             var normalizedPath = Marshal.PtrToStringUni(info.NormalizedPath) ?? string.Empty;
@@ -279,7 +261,7 @@ public sealed class SyncRootConnection : IDisposable
         }
         catch (Exception ex)
         {
-            _log?.Invoke($"FETCH_DATA failed: {ex}");
+            _log?.Invoke($"[{DateTimeOffset.Now:HH:mm:ss.fff}] FETCH_DATA failed ({DescribeFile(info)}): {ex}");
             if (ServerConnection.IsUnreachable(ex))
             {
                 _server?.Failed(ex.Message);
@@ -574,6 +556,33 @@ public sealed class SyncRootConnection : IDisposable
         _listedOk.TryGetValue(directory, out var at) && DateTimeOffset.UtcNow - at < _listingReuseWindow;
 
     /// <summary>The program whose I/O raised a callback, as "name (pid)".</summary>
+    /// <summary>The file a failed callback was for, as it is on disk now, read without opening it.</summary>
+    private string DescribeFile(CF_CALLBACK_INFO info)
+    {
+        try
+        {
+            var normalized = Marshal.PtrToStringUni(info.NormalizedPath);
+            if (string.IsNullOrEmpty(normalized))
+            {
+                return "no path";
+            }
+
+            var localPath = ToLocalPath(normalized);
+            if (!File.Exists(localPath))
+            {
+                return $"'{localPath}' is not on disk";
+            }
+
+            var state = _placeholders.QueryState(localPath);
+            return $"file id {info.FileId}, on disk id {state.FileId}, placeholder={state.IsPlaceholder}, " +
+                   $"in sync={state.InSync}, partial={state.Partial}, attributes=0x{(int)File.GetAttributes(localPath):X}";
+        }
+        catch (Exception ex)
+        {
+            return $"state unknown: {ex.Message}";
+        }
+    }
+
     private static string RequesterOf(CF_CALLBACK_INFO info)
     {
         if (info.ProcessInfo == IntPtr.Zero)
@@ -730,7 +739,8 @@ public sealed class SyncRootConnection : IDisposable
     }
 
     /// <summary>IsHydrating for the path itself or anything under it.</summary>
-    private bool IsHydratingUnder(string localPath)
+    /// <summary>A download is on its way for the item or anything below it.</summary>
+    public bool IsHydratingUnder(string localPath)
     {
         var prefix = localPath.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         return IsHydrating(localPath) || _hydratingPaths.Keys.Any(path =>
@@ -779,8 +789,8 @@ public sealed class SyncRootConnection : IDisposable
     /// NOTIFY_DELETE and NOTIFY_RENAME arrive *before* the operation, and the
     /// platform holds the delete/rename until the provider acknowledges it
     /// (ACK_DELETE / ACK_RENAME). Without the acknowledgement the user's
-    /// delete or rename simply hangs. Both are always allowed; the remote
-    /// side is updated afterwards, off the callback thread.
+    /// delete or rename simply hangs. Both are always allowed; the server is
+    /// told by the next sync run.
     /// </summary>
     private static void Acknowledge(CF_CALLBACK_INFO info, CF_OPERATION_TYPE type)
     {
@@ -820,28 +830,21 @@ public sealed class SyncRootConnection : IDisposable
         return volume + normalized;
     }
 
+    /// <summary>
+    /// A delete, recorded for the next sync run before the acknowledgement
+    /// lets it happen: from then until it reaches the server, listings leave
+    /// the item alone. Whether it really went (a delete may be part of
+    /// replacing the file, or fail) is the run's to read from the drive.
+    /// </summary>
     private void OnNotifyDelete(IntPtr callbackInfoPtr, IntPtr callbackParametersPtr)
     {
         CF_CALLBACK_INFO info = default;
-        string? pending = null;
         try
         {
             info = Marshal.PtrToStructure<CF_CALLBACK_INFO>(callbackInfoPtr);
             var parameters = Marshal.PtrToStructure<CF_CALLBACK_PARAMETERS>(callbackParametersPtr);
             var normalized = Marshal.PtrToStringUni(info.NormalizedPath) ?? string.Empty;
-            var undelete = (parameters.DeleteFlags & CF_CALLBACK_DELETE_FLAGS.CF_CALLBACK_DELETE_FLAG_IS_UNDELETE) != 0;
-
-            // Marked before the acknowledgement lets the delete happen: until
-            // it reaches the server, a listing must not hand the item out again.
-            if (!undelete)
-            {
-                pending = ToLocalPath(normalized);
-                MarkLocalChange(pending);
-            }
-
-            Acknowledge(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_DELETE);
-
-            if (undelete)
+            if ((parameters.DeleteFlags & CF_CALLBACK_DELETE_FLAGS.CF_CALLBACK_DELETE_FLAG_IS_UNDELETE) != 0)
             {
                 _log?.Invoke($"NOTIFY_DELETE (undelete ignored) '{normalized}'");
                 return;
@@ -855,9 +858,8 @@ public sealed class SyncRootConnection : IDisposable
                 return;
             }
 
-            _log?.Invoke($"NOTIFY_DELETE '{remotePath}' -> deleting remote object once it is gone.");
-            PropagateDelete(normalized, remotePath, pending!, info.FileId);
-            pending = null; // PropagateDelete clears the mark when it is done
+            _log?.Invoke($"NOTIFY_DELETE '{remotePath}' -> sent to the server with the next sync run.");
+            _localDelete?.Invoke(ToLocalPath(normalized), remotePath, info.FileId, isDirectory);
         }
         catch (Exception ex)
         {
@@ -865,97 +867,20 @@ public sealed class SyncRootConnection : IDisposable
         }
         finally
         {
-            if (pending is not null)
-            {
-                UnmarkLocalChange(pending);
-            }
-        }
-    }
-
-    private void MarkLocalChange(string localPath) =>
-        _localChangesPending.AddOrUpdate(localPath, 1, (_, count) => count + 1);
-
-    private void UnmarkLocalChange(string localPath)
-    {
-        while (_localChangesPending.TryGetValue(localPath, out var count))
-        {
-            var done = count <= 1
-                ? _localChangesPending.TryRemove(new KeyValuePair<string, int>(localPath, count))
-                : _localChangesPending.TryUpdate(localPath, count - 1, count);
-            if (done)
-            {
-                return;
-            }
+            AcknowledgeAlways(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_DELETE);
         }
     }
 
     /// <summary>
-    /// True while a delete, move or rename the user made of the item at
-    /// <paramref name="localPath"/>, or of a folder above it, has not reached
-    /// the server yet. A listing must not hand such an item out again: the
-    /// server still has it, but only because it has not been told yet.
+    /// A rename or move, recorded for the next sync run before the
+    /// acknowledgement lets it happen, with the item's state from before it.
+    /// A move out of the drive (the Recycle Bin, another folder) is a delete
+    /// for the server, not a move to some outside path; Windows downloads the
+    /// item's data to take along first, which the run waits for.
     /// </summary>
-    public bool IsLocalChangePending(string localPath)
-    {
-        foreach (var path in _localChangesPending.Keys)
-        {
-            if (string.Equals(path, localPath, StringComparison.OrdinalIgnoreCase) ||
-                localPath.StartsWith(path + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Deletes the server copy once the item has really gone. Both
-    /// notifications arrive before the operation: a move out of the drive is
-    /// announced before Windows downloads the item's data to take along, and
-    /// a delete may be part of replacing the file (an editor saving through a
-    /// temp file), or may not happen at all.
-    /// </summary>
-    /// <param name="fullPath">The item's full local path.</param>
-    /// <param name="fileId">Its NTFS file id, to tell it from a replacement.</param>
-    private void PropagateDelete(string localPath, string remotePath, string fullPath, long fileId)
-    {
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                switch (await WaitUntilGoneAsync(fullPath, fileId).ConfigureAwait(false))
-                {
-                    case ItemFate.Replaced:
-                        _log?.Invoke($"'{remotePath}' was replaced by a new item; its upload updates the server copy.");
-                        return;
-                    case ItemFate.Stayed:
-                        _log?.Invoke($"'{remotePath}' never left the drive; the server copy is kept.");
-                        return;
-                }
-
-                if (_deleteRemote is not null)
-                {
-                    await _deleteRemote(remotePath).ConfigureAwait(false);
-                }
-
-                Deleted?.Invoke(new RemoteDeleted(localPath, remotePath));
-            }
-            catch (Exception ex)
-            {
-                _log?.Invoke($"Delete propagation failed for '{remotePath}': {ex.Message}");
-            }
-            finally
-            {
-                UnmarkLocalChange(fullPath);
-            }
-        });
-    }
-
     private void OnNotifyRename(IntPtr callbackInfoPtr, IntPtr callbackParametersPtr)
     {
         CF_CALLBACK_INFO info = default;
-        string? pending = null;
         try
         {
             info = Marshal.PtrToStructure<CF_CALLBACK_INFO>(callbackInfoPtr);
@@ -966,14 +891,6 @@ public sealed class SyncRootConnection : IDisposable
                 ? string.Empty
                 : ToLocalPath(Marshal.PtrToStringUni(parameters.RenameTargetPath) ?? string.Empty);
 
-            // Both read or set before the acknowledgement lets the rename
-            // happen: the item's state, and the mark that keeps listings from
-            // handing it out again under its old name meanwhile.
-            var source = SnapshotRenameSource(sourceFull);
-            pending = sourceFull;
-            MarkLocalChange(pending);
-            Acknowledge(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_RENAME);
-
             var isDirectory = (parameters.RenameFlags & CF_CALLBACK_RENAME_FLAGS.CF_CALLBACK_RENAME_FLAG_IS_DIRECTORY) != 0;
             var remotePath = ResolveRemotePath(info) ?? RelativeRemotePath(sourceLocal, isDirectory);
             if (remotePath is null)
@@ -982,41 +899,16 @@ public sealed class SyncRootConnection : IDisposable
                 return;
             }
 
-            // Moved out of the drive (the Recycle Bin, another folder): for
-            // the server that is a delete, not a move to some outside path.
             if ((parameters.RenameFlags & CF_CALLBACK_RENAME_FLAGS.CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE) == 0 ||
                 string.IsNullOrEmpty(targetLocal))
             {
-                _log?.Invoke($"NOTIFY_RENAME '{remotePath}' moved out of the sync root -> deleting remote object once it has left.");
-                PropagateDelete(sourceLocal, remotePath, sourceFull, info.FileId);
-                pending = null; // PropagateDelete clears the mark when it is done
+                _log?.Invoke($"NOTIFY_RENAME '{remotePath}' moved out of the sync root -> deleted on the server with the next sync run.");
+                _localDelete?.Invoke(sourceFull, remotePath, info.FileId, isDirectory);
                 return;
             }
 
             _log?.Invoke($"NOTIFY_RENAME '{remotePath}' -> '{targetLocal}'.");
-
-            var renaming = pending;
-            pending = null; // cleared below once the rename has reached the server
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    if (_renameRemote is not null)
-                    {
-                        await _renameRemote(remotePath, targetLocal, source).ConfigureAwait(false);
-                    }
-
-                    Renamed?.Invoke(new RemoteRenamed(sourceLocal, targetLocal, remotePath, remotePath));
-                }
-                catch (Exception ex)
-                {
-                    _log?.Invoke($"NOTIFY_RENAME propagation failed for '{remotePath}': {ex.Message}");
-                }
-                finally
-                {
-                    UnmarkLocalChange(renaming);
-                }
-            });
+            _localRename?.Invoke(sourceFull, targetLocal, remotePath, SnapshotRenameSource(sourceFull));
         }
         catch (Exception ex)
         {
@@ -1024,57 +916,20 @@ public sealed class SyncRootConnection : IDisposable
         }
         finally
         {
-            if (pending is not null)
-            {
-                UnmarkLocalChange(pending);
-            }
+            AcknowledgeAlways(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_RENAME);
         }
     }
 
-    private enum ItemFate { Gone, Replaced, Stayed }
-
-    /// <summary>
-    /// Waits until the item with <paramref name="fileId"/> is no longer at
-    /// <paramref name="fullPath"/>: gone (the path stayed empty for
-    /// ReplaceGrace), or replaced by a different item. Stayed means it is
-    /// still there LeaveTimeout after its last download (the operation
-    /// failed or was cancelled).
-    /// </summary>
-    private async Task<ItemFate> WaitUntilGoneAsync(string fullPath, long fileId)
+    /// <summary>Unacknowledged, the user's delete or rename would hang.</summary>
+    private void AcknowledgeAlways(CF_CALLBACK_INFO info, CF_OPERATION_TYPE type)
     {
-        var deadline = DateTimeOffset.UtcNow + LeaveTimeout;
-        DateTimeOffset? emptySince = null;
-        while (true)
+        try
         {
-            var state = _placeholders.QueryState(fullPath);
-            if (!state.Exists)
-            {
-                emptySince ??= DateTimeOffset.UtcNow;
-                if (DateTimeOffset.UtcNow - emptySince >= ReplaceGrace)
-                {
-                    return ItemFate.Gone;
-                }
-
-                await Task.Delay(100).ConfigureAwait(false);
-                continue;
-            }
-
-            if (fileId != 0 && state.FileId != 0 && state.FileId != fileId)
-            {
-                return ItemFate.Replaced;
-            }
-
-            emptySince = null;
-            if (IsHydratingUnder(fullPath))
-            {
-                deadline = DateTimeOffset.UtcNow + LeaveTimeout;
-            }
-            else if (DateTimeOffset.UtcNow > deadline)
-            {
-                return ItemFate.Stayed;
-            }
-
-            await Task.Delay(100).ConfigureAwait(false);
+            Acknowledge(info, type);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"{type} failed: {ex.Message}");
         }
     }
 

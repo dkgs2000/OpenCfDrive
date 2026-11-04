@@ -471,7 +471,7 @@ public sealed class CloudPlaceholderService
     /// <param name="fileSize">
     /// The file's size as uploaded. The platform keeps its own record of a
     /// placeholder's size, which writes do not change; without the new one,
-    /// an edit that changed the size is downloaded to the old size after Free
+    /// a file an edit made bigger is downloaded to the old size after Free
     /// up space (the rest reads as zeros). Nextcloud's updatePlaceholderInfo
     /// passes it on every upload too.
     /// </param>
