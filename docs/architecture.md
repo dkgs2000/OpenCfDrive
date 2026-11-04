@@ -55,8 +55,12 @@ folder on demand.
 
 - The remote is the source of truth, read one folder at a time, the first
   time each folder is opened. Nothing is crawled.
-- A folder once listed stays fully populated, and the background sync keeps it
-  current: every 30 s, right after the server is back, and on request.
+- A folder once listed stays fully populated until the poll interval passes.
+  The background sync keeps it current: a folder that holds anything local is
+  listed every run; an online-only folder (nothing downloaded or kept in it)
+  is not re-listed - it is left for the next time it is opened, and once it is
+  older than the poll interval it is marked for on-demand population again.
+  Sync runs happen at start, right after the server is back, and on request.
 - Local changes are recorded from the Cloud Files notifications and a file
   watcher, and sent to the server in one plan per sync run, which starts a
   second after the last change.
@@ -96,10 +100,11 @@ The invariants below spell out how.
   is back, and one on the service's `sync` control request. A run first sends
   the deletes and renames kept from an offline spell, then lists the listed
   folders (the platform keeps that state on disk) one at a time, parents
-  first, never recursively, creates placeholders (`CfCreatePlaceholders`) for
-  what the server added, and applies its changes and deletes. Folders never
-  opened are not listed until they are. The client never relies on server
-  notifications.
+  first, never recursively. A folder that holds nothing local is online-only:
+  it is not listed every run; once it is older than the poll interval it is
+  given on-demand population again, and Windows lists it from the server when
+  it is next opened. Folders never opened are not listed until they are. The
+  client never relies on server notifications.
 - **Fetch from the remote, fall back to the cache.** A listing that fails, or
   gets no answer within 10 s (offline usually means rclone is up but keeps
   retrying an unreachable server), is answered with nothing new and no server
@@ -398,12 +403,24 @@ move exist on only some remotes, so they aren't used either.
   CloudMirror behaves the same way. Edits to them are still uploaded by the
   watcher.
 - Files added, changed or deleted on the remote show up in folders already
-  opened within 30 s (the next background sync run), as with Nextcloud.
-  Refreshing Explorer (F5) doesn't ask the server sooner. Folders never opened
-  are listed when they are, and are empty while the server can't be reached.
+  opened within 30 s (the next background sync run), as with Nextcloud - but
+  only for folders that hold something local, which the sync lists every run.
+  A purely online-only folder picks up server changes when it is next opened
+  after the relist age (the poll interval; `OPENCFDRIVE_RELIST_SECONDS`
+  overrides it): a sync run then marks it, and its next opening, F5 included,
+  lists it. Before that, F5 doesn't ask the server sooner. Requests from
+  Windows Search for a folder listed before are answered from disk, so the
+  indexer never brings the per-folder listings back. Folders never opened are
+  listed when they are, and are empty while the server can't be reached.
 - The background sync lists every folder that was ever opened, one at a time,
-  every 30 s. On remotes that count requests (cloud APIs with quotas), many
-  opened folders mean many listings.
+  every 30 s - but only while the folder holds something local (a downloaded,
+  kept or edited file, a pinned folder, or the root). A folder holding only
+  online-only placeholders is not re-listed; it is marked for on-demand
+  population once the relist age passes, and listed from the server when
+  opened. Which folders hold something local is worked out once per run, in
+  one pass over the store with one attribute lookup per file (no handle
+  opened). On remotes that count requests (cloud APIs with quotas), many
+  opened folders no longer mean many listings every 30 s.
 - Offline, a file that was never downloaded can't be opened; only downloaded
   files (and ones kept with "Always keep on this device") are readable. Edits,
   new folders, deletes and renames made offline are sent once the server

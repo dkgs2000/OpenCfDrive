@@ -57,6 +57,7 @@ public sealed class SqliteMetadataStore
                 LocalSize INTEGER,
                 LocalWriteUtc INTEGER,
                 Hash TEXT,
+                Listed INTEGER NOT NULL DEFAULT 0,
                 CreatedUtc TEXT NOT NULL DEFAULT (datetime('now'))
             );
         ";
@@ -71,6 +72,7 @@ public sealed class SqliteMetadataStore
         EnsureColumn(connection, "LocalSize", "INTEGER");
         EnsureColumn(connection, "LocalWriteUtc", "INTEGER");
         EnsureColumn(connection, "Hash", "TEXT");
+        EnsureColumn(connection, "Listed", "INTEGER NOT NULL DEFAULT 0");
 
         // Legacy builds stored a GUID string in FileId; normalise before indexing.
         using (var normalise = connection.CreateCommand())
@@ -250,6 +252,31 @@ public sealed class SqliteMetadataStore
         command.CommandText = "UPDATE Files SET IsHydrated = 0 WHERE RemotePath = @remotePath;";
         command.Parameters.AddWithValue("@remotePath", remotePath);
         command.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// A folder was listed from the server. Kept with its row (moved with it
+    /// by a rename, gone with it): a folder listed before, empty ones
+    /// included, is answered from disk when it cannot be listed now.
+    /// </summary>
+    /// <param name="directory">Its server path ('/' separated, with or without the trailing '/').</param>
+    public void MarkListed(string directory)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE Files SET Listed = 1 WHERE RemotePath = @remotePath AND IsDirectory = 1;";
+        command.Parameters.AddWithValue("@remotePath", directory.TrimEnd('/') + "/");
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>Whether <see cref="MarkListed"/> was done for this folder.</summary>
+    public bool WasListed(string directory)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1 FROM Files WHERE RemotePath = @remotePath AND IsDirectory = 1 AND Listed = 1;";
+        command.Parameters.AddWithValue("@remotePath", directory.TrimEnd('/') + "/");
+        return command.ExecuteScalar() is not null;
     }
 
     public void MarkInSync(string remotePath, long size)

@@ -266,6 +266,14 @@ public class LocalChangePlannerTests
         Assert.Equal(4, recorded);
         Assert.Equal(3, changes.Pending().Count);
 
+        // What a run's end asks before it clears a file's sync state: besides
+        // the change it sent, does one still wait? The edit made meanwhile does;
+        // a file with no other change does not.
+        var sent = taken.Where(c => c.Kind == LocalChangeKind.Changed).ToList();
+        Assert.True(changes.HasChangeFor(Local("edited.txt"), sent));
+        Assert.False(changes.HasChangeFor(Local("gone.txt"), taken));
+        Assert.True(changes.HasChangeFor(Local("gone.txt"), sent));
+
         // Edited again while a run sends it: that run's end leaves the new one.
         changes.Complete(taken.Where(c => c.Kind == LocalChangeKind.Changed));
         Assert.Contains(changes.Pending(), c => c.Kind == LocalChangeKind.Changed && LocalChanges.Same(c.LocalPath, Local("edited.txt")));

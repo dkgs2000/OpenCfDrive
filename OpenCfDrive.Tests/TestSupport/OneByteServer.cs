@@ -7,14 +7,21 @@ namespace OpenCfDrive.Tests.TestSupport;
 
 /// <summary>
 /// Answers every GET with the one byte "z" (or, failing, with a 500), once
-/// <c>beforeAnswer</c> is done.
+/// <c>beforeAnswer</c> is done. A <paramref name="body"/> is sent instead,
+/// optionally a <paramref name="chunkSize"/> at a time with a
+/// <paramref name="pause"/> between pieces, for slow large downloads.
 /// </summary>
 internal sealed class OneByteServer : IDisposable
 {
     private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
     private readonly CancellationTokenSource _stop = new();
 
-    public OneByteServer(Func<Task> beforeAnswer, bool fail = false)
+    public OneByteServer(
+        Func<Task> beforeAnswer,
+        bool fail = false,
+        byte[]? body = null,
+        int chunkSize = 0,
+        TimeSpan? pause = null)
     {
         _listener.Start();
         Url = $"http://127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}";
@@ -39,10 +46,23 @@ internal sealed class OneByteServer : IDisposable
 
                 Requests.Enqueue(request.ToString().Split("\r\n")[0]);
                 await beforeAnswer();
-                var answer = fail
-                    ? "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"u8.ToArray()
-                    : "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nz"u8.ToArray();
-                await stream.WriteAsync(answer, _stop.Token);
+
+                var content = fail ? Array.Empty<byte>() : body ?? "z"u8.ToArray();
+                var header = Encoding.ASCII.GetBytes(
+                    $"HTTP/1.1 {(fail ? "500 Internal Server Error" : "200 OK")}\r\n" +
+                    $"Content-Length: {content.Length}\r\nConnection: close\r\n\r\n");
+                await stream.WriteAsync(header, _stop.Token);
+
+                var size = chunkSize > 0 ? chunkSize : content.Length;
+                for (var offset = 0; !fail && offset < content.Length; offset += size)
+                {
+                    var count = Math.Min(size, content.Length - offset);
+                    await stream.WriteAsync(content.AsMemory(offset, count), _stop.Token);
+                    if (pause is { } wait)
+                    {
+                        await Task.Delay(wait, _stop.Token);
+                    }
+                }
             }
         });
     }

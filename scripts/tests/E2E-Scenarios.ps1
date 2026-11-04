@@ -249,6 +249,61 @@ function Get-ServerHeads([long]$From, [string]$Under) {
     return @($text -split "`r?`n" | Where-Object { $_ -match "DEBUG : HEAD /\S*$([regex]::Escape($Under))" })
 }
 
+# operations/list calls in an rclone log slice whose remote path ends with
+# $Under (for example "s29-dir"). It matches both "e2e:" style remotes
+# (remote = "s29-dir") and bucketed ones (remote = "opencfdrive/s29-dir").
+# A scenario uses it to prove a folder was - or was not - listed by a sync run.
+function Get-RcloneListings([long]$From, [string]$Under) {
+    $text = Read-LogSlice $script:E2ERcloneLog $From (Get-LogLength $script:E2ERcloneLog)
+    # rclone logs the parameters as a Go map, the remote last:
+    #   map[fs:e2e: opt:map[...] remote:opencfdrive/s29-dir]
+    $pattern = 'rc: "operations/list": with parameters map\[.*\sremote:(?:\S*/)?' + [regex]::Escape($Under) + '\]'
+    return @($text -split "`r?`n" | Where-Object { $_ -match $pattern })
+}
+
+# The sync state the shell reports for an item (System.StorageProviderCustomStates),
+# as text, so a scenario can assert a state such as "Waiting to upload" or
+# "Conflict copy" is shown or cleared. Returns "" when the shell cannot be asked.
+# A file that came from the server has nothing to send, so no sync state may
+# have been shown for it. The run that follows a change has dropped the
+# client's own writes by the time Sync-Remote answers; the service logs every
+# state it applies ("Explorer state for '<path>': <state>.").
+function Assert-NoStateShown([string]$Relative) {
+    Sync-Remote
+    $name = [regex]::Escape((Get-LocalPath $Relative))
+    $shown = @((Read-LogText $script:E2EServiceLog) -split "`r?`n" | Where-Object { $_ -match "Explorer state for '$name': " })
+    if ($shown.Count -gt 0) { throw "$Relative came from the server, yet a sync state was shown for it: $($shown -join ' | ')" }
+}
+
+function Get-ShellState([string]$Relative) {
+    $path = Get-LocalPath $Relative
+    $parent = (Split-Path -Parent $path).Replace("'", "''")
+    $name = (Split-Path -Leaf $path).Replace("'", "''")
+    try {
+        # Query from a fresh Shell.Application process. The in-process COM
+        # object can cache the old property value while the provider's async
+        # item-property writer is updating it.
+        $command = "`$i = (New-Object -ComObject Shell.Application).Namespace('$parent').ParseName('$name'); " +
+            "`$v = `$i.ExtendedProperty('System.StorageProviderCustomStates'); " +
+            "if (`$null -eq `$v) { '' } elseif (`$v -is [byte[]]) { [Text.Encoding]::Unicode.GetString([byte[]]`$v) } elseif (`$v -is [string]) { [string]`$v } elseif (`$v -is [array]) { ((@(`$v) | ForEach-Object { if (`$null -ne `$_.Value) { [string]`$_.Value } else { [string]`$_ } }) -join ' ') } elseif (`$null -ne `$v.Value) { [string]`$v.Value } else { [string]`$v }"
+        $start = New-Object System.Diagnostics.ProcessStartInfo
+        $start.FileName = 'powershell.exe'
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $start.ArgumentList.Add('-NoProfile')
+        $start.ArgumentList.Add('-Command')
+        $start.ArgumentList.Add($command)
+        $process = [System.Diagnostics.Process]::Start($start)
+        $output = $process.StandardOutput.ReadToEnd()
+        $process.WaitForExit()
+        return $output.Trim()
+    } catch {
+        return ""
+    }
+}
+
 function Assert-RemoteMissing([string]$Path) {
     Wait-Remote { -not (Test-RemoteItem $Path) } "Server still has '$Path'."
 }
@@ -410,6 +465,7 @@ function Get-E2EScenarios {
             Set-RemoteFile "s01.txt" "s01"
             Wait-Local "" { Test-Local "s01.txt" } "s01.txt did not appear locally."
             Assert-Local "s01.txt" "s01"
+            Assert-NoStateShown "s01.txt"
         }
         New-E2EScenario "S02" "server adds a file in an existing folder" -Budget @{ DownloadBytes = 3 } -CloudOnly {
             Set-RemoteFile "docs/s02.txt" "s02"
@@ -430,6 +486,7 @@ function Get-E2EScenarios {
             Set-RemoteFile "s04.txt" "s04-version-two"
             Wait-Local "" { (Get-LocalLength "s04.txt") -eq 15 } "s04.txt did not get the server's new size."
             Assert-Local "s04.txt" "s04-version-two"
+            Assert-NoStateShown "s04.txt"
         }
         New-E2EScenario "S05" "server updates a file that was never opened" -Budget @{ DownloadBytes = 15 } -CloudOnly {
             Set-RemoteFile "s05.txt" "s05-v1"
@@ -650,11 +707,15 @@ function Get-E2EScenarios {
         # A folder Windows has listed stays fully populated: Explorer shows it
         # as available, not with the cloud icon, and the background sync
         # keeps it current.
-        New-E2EScenario "S22" "a folder once listed shows as available, not online-only, and gets what the server adds" -CloudOnly {
+        New-E2EScenario "S22" "a folder once listed shows as available, not online-only, and gets what the server adds" -Budget @{ DownloadBytes = 3 } -CloudOnly {
             Set-RemoteFile "s22-dir/f.txt" "s22"
             Wait-Local "" { Test-Local "s22-dir" } "s22-dir did not appear locally."
             if (-not (Test-OnlineOnlyFolder "s22-dir")) { throw "s22-dir shows as available before it was ever listed." }
             Wait-Local "s22-dir" { Test-Local "s22-dir/f.txt" } "s22-dir\f.txt did not appear locally."
+            # Keep one file locally so this folder exercises the local-folder
+            # polling path; online-only folders are intentionally refreshed only
+            # when they are opened again after the poll interval.
+            Assert-Local "s22-dir/f.txt" "s22"
             if (Test-OnlineOnlyFolder "s22-dir") { throw "s22-dir still shows as online-only after it was listed." }
             Set-RemoteFile "s22-dir/g.txt" "g"
             Wait-Local "s22-dir" { Test-Local "s22-dir/g.txt" } "s22-dir\g.txt, added on the server later, did not appear."
@@ -735,16 +796,178 @@ function Get-E2EScenarios {
         # On S3 a listing with times costs one request per file (a HEAD).
         # A folder listed before is listed without them: its unchanged files
         # are told by their MD5, so a sync run asks none of them anything.
-        New-E2EScenario "S28" "a sync run of a folder listed before asks no unchanged file for its time" -CloudOnly {
+        New-E2EScenario "S28" "a sync run of a folder listed before asks no unchanged file for its time" -Budget @{ DownloadBytes = 1 } -CloudOnly {
             Set-RemoteFile "s28-dir/a.txt" "a"
             Set-RemoteFile "s28-dir/b.txt" "b"
             Set-RemoteFile "s28-dir/c.txt" "c"
             Wait-Local "" { Test-Local "s28-dir" } "s28-dir did not appear locally."
             Wait-Local "s28-dir" { (Test-Local "s28-dir/a.txt") -and (Test-Local "s28-dir/b.txt") -and (Test-Local "s28-dir/c.txt") } "s28-dir's files did not appear locally."
+            # Download one file: a folder holding anything local is listed
+            # every sync run, so this exercises the listed-folder path rather
+            # than the online-only one.
+            Assert-Local "s28-dir/a.txt" "a"
             $from = Get-LogLength $script:E2ERcloneLog
             Sync-Remote
             $heads = @(Get-ServerHeads $from "s28-dir/")
             if ($heads.Count -gt 0) { throw "The sync run asked $($heads.Count) unchanged file(s) of s28-dir for their time: $($heads -join ' | ')" }
+        }
+
+        # A folder nobody ever opened stays online-only: no sync run lists it,
+        # and opening it for the first time lists it from the server.
+        New-E2EScenario "S29" "a folder never opened is not listed by sync runs, then listed when it is opened" -Budget @{ DownloadBytes = 3 } -CloudOnly {
+            Set-RemoteFile "s29-dir/f.txt" "s29"
+            # Do not probe the directory with Test-Path/Get-Item before the
+            # listing check: Cloud Files may interpret that probe as opening
+            # the folder. The root is listed by each sync, but an online-only
+            # child is intentionally not listed by those runs.
+            $from = Get-LogLength $script:E2ERcloneLog
+            Sync-Remote
+            Sync-Remote
+            $listings = @(Get-RcloneListings $from "s29-dir")
+            if ($listings.Count -gt 0) { throw "A sync run listed $($listings.Count) time(s) the never-opened s29-dir: $($listings -join ' | ')" }
+            # This is the first operation directed at the child folder and is
+            # the equivalent of opening it in Explorer.
+            Update-LocalFolder "s29-dir"
+            Wait-Local "s29-dir" { Test-Local "s29-dir/f.txt" } "s29-dir\f.txt did not appear when s29-dir was opened."
+            Assert-Local "s29-dir/f.txt" "s29"
+        }
+
+        # A folder holding a downloaded file is listed every run, so a server
+        # change reaches it without waiting for the folder to be opened again.
+        New-E2EScenario "S30" "a downloaded-file folder still gets a server change from a sync run" -Budget @{ DownloadBytes = 9 } -CloudOnly {
+            Set-RemoteFile "s30-dir/f.txt" "s30"
+            Wait-Local "" { Test-Local "s30-dir" } "s30-dir did not appear locally."
+            Wait-Local "s30-dir" { Test-Local "s30-dir/f.txt" } "s30-dir\f.txt did not appear locally."
+            Assert-Local "s30-dir/f.txt" "s30"
+            Set-RemoteFile "s30-dir/f.txt" "s30-v2"
+            $from = Get-LogLength $script:E2ERcloneLog
+            Sync-Remote
+            Assert-Local "s30-dir/f.txt" "s30-v2"
+        }
+
+        # Offline, a folder listed before shows its local files at once and a
+        # new file made there reaches the server once it answers.
+        New-E2EScenario "S31" "offline: a listed folder opens with its files and a new file made there is uploaded" -Budget @{ DownloadBytes = 3; Uploads = 1 } -CloudOnly {
+            Set-RemoteFile "s31-dir/f.txt" "s31"
+            Wait-Local "" { Test-Local "s31-dir" } "s31-dir did not appear locally."
+            Wait-Local "s31-dir" { Test-Local "s31-dir/f.txt" } "s31-dir\f.txt did not appear locally."
+            Assert-Local "s31-dir/f.txt" "s31"
+
+            Suspend-E2EBackend
+            try {
+                # Make the client observe the outage before creating the file;
+                # otherwise the first sync can still upload it before the
+                # connection monitor has switched to offline mode.
+                Sync-Remote -TimeoutSeconds 60
+                $clock = [System.Diagnostics.Stopwatch]::StartNew()
+                Update-LocalFolder "s31-dir"
+                $offlineMs = $clock.ElapsedMilliseconds
+                if (-not (Test-Local "s31-dir/f.txt")) { throw "Offline, s31-dir\f.txt is gone." }
+                Write-Local "s31-dir/offline.txt" "offline"
+                $kept = Wait-ForCondition {
+                    (Read-LogText $script:E2EServiceLog).Contains("Offline: 's31-dir/offline.txt' is uploaded once the server answers.")
+                } -TimeoutSeconds 30 -PollMilliseconds 200
+                if (-not $kept) { throw "The offline file was not kept for the server." }
+                Write-E2ELog "  offline listing of s31-dir took $offlineMs ms"
+            } finally {
+                Resume-E2EBackend
+            }
+            Sync-Remote
+            Wait-Remote { (Get-RemoteFile "s31-dir/offline.txt") -eq "offline" } "The offline file did not reach the server."
+            Assert-Local "s31-dir/offline.txt" "offline"
+        }
+
+        # A folder opened once is not re-listed on every sync run (a run may
+        # mark it to be listed when next opened), and keeps its files.
+        New-E2EScenario "S32" "a folder opened once is not re-listed by sync runs and keeps its files" -Budget @{ DownloadBytes = 3 } -CloudOnly {
+            Set-RemoteFile "s32-dir/f.txt" "s32"
+            Wait-Local "" { Test-Local "s32-dir" } "s32-dir did not appear locally."
+            Wait-Local "s32-dir" { Test-Local "s32-dir/f.txt" } "s32-dir\f.txt did not appear locally."
+            $from = Get-LogLength $script:E2ERcloneLog
+            Sync-Remote
+            Sync-Remote
+            $listings = @(Get-RcloneListings $from "s32-dir")
+            if ($listings.Count -gt 0) { throw "After being opened, s32-dir was listed $($listings.Count) time(s) by sync runs: $($listings -join ' | ')" }
+            if (-not (Test-Local "s32-dir/f.txt")) { throw "s32-dir\f.txt is gone although s32-dir stays populated." }
+        }
+
+        # An offline edit is shown as "Waiting to upload" until it reaches the
+        # server, then the state is cleared. Sync root state is a custom item
+        # property the shell reports (Change 3).
+        New-E2EScenario "S33" "offline: an edit shows 'waiting to upload' until uploaded, then clears" -Budget @{ DownloadBytes = 3; Uploads = 1 } -CloudOnly {
+            Set-RemoteFile "s33.txt" "s33"
+            Wait-Local "" { Test-Local "s33.txt" } "s33.txt did not appear locally."
+            Assert-Local "s33.txt" "s33"
+
+            Suspend-E2EBackend
+            try {
+                # Establish offline mode before the edit so it cannot race with
+                # the final online upload and skip the waiting state.
+                Sync-Remote -TimeoutSeconds 60
+                [System.IO.File]::AppendAllText((Get-LocalPath "s33.txt"), "-edited")
+                # The state is written on a background thread, so poll for it.
+                $marked = Wait-ForCondition {
+                    # The service log records the successful item-property
+                    # write; the contract test separately reads the same
+                    # property through Shell.Application. Explorer's COM
+                    # property cache is not reliable while the provider is
+                    # offline, so do not make this timing check depend on it.
+                    (Read-LogText $script:E2EServiceLog) -match "Explorer state for .*\\s33\.txt': Waiting to upload\."
+                } -TimeoutSeconds 30 -PollMilliseconds 200
+                if (-not $marked) { throw "s33.txt is not marked 'waiting to upload' while its edit is offline." }
+            } finally {
+                Resume-E2EBackend
+            }
+            Sync-Remote
+            $cleared = Wait-ForCondition {
+                (Read-LogText $script:E2EServiceLog) -match "Cleared Explorer state for .*\\s33\.txt'."
+            } -TimeoutSeconds 30 -PollMilliseconds 200
+            if (-not $cleared) { throw "s33.txt is still 'waiting to upload' after its edit was uploaded." }
+            Wait-Remote { (Get-RemoteFile "s33.txt") -eq "s33-edited" } "The offline edit did not reach the server."
+            Assert-Local "s33.txt" "s33-edited"
+        }
+
+        # A conflict copy is marked "Conflict copy" in the shell. The server's
+        # version keeps the name; this PC's edit is kept beside it and uploaded.
+        New-E2EScenario "S34" "a conflict copy is marked 'conflict copy'" -Budget (Get-Budget @{ DownloadBytes = 15; Uploads = 1 } -HashesLocal) -CloudOnly {
+            Set-RemoteFile "s34.txt" "s34-server-v1"
+            Wait-Local "" { Test-Local "s34.txt" } "s34.txt did not appear locally."
+            Assert-Local "s34.txt" "s34-server-v1"
+            Write-Local "s34.txt" "s34-local-edit"
+            Set-RemoteFile "s34.txt" "s34-server-v2"
+            Sync-Remote
+            $copy = Get-ConflictCopy "" "s34"
+            # The state is written on a background thread. Use the successful
+            # provider write in the service log here; the shell contract test
+            # verifies the serialized Explorer property. It stays after the
+            # copy is uploaded, until the copy is renamed or deleted.
+            $copyName = [regex]::Escape($copy)
+            $marked = Wait-ForCondition {
+                (Read-LogText $script:E2EServiceLog) -match "Explorer state for .*\\$copyName': Conflict copy\."
+            } -TimeoutSeconds 10 -PollMilliseconds 100
+            if (-not $marked) { throw "The conflict copy $copy is not marked 'conflict copy' in the provider." }
+            Assert-Local $copy "s34-local-edit"
+            Assert-RemoteText "s34.txt" "s34-server-v2"
+        }
+
+        # A folder holding nothing local is not listed by sync runs: a run
+        # marks it to be listed when it is next opened, and opening it shows
+        # what changed on the server meanwhile.
+        New-E2EScenario "S35" "an online-only folder is marked by a sync run, and opening it shows the server's change" -Budget @{ DownloadBytes = 15 } -CloudOnly {
+            Set-RemoteFile "s35-dir/f.txt" "s35-v1"
+            Wait-Local "" { Test-Local "s35-dir" } "s35-dir did not appear locally."
+            Wait-Local "s35-dir" { Test-Local "s35-dir/f.txt" } "s35-dir\f.txt did not appear locally."
+            Set-RemoteFile "s35-dir/f.txt" "s35-version-two"
+            $from = Get-LogLength $script:E2ERcloneLog
+            Sync-Remote
+            $listings = @(Get-RcloneListings $from "s35-dir")
+            if ($listings.Count -gt 0) { throw "A sync run listed the online-only s35-dir $($listings.Count) time(s): $($listings -join ' | ')" }
+            # Read from its parent's entry, so it does not open the folder.
+            if (-not (Test-OnlineOnlyFolder "s35-dir")) { throw "The sync run did not mark s35-dir to be listed when it is next opened." }
+
+            Wait-Local "s35-dir" { (Get-LocalLength "s35-dir/f.txt") -eq 15 } "Opened again, s35-dir did not show the server's change to f.txt."
+            if (@(Get-RcloneListings $from "s35-dir").Count -eq 0) { throw "Opening s35-dir did not list it from the server." }
+            Assert-Local "s35-dir/f.txt" "s35-version-two"
         }
 
         # ---------------- client side -> server ----------------

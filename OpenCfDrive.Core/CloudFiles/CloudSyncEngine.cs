@@ -32,6 +32,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
     private readonly SyncRootRegistrar _registrar = new();
     private readonly CloudPlaceholderService _placeholders = new();
+    private readonly ItemStates _itemStates;
 
     private RcloneRcClient? _rc;
     private RcloneServeClient? _serve;
@@ -43,6 +44,16 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
     private readonly bool _forceSimulation;
     private readonly HashSet<string> _stateFiles = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// When each listed folder was last listed from the server, by server
+    /// path. A folder that holds nothing local is not listed every run: once
+    /// it is older than the poll interval it is given on-demand population
+    /// again, and Windows lists it when it is next opened. Missing here (a
+    /// restart), every online-only folder is marked on the first pass.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _listedAt =
+        new(StringComparer.OrdinalIgnoreCase);
 
     private volatile bool _populating;
 
@@ -209,6 +220,9 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         _forceSimulation = forceSimulation;
         _changes = new LocalChanges(_store);
         _changes.Recorded += () => _scheduler?.RequestLocalRun();
+        // Plain files in mock mode are outside a sync root, where the shell
+        // has no state column to fill.
+        _itemStates = new ItemStates(log, enabled: !forceSimulation);
 
         // The metadata DB and its SQLite side files are engine state, never
         // user data. If they live inside the sync root they must not be
@@ -468,14 +482,15 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     /// waited for, and then the folder is listed where it went. Answered
     /// with nothing, it would be marked fully populated and stay empty.
     /// </summary>
-    private async Task<IReadOnlyList<PlaceholderEntry>?> ListFolderForWindowsAsync(
+    private async Task<SyncRootConnection.DirectoryListing?> ListFolderForWindowsAsync(
         string remoteDirectory,
         string localDirectory,
         CancellationToken cancellationToken)
     {
         if (!IsLocalChangePending(localDirectory))
         {
-            return await ListNewRemoteEntriesAsync(remoteDirectory, cancellationToken).ConfigureAwait(false);
+            var entries = await ListNewRemoteEntriesAsync(remoteDirectory, cancellationToken).ConfigureAwait(false);
+            return new SyncRootConnection.DirectoryListing(entries, Listed: true);
         }
 
         if (!await _moveGate.WaitAsync(FolderMoveWait, cancellationToken).ConfigureAwait(false))
@@ -490,7 +505,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             var current = _store.GetByLocalPath(localDirectory) is { IsDirectory: true } row
                 ? row.RemotePath.TrimEnd('/')
                 : remoteDirectory;
-            return await ListNewRemoteEntriesAsync(current, cancellationToken, landingDirectory: localDirectory).ConfigureAwait(false);
+            var entries = await ListNewRemoteEntriesAsync(current, cancellationToken, landingDirectory: localDirectory).ConfigureAwait(false);
+            return new SyncRootConnection.DirectoryListing(entries, Listed: true);
         }
         finally
         {
@@ -646,6 +662,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             if (!isKnown && !item.IsDirectory && File.Exists(localPath) && !_placeholders.QueryState(localPath).IsPlaceholder)
             {
                 _changes.Changed(localPath);
+                _itemStates.WaitingToUpload(localPath);
                 continue;
             }
 
@@ -699,6 +716,23 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         if (deleted.Count > 0 || changed.Count > 0)
         {
             _pendingDiffs[relativeDirectory] = new DirectoryDiff(listedAt, deleted, changed);
+        }
+
+        // A folder listed from the server is not marked for population again
+        // until the interval has passed (see SyncRemoteAsync). A folder
+        // renamed here was listed where the server still had it; the folder
+        // its entries landed in is the one Windows will next open.
+        _listedAt[relativeDirectory] = listedAt;
+        if (landingDirectory is not null)
+        {
+            _listedAt[RelativeOf(landingDirectory)] = listedAt;
+        }
+
+        // Also kept in the store, which an empty folder has no other row in:
+        // one listed before is answered from disk when it cannot be listed.
+        if (relativeDirectory.Length > 0)
+        {
+            _store.MarkListed(relativeDirectory);
         }
 
         return entries;
@@ -837,6 +871,9 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 _log?.Invoke(dropped.Reason);
             }
 
+            // Nothing to send (the client's own write, gone again, or with its
+            // folder): no state stays on the file for it.
+            ClearStates(dropped.Changes);
             _changes.Complete(dropped.Changes);
         }
 
@@ -845,6 +882,25 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             ReportKeptOffline(plan);
             _server.CheckNow();
             return;
+        }
+
+        // "Waiting to upload" is shown where the plan has something to send,
+        // not for every file event: most of those are the client's own writes,
+        // which the plan drops.
+        foreach (var move in plan.Moves)
+        {
+            _itemStates.WaitingToUpload(move.NewLocalPath);
+        }
+
+        // A folder made here is no placeholder until the server has it.
+        foreach (var folder in plan.Folders.Where(f => Directory.Exists(f.LocalPath) && !_placeholders.QueryState(f.LocalPath).IsPlaceholder))
+        {
+            _itemStates.WaitingToUpload(folder.LocalPath);
+        }
+
+        foreach (var upload in plan.Uploads.Where(u => HasUnsyncedLocalChanges(u.LocalPath)))
+        {
+            _itemStates.WaitingToUpload(upload.LocalPath);
         }
 
         // New items found on the way (a folder moved in, or renamed before the
@@ -946,20 +1002,71 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
     /// <summary>
     /// One step of the plan; its changes are done with once it has run, or
-    /// failed for any reason but an unreachable server.
+    /// failed for any reason but an unreachable server. A failure is shown on
+    /// the file (except while offline, when it is still waiting to upload).
     /// </summary>
     private async Task StepAsync(IReadOnlyList<LocalChange> from, string failure, Func<Task> step)
     {
         try
         {
             await step().ConfigureAwait(false);
+            ClearStates(from);
         }
         catch (Exception ex) when (ex is not OperationCanceledException && !(_server is not null && ServerConnection.IsUnreachable(ex)))
         {
             _log?.Invoke($"{failure}: {ex.Message}");
+            foreach (var localPath in ChangedPaths(from))
+            {
+                if (File.Exists(localPath) || Directory.Exists(localPath))
+                {
+                    _itemStates.CouldNotSync(localPath, ex.Message);
+                }
+            }
         }
 
         _changes.Complete(from);
+    }
+
+    /// <summary>The local paths a plan step touched (a rename has both names).</summary>
+    private static IEnumerable<string> ChangedPaths(IReadOnlyList<LocalChange> from)
+    {
+        foreach (var change in from)
+        {
+            yield return change.LocalPath;
+            if (change.NewLocalPath is not null)
+            {
+                yield return change.NewLocalPath;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Done with <paramref name="from"/>: their files show no state, unless
+    /// another change of the file still waits (one reported again while this
+    /// was sent, or put back because the file was still downloading).
+    /// </summary>
+    private void ClearStates(IReadOnlyList<LocalChange> from)
+    {
+        foreach (var localPath in ChangedPaths(from).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (!_changes.HasChangeFor(localPath, from))
+            {
+                _itemStates.Clear(localPath);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The file reached the server, or has nothing to send: it shows no
+    /// state, unless a change of it still waits. Inside a plan step that is
+    /// the step's own change, so the step clears it once done (ClearStates).
+    /// </summary>
+    private void ClearState(string localPath)
+    {
+        if (!_changes.HasChangeFor(localPath))
+        {
+            _itemStates.Clear(localPath);
+        }
     }
 
     /// <summary>Says once per change what waits for the server, as before.</summary>
@@ -990,6 +1097,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
         foreach (var upload in plan.Uploads.Where(u => HasUnsyncedLocalChanges(u.LocalPath) && First(u.From)))
         {
+            // FileSystemWatcher is not guaranteed to report edits made through
+            // a hydrated Cloud Files placeholder. The offline plan is the
+            // authoritative point at which we know the upload is waiting, so
+            // also set the Explorer state here.
+            _itemStates.WaitingToUpload(upload.LocalPath);
             _log?.Invoke($"Offline: '{RelativeOf(upload.LocalPath)}' is uploaded once the server answers.");
         }
     }
@@ -1020,17 +1132,23 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         if (!IsServerDelete(remotePath))
         {
             _changes.Deleted(localPath, remotePath, fileId, isDirectory);
+            ClearState(localPath);
         }
     }
 
     /// <summary>
     /// One background sync run, the counterpart of a Nextcloud sync run's
-    /// remote discovery for the folders this PC has listed: each is listed
-    /// (parents first, one at a time, never recursively) and what changed on
-    /// the server is applied: new items appear, changed files take the new
-    /// version (keeping a local edit as a conflict copy), and deleted ones go.
-    /// Folders never opened are left to be listed when they are. Offline,
-    /// nothing is asked; the connection check runs instead.
+    /// remote discovery for the folders this PC has listed. A folder that
+    /// holds something local (the root, a pinned folder, a downloaded, kept or
+    /// edited file) is listed every run, parents first, one at a time, never
+    /// recursively, and what changed on the server is applied: new items
+    /// appear, changed files take the new version (keeping a local edit as a
+    /// conflict copy), and deleted ones go. A folder that holds nothing local
+    /// is online-only: it is not listed; once it is older than the poll
+    /// interval it is given on-demand population again, and Windows lists it
+    /// from the server when it is next opened. Folders never opened are left
+    /// to be listed when they are. Offline, nothing is asked; the connection
+    /// check runs instead.
     /// </summary>
     private async Task SyncRemoteAsync(CancellationToken cancellationToken)
     {
@@ -1042,14 +1160,161 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
         // The run sent the local changes before this, so no listing takes
         // what they change for the server's current state.
+        var relistAge = SyncScheduler.ConfiguredRelistAge();
+        var local = LocalDirectories();
         foreach (var directory in ListedDirectories().ToList())
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (!await RefreshDirectoryAsync(directory, cancellationToken).ConfigureAwait(false))
+
+            if (local.Contains(directory) || IsPinnedFolder(directory))
             {
-                return;
+                if (!await RefreshDirectoryAsync(directory, cancellationToken).ConfigureAwait(false))
+                {
+                    return;
+                }
+
+                continue;
+            }
+
+            // Online-only: nothing here would be lost by asking the server
+            // only when it is opened. Leave it fully populated until it is
+            // older than the relist age, then let the next opening list it.
+            if (_listedAt.TryGetValue(directory, out var listedAt) &&
+                DateTimeOffset.UtcNow - listedAt < relistAge)
+            {
+                continue;
+            }
+
+            if (_placeholders.EnableOnDemandPopulation(LocalPathOf(directory)))
+            {
+                _log?.Invoke($"'{RelativeOf(LocalPathOf(directory))}' holds nothing local; it is listed from the server when it is next opened.");
             }
         }
+    }
+
+    /// <summary>
+    /// The folders a sync run keeps listing, as server paths ("" for the
+    /// root): each holds, at any depth below it, something whose local copy a
+    /// server change could not simply replace or drop: a downloaded, kept or
+    /// edited file, a plain local file, or a change made here not sent yet.
+    /// Any depth, so a server delete or rename of a folder above a downloaded
+    /// file is still seen. Worked out once per run (see
+    /// <see cref="LocalDirectories(SqliteMetadataStore, string, bool, Func{string, bool})"/>).
+    /// A pinned folder counts too; that is checked per listed folder
+    /// (<see cref="IsPinnedFolder"/>).
+    /// </summary>
+    private HashSet<string> LocalDirectories()
+    {
+        var local = LocalDirectories(_store, _syncRootPath, IsSimulated, CloudPlaceholderService.HasLocalData);
+        foreach (var change in _changes.Pending())
+        {
+            foreach (var path in change.NewLocalPath is null ? [change.LocalPath] : new[] { change.LocalPath, change.NewLocalPath })
+            {
+                var relative = RelativeOf(path);
+                if (!relative.StartsWith("..", StringComparison.Ordinal) && !Path.IsPathRooted(relative))
+                {
+                    // The item itself, in case it is a folder, and every folder above it.
+                    AddWithParents(local, relative);
+                }
+            }
+        }
+
+        return local;
+    }
+
+    /// <summary>
+    /// The folders holding local data at any depth, from one pass over the
+    /// store: a file the provider downloaded (also "Always keep"), or one
+    /// whose data is on this PC by its attributes (one lookup each, no handle
+    /// opened), which also takes in edits and plain files the store knows.
+    /// In mock mode also plain files the store does not know yet.
+    /// </summary>
+    internal static HashSet<string> LocalDirectories(
+        SqliteMetadataStore store,
+        string syncRootPath,
+        bool simulated,
+        Func<string, bool> hasLocalData)
+    {
+        // The root is always kept current: it is what Explorer opens first.
+        var local = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { string.Empty };
+        var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in store.GetAll())
+        {
+            if (row.IsDirectory)
+            {
+                continue;
+            }
+
+            known.Add(row.LocalPath);
+            if ((row.IsHydrated && File.Exists(row.LocalPath)) || hasLocalData(row.LocalPath))
+            {
+                AddWithParents(local, ParentOf(row.RemotePath));
+            }
+        }
+
+        if (simulated && Directory.Exists(syncRootPath))
+        {
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(syncRootPath, "*", SearchOption.AllDirectories).Where(f => !known.Contains(f)))
+                {
+                    AddWithParents(local, ParentOf(Path.GetRelativePath(syncRootPath, file).Replace('\\', '/')));
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Unreadable: the folders found so far stand.
+            }
+        }
+
+        return local;
+    }
+
+    /// <summary>For tests: whether a sync run keeps listing this folder.</summary>
+    internal static bool HoldsLocalFiles(
+        SqliteMetadataStore store,
+        string syncRootPath,
+        string directory,
+        bool simulated = false,
+        Func<string, bool>? hasLocalData = null)
+    {
+        var relative = directory.Trim('/');
+        return relative.Length == 0 ||
+               IsPinned(Path.Combine(syncRootPath, relative.Replace('/', Path.DirectorySeparatorChar))) ||
+               LocalDirectories(store, syncRootPath, simulated, hasLocalData ?? CloudPlaceholderService.HasLocalData).Contains(relative);
+    }
+
+    /// <summary>"Always keep on this device" on the folder itself.</summary>
+    private bool IsPinnedFolder(string directory) => directory.Length > 0 && IsPinned(LocalPathOf(directory));
+
+    private static bool IsPinned(string localDirectory)
+    {
+        try
+        {
+            return Directory.Exists(localDirectory) && (File.GetAttributes(localDirectory) & PinnedAttribute) != 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Unreadable: treat it as local rather than risk missing a change.
+            return true;
+        }
+    }
+
+    /// <summary>Adds a folder and every folder above it, up to the root.</summary>
+    private static void AddWithParents(HashSet<string> folders, string relative)
+    {
+        // A folder already there came with its parents.
+        for (var folder = relative.Trim('/'); folders.Add(folder) && folder.Length > 0; folder = ParentOf(folder))
+        {
+        }
+    }
+
+    /// <summary>The folder a server path is in: "a/b" for "a/b/c.txt", "" at the top.</summary>
+    private static string ParentOf(string remotePath)
+    {
+        var path = remotePath.TrimEnd('/');
+        var slash = path.LastIndexOf('/');
+        return slash < 0 ? string.Empty : path[..slash];
     }
 
     /// <summary>
@@ -1347,6 +1612,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         {
             _log?.Invoke($"Server deleted folder '{prefix}', but '{RelativeOf(file)}' has local changes: it is kept and uploaded again.");
             _changes.Changed(file);
+            _itemStates.WaitingToUpload(file);
         }
     }
 
@@ -1359,6 +1625,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         _store.DeleteByRemotePath(record.RemotePath);
         _log?.Invoke($"Server {what} '{record.RemotePath}', which has local changes: they are kept and uploaded again.");
         _changes.Changed(record.LocalPath);
+        _itemStates.WaitingToUpload(record.LocalPath);
     }
 
     /// <summary>
@@ -1373,6 +1640,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         {
             var copy = ConflictCopies.PathFor(localPath, File.GetLastWriteTime(localPath));
             File.Copy(localPath, copy);
+            _itemStates.ConflictCopy(copy);
             _log?.Invoke($"Conflict: '{remotePath}' changed here and on the server; the server's version keeps the name, this PC's is kept as '{RelativeOf(copy)}'.");
             return copy;
         }
@@ -1412,6 +1680,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             if (compareContent && await IsServerContentAsync(localPath, hash).ConfigureAwait(false))
             {
                 TakeAsInSync(localPath, remotePath, size, modifiedUtc, hash);
+                ClearState(localPath);
                 return true;
             }
 
@@ -1453,6 +1722,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
 
         _store.UpdateRemoteMetadata(remotePath, size, modifiedUtc, dehydrated: !IsSimulated, hash);
+        ClearState(localPath);
         _log?.Invoke($"Server changed '{remotePath}' ({size} bytes); local copy will be re-downloaded on next open.");
         return true;
     }
@@ -1952,6 +2222,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     private void RecordChanged(string localPath)
     {
         // Namespace population writes local files; never echo those back.
+        // Its state is set by the run that plans it (see SendLocalChangesAsync):
+        // many events are the client's own writes, which carry no state.
         if (!_populating && !IsStateFile(localPath))
         {
             _changes.Changed(localPath);
@@ -1984,6 +2256,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         {
             var synced = _lastSyncedState.TryGetValue(localPath, out var state) ? state : ((long, DateTime)?)null;
             _changes.Deleted(localPath, remotePath, 0, record?.IsDirectory == true, synced);
+            ClearState(localPath);
         }
     }
 
@@ -2267,6 +2540,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
         _log?.Invoke($"Renamed remote '{fs}{oldRemote}' -> '{newRemote}'.");
 
+        ClearState(newLocalPath);
+
         if (!IsSimulated)
         {
             UpdateRenamedPlaceholder(newLocalPath, newRelative, source);
@@ -2373,6 +2648,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
 
         _log?.Invoke($"Renamed remote folder '{fs}{oldRemote}' -> '{newRemote}'.");
+        ClearState(newLocalPath);
     }
 
     private string RelativeOf(string localPath) =>
@@ -2454,6 +2730,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             if (_store.GetByRemotePath(RelativeOf(folder) + "/") is null && !_placeholders.QueryState(folder).IsPlaceholder)
             {
                 _changes.Changed(folder);
+                _itemStates.WaitingToUpload(folder);
                 folders++;
             }
         }
@@ -2463,6 +2740,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             if (!IsStateFile(file) && HasUnsyncedLocalChanges(file))
             {
                 _changes.Changed(file);
+                _itemStates.WaitingToUpload(file);
                 files++;
             }
         }
@@ -2477,6 +2755,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     {
         if (!File.Exists(localPath))
         {
+            ClearState(localPath);
             return false;
         }
 
@@ -2485,6 +2764,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         if (_connection?.IsHydrating(localPath) == true)
         {
             _changes.Changed(localPath);
+            _itemStates.WaitingToUpload(localPath);
             return false;
         }
 
@@ -2505,6 +2785,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             // local copy is never sent over good server data.
             if (state is { IsPlaceholder: true, InSync: true } && MatchesLastSync(localPath, record))
             {
+                ClearState(localPath);
                 return false;
             }
 
@@ -2513,12 +2794,14 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             if (!state.IsPlaceholder && record is { IsDirectory: false, SyncedLocalState: not null } && MatchesLastSync(localPath, record))
             {
                 _placeholders.ConvertToPlaceholder(localPath, CloudPlaceholderService.BuildFileIdentity(record.RemotePath), markInSync: true);
+                ClearState(localPath);
                 return false;
             }
         }
         else if (_lastSyncedState.TryGetValue(localPath, out var synced) &&
                  synced == (info.Length, info.LastWriteTimeUtc))
         {
+            ClearState(localPath);
             return false;
         }
 
@@ -2545,6 +2828,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 if (KeepConflictCopy(localPath, relative) is not null)
                 {
                     File.Delete(localPath);
+                    ClearState(localPath);
                     if (record is not null)
                     {
                         _store.DeleteByRemotePath(record.RemotePath);
@@ -2576,6 +2860,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 }
 
                 RememberSyncedState(localPath);
+                ClearState(localPath);
                 return false;
             }
             else
@@ -2631,6 +2916,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             hash: serverHash);
         _localChangeAt[relative] = DateTimeOffset.UtcNow;
         RememberSyncedState(localPath);
+        ClearState(localPath);
 
         _log?.Invoke($"Uploaded '{relative}' ({info.Length} bytes) to {fs}{remoteDirectory}.");
 
@@ -2694,6 +2980,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
         _rc?.Dispose();
         _rc = null;
+
+        _itemStates.Dispose();
 
         // The drive stays registered: stopping the service (the app's Stop,
         // a restart to apply settings) is not removing the drive. Until the

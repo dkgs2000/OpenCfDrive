@@ -43,11 +43,12 @@ public class RenamedFolderContractTest(ITestOutputHelper output)
         var inWindow = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var updated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        async Task<IReadOnlyList<PlaceholderEntry>?> ListDirectory(string directory, string localDirectory, CancellationToken cancellationToken)
+        async Task<SyncRootConnection.DirectoryListing?> ListDirectory(string directory, string localDirectory, CancellationToken cancellationToken)
         {
             if (directory.Length == 0)
             {
-                return [new PlaceholderEntry("old", true, 0, now, "old/")];
+                return new SyncRootConnection.DirectoryListing(
+                    [new PlaceholderEntry("old", true, 0, now, "old/")], Listed: true);
             }
 
             if (window == Window.Listing)
@@ -57,7 +58,8 @@ public class RenamedFolderContractTest(ITestOutputHelper output)
                 await updated.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken);
             }
 
-            return [new PlaceholderEntry("z.txt", false, 1, now, "new/z.txt")];
+            return new SyncRootConnection.DirectoryListing(
+                [new PlaceholderEntry("z.txt", false, 1, now, "new/z.txt")], Listed: true);
         }
 
         using var server = new OneByteServer(async () =>
@@ -133,7 +135,12 @@ public class RenamedFolderContractTest(ITestOutputHelper output)
 
             output.WriteLine($"read: exit {read.ExitCode}, '{read.Output.Trim()}'");
             Assert.True(updated.Task.IsCompleted, "The folder update never ran.");
-            Assert.DoesNotContain(log, line => line.Contains("failed", StringComparison.OrdinalIgnoreCase));
+            // A progress-report failure is logged once per download and is
+            // never fatal (Change 2): some platforms do not support it and the
+            // bytes still arrive. Nothing else may fail.
+            Assert.DoesNotContain(log, line =>
+                line.Contains("failed", StringComparison.OrdinalIgnoreCase) &&
+                !line.Contains("progress report", StringComparison.OrdinalIgnoreCase));
             Assert.Equal("z", read.Output.Trim());
             if (window == Window.Download)
             {

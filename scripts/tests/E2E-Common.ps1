@@ -503,6 +503,10 @@ function Start-E2EService {
     # The background sync runs only when a scenario asks (Sync-Remote), so each
     # one sees exactly the server calls it caused. Its schedule is unit-tested.
     [Environment]::SetEnvironmentVariable("OPENCFDRIVE_REMOTE_POLL_SECONDS", "86400", "Process")
+    # Every sync run marks a folder holding nothing local to be listed when it
+    # is next opened (the service waits one poll interval), so a scenario's
+    # own listing of it (Update-LocalFolder) asks the server.
+    [Environment]::SetEnvironmentVariable("OPENCFDRIVE_RELIST_SECONDS", "0", "Process")
     $script:E2ESyncRoot = $SyncRoot
 
     Write-E2ELog "Starting $(Split-Path -Leaf $ServiceExe)"
