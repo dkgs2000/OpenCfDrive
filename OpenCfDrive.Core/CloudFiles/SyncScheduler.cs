@@ -26,6 +26,13 @@ public sealed class SyncScheduler : IDisposable
     /// <summary>Overrides the interval in seconds (tests and scripts).</summary>
     public const string IntervalVariable = "OPENCFDRIVE_REMOTE_POLL_SECONDS";
 
+    /// <summary>
+    /// Overrides, in seconds, how long after its last listing a folder holding
+    /// nothing local is marked to be listed on its next opening (tests). 0
+    /// marks it at every full run.
+    /// </summary>
+    public const string RelistVariable = "OPENCFDRIVE_RELIST_SECONDS";
+
     private readonly Func<bool, CancellationToken, Task> _run;
     private readonly ITimer _timer;
     private readonly ITimer _localTimer;
@@ -54,6 +61,12 @@ public sealed class SyncScheduler : IDisposable
         double.TryParse(Environment.GetEnvironmentVariable(IntervalVariable), System.Globalization.CultureInfo.InvariantCulture, out var seconds) && seconds > 0
             ? TimeSpan.FromSeconds(seconds)
             : DefaultInterval;
+
+    /// <summary>The relist age from <see cref="RelistVariable"/>, else the interval.</summary>
+    public static TimeSpan ConfiguredRelistAge() =>
+        double.TryParse(Environment.GetEnvironmentVariable(RelistVariable), System.Globalization.CultureInfo.InvariantCulture, out var seconds) && seconds >= 0
+            ? TimeSpan.FromSeconds(seconds)
+            : ConfiguredInterval();
 
     /// <summary>The first full run, at once.</summary>
     public void Start() => _ = SyncNowAsync();

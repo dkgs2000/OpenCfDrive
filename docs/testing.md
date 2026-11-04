@@ -95,7 +95,7 @@ leaves a plain file. Others, Notepad among them, write into the same file,
 which stays a placeholder whose size Windows keeps a record of. The edit
 scenarios below are run both ways where the two take different paths.
 
-**Server side (`S01`–`S28`, cloud mode only).** Another app changes the server.
+**Server side (`S01`–`S35`, cloud mode only).** Another app changes the server.
 The scenario then has the client run its background sync, lists the folder as
 Explorer does, and expects the local side to match:
 
@@ -169,6 +169,15 @@ drive, after which the server is expected to match:
 - offline (cloud mode): a delete and a rename made while the server can't be
   reached are kept and reach the server once it answers; nothing comes back
   meanwhile. An edit saved in place offline is uploaded once it answers
+- online-only folders are not re-listed by background sync; folders holding
+  local files are refreshed, failed listings fall back to their disk contents,
+  and an unopened folder is listed when Explorer opens it. A sync run marks an
+  online-only folder to be listed when next opened, and opening it shows what
+  the server changed meanwhile (the E2E sets `OPENCFDRIVE_RELIST_SECONDS=0`,
+  so every run marks them)
+- Explorer item states cover waiting to upload (cleared after a successful
+  upload), conflict copy (kept after it is uploaded), and a failed sync. A file
+  that only came from the server never gets one
 - Free up space on a file with an unsynced edit (cloud mode): it's uploaded
   first, then freed, and opens whole again
 

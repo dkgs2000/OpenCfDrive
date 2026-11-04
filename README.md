@@ -27,7 +27,9 @@
   you open it. **Free up space** and **Always keep on this device** are in the
   right-click menu.
 - **Two-way sync.** Your adds, edits, renames, moves and deletes go to the
-  server. Changes made on the server show up within 30 seconds.
+  server. Changes made on the server show up within 30 seconds in folders
+  holding files you downloaded or keep on this device, and in other folders
+  when you next open them.
 - **Works offline.** Files you downloaded still open. Edits, renames and
   deletes you make offline go to the server when it's back.
 - **Never loses an edit.** If a file changed on both sides, OpenCfDrive keeps
@@ -36,8 +38,8 @@
   [rclone](https://rclone.org). Your drive works with any storage rclone works
   with.
 - **Easy on your server.** OpenCfDrive reads a folder only when you open it and
-  never crawls the whole drive. Your server doesn't need to send change
-  notifications.
+  never crawls the whole drive. Only folders with files on this PC are checked
+  in the background. Your server doesn't need to send change notifications.
 - **Easy to run.** The installer needs no admin rights and includes .NET. An
   icon in the notification area shows what is syncing, and the app updates
   itself.
@@ -69,7 +71,10 @@ Your drive is now in Explorer as **OpenCfDrive**, at `%USERPROFILE%\OpenCfDrive`
 ## Using it
 
 - **Open files as usual.** A cloud icon in Explorer's Status column means the
-  file is online only. Opening it downloads it.
+  file is online only. Opening it downloads it, with a progress bar for big
+  files.
+- **The Status column also shows a file's sync state:** waiting to upload, a
+  conflict copy, or couldn't sync, with the reason.
 - **Right-click** a file or folder and choose **Free up space** to remove the
   local copy, or **Always keep on this device** to keep it available offline.
 - **Click the OpenCfDrive icon** in the notification area to see the status

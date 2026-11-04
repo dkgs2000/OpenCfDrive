@@ -19,6 +19,16 @@ public sealed class SyncRootRegistrar
     public const string ProviderName = "OpenCfDrive";
     public const string ProviderVersion = "0.1.0";
 
+    /// <summary>
+    /// Id of the custom item property that carries a file's sync state. Every
+    /// state is set on this one property; Explorer shows its icon in the Status
+    /// column and its value in the "OpenCfDrive state" column.
+    /// </summary>
+    public const int StatePropertyId = 1;
+
+    /// <summary>The name Explorer gives the state column.</summary>
+    public const string StatePropertyDisplayName = "OpenCfDrive state";
+
     private const int HRESULT_ALREADY_EXISTS = unchecked((int)0x800700B7);
 
     /// <summary>
@@ -132,6 +142,16 @@ public sealed class SyncRootRegistrar
             AllowPinning = true,
             Context = CryptographicBuffer.CreateFromByteArray(context),
         };
+
+        // A custom item property turns a per-file state into an icon in
+        // Explorer's Status column (and a value in its own column). The
+        // definition has to be part of the registration; without it the
+        // platform rejects or ignores state values set on items.
+        info.StorageProviderItemPropertyDefinitions.Add(new StorageProviderItemPropertyDefinition
+        {
+            Id = StatePropertyId,
+            DisplayNameResource = StatePropertyDisplayName,
+        });
 
         // Registering an id that already exists updates it in place, which
         // also re-applies changed policies after an upgrade.

@@ -36,17 +36,19 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
         void Add(string directory, PlaceholderEntry entry) =>
             pending.AddOrUpdate(directory, _ => [entry], (_, list) => { lock (list) { list.Add(entry); } return list; });
 
-        Task<IReadOnlyList<PlaceholderEntry>?> ListDirectory(string directory, string localDirectory, CancellationToken cancellationToken)
+        Task<SyncRootConnection.DirectoryListing?> ListDirectory(string directory, string localDirectory, CancellationToken cancellationToken)
         {
             calls.Enqueue(directory);
             if (!pending.TryRemove(directory, out var list))
             {
-                return Task.FromResult<IReadOnlyList<PlaceholderEntry>?>([]);
+                return Task.FromResult<SyncRootConnection.DirectoryListing?>(
+                    new SyncRootConnection.DirectoryListing([], Listed: true));
             }
 
             lock (list)
             {
-                return Task.FromResult<IReadOnlyList<PlaceholderEntry>?>(list.ToList());
+                return Task.FromResult<SyncRootConnection.DirectoryListing?>(
+                    new SyncRootConnection.DirectoryListing(list.ToList(), Listed: true));
             }
         }
 
@@ -145,10 +147,13 @@ public class FetchPlaceholdersContractTest(ITestOutputHelper output)
         var now = DateTimeOffset.UtcNow;
         var calls = new ConcurrentQueue<string>();
 
-        Task<IReadOnlyList<PlaceholderEntry>?> ListDirectory(string directory, string localDirectory, CancellationToken cancellationToken)
+        Task<SyncRootConnection.DirectoryListing?> ListDirectory(string directory, string localDirectory, CancellationToken cancellationToken)
         {
             calls.Enqueue(directory);
-            return Task.FromResult<IReadOnlyList<PlaceholderEntry>?>([new PlaceholderEntry("first.txt", false, 5, now, "first.txt")]);
+            return Task.FromResult<SyncRootConnection.DirectoryListing?>(
+                new SyncRootConnection.DirectoryListing(
+                    [new PlaceholderEntry("first.txt", false, 5, now, "first.txt")],
+                    Listed: true));
         }
 
         // The server answers checks only once the test says it is back.

@@ -22,6 +22,14 @@ public sealed class SyncRootConnection : IDisposable
     /// </summary>
     private const int TransferChunkSize = 4 * 1024 * 1024;
 
+    /// <summary>
+    /// How often progress is reported while bytes arrive: every this many
+    /// bytes, or every this long, whichever comes first. Each report resets
+    /// the platform's 60 s callback timeout.
+    /// </summary>
+    private const long ProgressReportBytes = 256 * 1024;
+    private static readonly TimeSpan ProgressReportInterval = TimeSpan.FromMilliseconds(250);
+
     private readonly SqliteMetadataStore _store;
     private readonly RcloneServeClient _serve;
     private readonly Action<string>? _log;
@@ -57,6 +65,11 @@ public sealed class SyncRootConnection : IDisposable
     private string _syncRootPath = string.Empty;
     private string _syncRootVolumeRelative = string.Empty;
 
+    /// <summary>Successful progress reports, for download contract tests.</summary>
+    private long _progressReports;
+
+    internal long ProgressReports => Interlocked.Read(ref _progressReports);
+
     /// <summary>A local delete or move out of the drive, reported on the callback thread.</summary>
     /// <param name="remotePath">The item's server path; folders end in '/'.</param>
     /// <param name="fileId">Its NTFS file id, to tell it from what may replace it.</param>
@@ -64,6 +77,14 @@ public sealed class SyncRootConnection : IDisposable
 
     /// <summary>A local rename or move within the drive, reported on the callback thread.</summary>
     public delegate void LocalRename(string oldLocalPath, string newLocalPath, string remotePath, RenameSource? source);
+
+    /// <summary>
+    /// The answer to FETCH_PLACEHOLDERS: entries to hand out, and whether they
+    /// came from a live server listing (<c>Listed</c>) or from what is already
+    /// on disk (<c>false</c>). <c>null</c> is still "declined": the folder is
+    /// not listed now and is listed when it is next opened.
+    /// </summary>
+    public sealed record DirectoryListing(IReadOnlyList<PlaceholderEntry> Entries, bool Listed);
 
     /// <summary>
     /// Answers FETCH_PLACEHOLDERS: the server entries of one folder that have
@@ -75,7 +96,7 @@ public sealed class SyncRootConnection : IDisposable
     /// Where it is on disk now: under another name than its server path while
     /// a rename made here has not reached the server.
     /// </param>
-    public delegate Task<IReadOnlyList<PlaceholderEntry>?> ListDirectory(
+    public delegate Task<DirectoryListing?> ListDirectory(
         string remoteDirectory, string localDirectory, CancellationToken cancellationToken);
 
     /// <summary>
@@ -357,8 +378,33 @@ public sealed class SyncRootConnection : IDisposable
         var end = offset + length;
         var chunk = new byte[(int)Math.Min(TransferChunkSize, length)];
         var pinned = GCHandle.Alloc(chunk, GCHandleType.Pinned);
+
+        // Progress shown by Windows on the item, and what keeps a long
+        // download from hitting the platform's 60 s callback timeout.
+        var progressReported = 0L;
+        var lastReportMs = 0L;
+        var progressFailureLogged = false;
+        void ReportProgress(long completed)
+        {
+            var hr = CfApi.CfReportProviderProgress(info.ConnectionKey, info.TransferKey, length, completed);
+            if (CfApi.Succeeded(hr))
+            {
+                Interlocked.Increment(ref _progressReports);
+                return;
+            }
+
+            // Logged once for this download and never fatal: some platforms
+            // do not support it, and the bytes still arrive.
+            if (!progressFailureLogged)
+            {
+                progressFailureLogged = true;
+                _log?.Invoke($"  progress report for '{remotePath}' failed: {HResult.Describe(hr)}; the download continues.");
+            }
+        }
+
         try
         {
+            ReportProgress(0);
             var position = offset;
             while (position < end)
             {
@@ -377,6 +423,19 @@ public sealed class SyncRootConnection : IDisposable
                     }
 
                     filled += read;
+
+                    // As bytes arrive, not only once a chunk is handed over:
+                    // on a slow link one 4 MB chunk can take longer to arrive
+                    // than the 60 s callback timeout, and Windows tracks the
+                    // handed-over chunks itself.
+                    var received = position - offset + filled;
+                    if (received - progressReported >= ProgressReportBytes ||
+                        clock.ElapsedMilliseconds - lastReportMs >= ProgressReportInterval.TotalMilliseconds)
+                    {
+                        ReportProgress(received);
+                        progressReported = received;
+                        lastReportMs = clock.ElapsedMilliseconds;
+                    }
                 }
 
                 if (filled != size)
@@ -393,6 +452,11 @@ public sealed class SyncRootConnection : IDisposable
                 chunks++;
                 position = chunkEnd;
             }
+
+            // No report after the loop: the last transfer completes the
+            // request, and Windows refuses a report on a completed one
+            // (0x8007018E). Bytes are reported as they arrive, before each
+            // transfer, and Windows tracks the transfers itself.
 
             _log?.Invoke(
                 $"  transferred {length} bytes at {offset} in {clock.ElapsedMilliseconds} ms " +
@@ -492,13 +556,34 @@ public sealed class SyncRootConnection : IDisposable
                 Marshal.PtrToStructure<CF_CALLBACK_PARAMETERS>(callbackParametersPtr).FetchPlaceholdersPattern);
             var requester = $"{RequesterOf(info)}, pattern '{pattern}'";
 
+            // Windows Search re-reads folders that change, and a folder marked
+            // to be listed on its next opening has just changed (its
+            // attributes). Listing it from the server for the indexer would
+            // bring back a listing per folder per interval. A folder listed
+            // before is answered from what is on disk; a user opening it later
+            // still gets a listing once it is marked again.
+            if (IsSearchIndexer(info) && WasListedBefore(directory))
+            {
+                TransferPlaceholders(info, [], StatusSuccess, populated: true);
+                if (_answeredForIndexer.TryAdd(directory, 0))
+                {
+                    _log?.Invoke($"FETCH_PLACEHOLDERS '{directory}' for {requester}: answered from disk, as for every request from Windows Search.");
+                }
+
+                return;
+            }
+
             var clock = Stopwatch.StartNew();
             var localDirectory = normalized.Length == 0 ? _syncRootPath : ToLocalPath(normalized);
-            var (entries, listed, notListed) = ListCoalesced(directory, localDirectory, requester);
+            var (entries, listed, notListed, fromDisk) = ListCoalesced(directory, localDirectory, requester);
 
-            // Offline, a folder never listed shows what is local and stays
-            // unlisted, so opening it once the server answers lists it.
-            var populated = listed || IsListedRecently(directory);
+            // Offline, or a listing that failed: a folder that was listed
+            // before is marked populated again and shows what is already on
+            // disk. What it keeps (downloaded files included) stays, and a new
+            // file can still be made in it. A folder never listed shows what
+            // is local and stays unlisted, so opening it once the server
+            // answers lists it.
+            var populated = listed || fromDisk || IsListedRecently(directory);
             TransferPlaceholders(info, entries, StatusSuccess, populated);
             // Only a slow one: Windows asks again at once for a folder left
             // unlisted, so quick ones come by the hundred.
@@ -543,13 +628,17 @@ public sealed class SyncRootConnection : IDisposable
     /// One the lister declines also returns nothing, and leaves the next
     /// request free to list.
     /// </summary>
-    /// <returns>Also why nothing was listed, when that was not a failure (failures are logged here).</returns>
-    private (IReadOnlyList<PlaceholderEntry> Entries, bool Listed, string? NotListed) ListCoalesced(string directory, string localDirectory, string requester)
+    /// <returns>
+    /// Also why nothing was listed, when that was not a failure (failures are
+    /// logged here), and whether the answer came from what is already on disk.
+    /// </returns>
+    private (IReadOnlyList<PlaceholderEntry> Entries, bool Listed, string? NotListed, bool FromDisk) ListCoalesced(
+        string directory, string localDirectory, string requester)
     {
         if (_server is { IsOnline: false })
         {
             _server.CheckNow();
-            return ([], false, "offline");
+            return ([], false, "offline", WasListedBefore(directory));
         }
 
         var gate = _listingGates.GetOrAdd(directory, _ => new SemaphoreSlim(1, 1));
@@ -559,29 +648,29 @@ public sealed class SyncRootConnection : IDisposable
             if (_lastListed.TryGetValue(directory, out var at) &&
                 DateTimeOffset.UtcNow - at < _listingReuseWindow)
             {
-                return ([], false, $"tried {(DateTimeOffset.UtcNow - at).TotalMilliseconds:0} ms ago");
+                return ([], false, $"tried {(DateTimeOffset.UtcNow - at).TotalMilliseconds:0} ms ago", false);
             }
 
             // Gone offline while this one waited for the gate.
             if (_server is { IsOnline: false })
             {
-                return ([], false, "offline");
+                return ([], false, "offline", WasListedBefore(directory));
             }
 
             using var timeout = new CancellationTokenSource(ListingTimeout);
             var declined = false;
             try
             {
-                var entries = _listDirectory!(directory, localDirectory, timeout.Token).GetAwaiter().GetResult();
-                if (entries is null)
+                var listing = _listDirectory!(directory, localDirectory, timeout.Token).GetAwaiter().GetResult();
+                if (listing is null)
                 {
                     declined = true;
-                    return ([], false, "declined");
+                    return ([], false, "declined", false);
                 }
 
                 _server?.Succeeded();
                 _listedOk[directory] = DateTimeOffset.UtcNow;
-                return (entries, true, null);
+                return (listing.Entries, listing.Listed, null, !listing.Listed);
             }
             catch (Exception ex)
             {
@@ -592,7 +681,9 @@ public sealed class SyncRootConnection : IDisposable
                     _server?.Failed(reason);
                 }
 
-                return ([], false, null);
+                // Listed before: keep the folder populated with what is on
+                // disk instead of letting Windows ask again in a loop.
+                return ([], false, null, WasListedBefore(directory));
             }
             finally
             {
@@ -607,6 +698,17 @@ public sealed class SyncRootConnection : IDisposable
             gate.Release();
         }
     }
+
+    /// <summary>
+    /// Whether this folder was listed from the server before, by this process
+    /// or an earlier one: marked so in the store (empty folders included), or,
+    /// for a store from before that mark, by the rows its listing wrote. Its
+    /// files stay on disk and are what a failed listing answers with.
+    /// </summary>
+    private bool WasListedBefore(string directory) =>
+        _listedOk.ContainsKey(directory) ||
+        (directory.Length > 0 && _store.WasListed(directory)) ||
+        _store.GetChildren(directory).Count > 0;
 
     /// <summary>
     /// Whether the directory's last listing succeeded within the reuse window:
@@ -642,6 +744,29 @@ public sealed class SyncRootConnection : IDisposable
         {
             return $"state unknown: {ex.Message}";
         }
+    }
+
+    /// <summary>The Windows Search processes, which read folders to index them.</summary>
+    private static readonly HashSet<string> SearchIndexerImages = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SearchIndexer.exe",
+        "SearchProtocolHost.exe",
+        "SearchFilterHost.exe",
+    };
+
+    /// <summary>Folders an indexer request was answered for from disk; each is logged once.</summary>
+    private readonly ConcurrentDictionary<string, byte> _answeredForIndexer = new(StringComparer.OrdinalIgnoreCase);
+
+    private static bool IsSearchIndexer(CF_CALLBACK_INFO info)
+    {
+        if (info.ProcessInfo == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var process = Marshal.PtrToStructure<CF_PROCESS_INFO>(info.ProcessInfo);
+        var image = process.ImagePath == IntPtr.Zero ? null : Marshal.PtrToStringUni(process.ImagePath);
+        return !string.IsNullOrEmpty(image) && SearchIndexerImages.Contains(Path.GetFileName(image));
     }
 
     private static string RequesterOf(CF_CALLBACK_INFO info)

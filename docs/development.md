@@ -89,6 +89,7 @@ set.
 | Start at sign-in | `StartAtSignIn` | | on for the installed app |
 | Check for updates | `CheckForUpdates` | | on |
 | Background sync interval | | `OPENCFDRIVE_REMOTE_POLL_SECONDS` | 30 s |
+| Age at which a folder holding nothing local is marked to be listed on its next opening | | `OPENCFDRIVE_RELIST_SECONDS` | the sync interval |
 
 `OPENCFDRIVE_SETTINGS` points both the app and the service at another
 settings file.

@@ -152,10 +152,13 @@ already downloaded.
 ## How syncing works
 
 - **The server is the source of truth.** The first time you open a folder,
-  OpenCfDrive lists it from the server. From then on the folder is kept up to
+  OpenCfDrive lists it from the server. A folder that holds something local
+  (a downloaded, kept or edited file, or a pinned folder) is then kept up to
   date in the background, every 30 seconds and right after the server comes
-  back from being offline. Changes from the server, including new files,
-  edits, deletes and renames, show up without you reopening anything.
+  back from being offline. An online-only folder - one whose files have not
+  been downloaded - is not re-listed every 30 seconds. Once 30 seconds have
+  passed since it was last listed, the next time you open it OpenCfDrive
+  lists it from the server, so it shows what changed there meanwhile.
 - **Folders you have never opened are not read** until you open them. The drive
   is never crawled.
 - **Your changes go to the server.** That includes new files, edits, deletes,
@@ -272,19 +275,34 @@ sync service ends, and OpenCfDrive restarts it if it stops on its own.
 - **Files that were already in the folder** before the drive was set up stay
   normal local files. Their edits are still uploaded. Windows can't turn an
   existing file into an online-only one.
-- **Pressing F5 in Explorer doesn't ask the server sooner.** Changes from the
-  server arrive within 30 seconds.
-- **Many opened folders mean many listings.** Every folder you have opened is
-  listed every 30 seconds. On cloud services that count requests against a
-  quota, that adds up.
+- **Pressing F5 in Explorer.** In a folder with something local in it, it
+  doesn't ask the server sooner: changes from the server arrive within 30
+  seconds anyway. In an online-only folder, F5 lists the folder from the
+  server once 30 seconds have passed since it was last listed; before that, it
+  shows the same listing.
+- **Many opened folders do not mean many listings.** Only folders that hold
+  something local (a downloaded, kept or edited file, or a pinned folder) are
+  listed every 30 seconds. Online-only folders are listed when you open them,
+  so opening many folders does not drive up per-folder polling.
 - **On S3 and other bucket stores**, an empty folder exists only on this
   computer until you put a file in it, because those stores have no real
   folders.
 - **"Being used by another process."** A program that opens a file at the
   exact moment OpenCfDrive applies a server change to it can see this error.
   Opening the file again works.
+- **Sync states in Explorer's Status column.** OpenCfDrive shows a per-file
+  sync state in Explorer's Status column:
+  - **Waiting to upload** - the file has a local edit that has not reached the
+    server yet; cleared once the upload succeeds.
+  - **Conflict copy** - the file is a conflict copy kept beside a server
+    version that changed at the same time. It stays marked, also after it is
+    uploaded, until you rename or delete it.
+  - **Couldn't sync** - the last sync attempt for the file failed; the reason
+    is shown, and the state clears on the next success for that file.
 - **No cloud badge on file icons.** OpenCfDrive shows the online/offline state
-  in Explorer's Status column, not as an overlay on each icon.
+  and the sync state in Explorer's Status column, not as an overlay on each
+  icon. The Status column is what tells you whether a file is online-only,
+  downloaded, or waiting on the server.
 
 Something not working? Open an
 [issue](https://github.com/dkgs2000/OpenCfDrive/issues) and attach the sync

@@ -109,6 +109,32 @@ public class SqliteMetadataStoreTests
     }
 
     [Fact]
+    public void AListedMark_StaysWithTheFolder_ThroughAnUpsertAndARename()
+    {
+        var store = new SqliteMetadataStore(TempDbPath());
+        store.Initialize();
+        var now = DateTimeOffset.UtcNow;
+        store.UpsertFile("docs/", @"C:\drive\docs", "docs/", 0, isPlaceholder: true, isDirectory: true, size: 0, modifiedUtc: now, inSync: true);
+        store.UpsertFile("docs/a.txt", @"C:\drive\docs\a.txt", "docs/a.txt", 0, isPlaceholder: true, isDirectory: false, size: 1, modifiedUtc: now, inSync: true);
+
+        Assert.False(store.WasListed("docs"));
+        store.MarkListed("docs/a.txt"); // a file is never marked
+        store.MarkListed("docs");
+        Assert.True(store.WasListed("docs"));
+        Assert.True(store.WasListed("docs/"));
+        Assert.False(store.WasListed("docs/a.txt"));
+
+        // Listed again by its parent: the folder row is written again, the mark stays.
+        store.UpsertFile("docs/", @"C:\drive\docs", "docs/", 0, isPlaceholder: true, isDirectory: true, size: 0, modifiedUtc: now, inSync: true);
+        Assert.True(store.WasListed("docs"));
+
+        // Renamed here: the mark moves with it.
+        store.RenameTree("docs", "papers", @"C:\drive\docs", @"C:\drive\papers");
+        Assert.True(store.WasListed("papers"));
+        Assert.False(store.WasListed("docs"));
+    }
+
+    [Fact]
     public void Hashes_AreKept_UpdatedWithTheServersVersion_AndForgotten()
     {
         var store = new SqliteMetadataStore(TempDbPath());

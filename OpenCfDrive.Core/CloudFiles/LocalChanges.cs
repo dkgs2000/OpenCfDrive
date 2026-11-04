@@ -192,11 +192,21 @@ public sealed class LocalChanges(SqliteMetadataStore store)
     }
 
     /// <summary>Any change of this item is waiting.</summary>
-    public bool HasChangeFor(string localPath)
+    public bool HasChangeFor(string localPath) => HasChangeFor(localPath, []);
+
+    /// <summary>
+    /// A change of this item is waiting besides <paramref name="except"/>, the
+    /// ones a run is carrying out. A change reported again meanwhile counts:
+    /// it is numbered anew (see <see cref="Changed"/>).
+    /// </summary>
+    public bool HasChangeFor(string localPath, IReadOnlyCollection<LocalChange> except)
     {
+        var excluded = except.Select(c => c.Seq).ToHashSet();
         lock (_gate)
         {
-            return _changes.Any(c => Same(c.LocalPath, localPath) || (c.NewLocalPath is not null && Same(c.NewLocalPath, localPath)));
+            return _changes.Any(c =>
+                !excluded.Contains(c.Seq) &&
+                (Same(c.LocalPath, localPath) || (c.NewLocalPath is not null && Same(c.NewLocalPath, localPath))));
         }
     }
 

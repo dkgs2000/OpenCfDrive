@@ -44,6 +44,7 @@ public sealed class CloudPlaceholderService
 {
     private const uint FILE_ATTRIBUTE_ARCHIVE = 0x00000020;
     private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+    private const uint FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000;
     private const int HRESULT_ALREADY_EXISTS = unchecked((int)0x800700B7);
 
     /// <summary>Identity blob attached to every placeholder; this is what cfapi hands back in callbacks.</summary>
@@ -432,6 +433,21 @@ public sealed class CloudPlaceholderService
                 Marshal.FreeHGlobal(ptr);
             }
         }
+    }
+
+    /// <summary>
+    /// Whether the file's data, or some of it, is on this PC, from its
+    /// attributes alone: one lookup, no handle opened (a placeholder's
+    /// reparse tag needs one). Windows sets RECALL_ON_DATA_ACCESS while a
+    /// placeholder's data is not all here; a plain file never has it.
+    /// For checks that run over many files.
+    /// </summary>
+    public static bool HasLocalData(string localPath)
+    {
+        var data = new WIN32_FILE_ATTRIBUTE_DATA();
+        return GetFileAttributesExW(localPath, 0, ref data) &&
+               (data.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+               (data.FileAttributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) == 0;
     }
 
     /// <summary>Reads the placeholder state and real Windows file id for a created item.</summary>

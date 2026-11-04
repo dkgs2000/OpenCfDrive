@@ -56,7 +56,6 @@ internal static class CfApi
 
     [DllImport("cldapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
     internal static extern int CfExecute(ref CF_OPERATION_INFO opInfo, ref CF_OPERATION_PARAMETERS opParams);
-
     // Same native entry point; the union is overlaid with its
     // TransferPlaceholders member instead of TransferData.
     [DllImport("cldapi.dll", EntryPoint = "CfExecute", ExactSpelling = true, CharSet = CharSet.Unicode)]
@@ -65,6 +64,19 @@ internal static class CfApi
     // Same native entry point; AckDelete / AckRename member of the union.
     [DllImport("cldapi.dll", EntryPoint = "CfExecute", ExactSpelling = true, CharSet = CharSet.Unicode)]
     internal static extern int CfExecute(ref CF_OPERATION_INFO opInfo, ref CF_OPERATION_PARAMETERS_ACK opParams);
+
+    /// <summary>
+    /// Reports a provider's progress for the transfer the callback is serving.
+    /// Windows shows it on the item (and resets the 60 s callback timeout), so
+    /// a large download does not look hung. Both numbers are 64-bit
+    /// (LARGE_INTEGER).
+    /// </summary>
+    [DllImport("cldapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    internal static extern int CfReportProviderProgress(
+        CF_CONNECTION_KEY connectionKey,
+        long transferKey,
+        long providerProgressTotal,
+        long providerProgressCompleted);
 
     [DllImport("cldapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
     internal static extern int CfUpdatePlaceholder(

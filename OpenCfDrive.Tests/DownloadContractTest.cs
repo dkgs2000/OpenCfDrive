@@ -101,6 +101,40 @@ public class DownloadContractTest(ITestOutputHelper output)
         }
     }
 
+    /// <summary>
+    /// A large download reports provider progress as bytes arrive (at least
+    /// once before the first byte and then as it goes), so Windows can show a
+    /// progress bar and keeps the callback alive. The read still completes and
+    /// the bytes are whole.
+    /// </summary>
+    [SkippableFact]
+    public void ADownload_ReportsProviderProgress_AsBytesArrive()
+    {
+        Skip.IfNot(
+            Prerequisites.CloudFilesAvailable,
+            $"Cloud Files API unavailable on this host: {Prerequisites.CloudFilesReason}");
+
+        const int length = 2 * 1024 * 1024;
+        var body = Enumerable.Repeat((byte)'p', length).ToArray();
+        using var server = new OneByteServer(
+            () => Task.CompletedTask,
+            body: body,
+            chunkSize: 64 * 1024,
+            pause: TimeSpan.FromMilliseconds(15));
+        using var drive = new Drive(output, server, prepareDownload: null, name: "big.bin", identity: "big.bin", size: length);
+
+        var read = drive.Read("big.bin");
+
+        Assert.Equal(length, read.Length);
+
+        // The whole file fits in one 4 MB transfer to Windows, so a report
+        // only per transfer would make two. As bytes arrive it is at least one
+        // per 256 KB.
+        const int expected = length / (256 * 1024);
+        Assert.True(drive.Connection.ProgressReports >= expected,
+            $"Only {drive.Connection.ProgressReports} progress report(s) were made; expected at least {expected} as bytes arrived.");
+    }
+
     /// <summary>A sync root with one online-only file, a.txt, whose placeholder names "old.txt".</summary>
     private sealed class Drive : IDisposable
     {
@@ -110,7 +144,8 @@ public class DownloadContractTest(ITestOutputHelper output)
         private readonly RcloneServeClient _serve;
         private readonly ConcurrentQueue<string> _log = new();
 
-        public Drive(ITestOutputHelper output, OneByteServer server, SyncRootConnection.PrepareDownload? prepareDownload)
+        public Drive(ITestOutputHelper output, OneByteServer server, SyncRootConnection.PrepareDownload? prepareDownload,
+            string name = "a.txt", string identity = "old.txt", long size = 1)
         {
             _output = output;
             _root = Path.Combine(Path.GetTempPath(), "opencfdrive-download", Guid.NewGuid().ToString("N"));
@@ -128,8 +163,10 @@ public class DownloadContractTest(ITestOutputHelper output)
                 store,
                 _serve,
                 _log.Enqueue,
-                listDirectory: (directory, _, _) => Task.FromResult<IReadOnlyList<PlaceholderEntry>?>(
-                    directory.Length == 0 ? [new PlaceholderEntry("a.txt", false, 1, now, "old.txt")] : []),
+                listDirectory: (directory, _, _) => Task.FromResult<SyncRootConnection.DirectoryListing?>(
+                    new SyncRootConnection.DirectoryListing(
+                        directory.Length == 0 ? [new PlaceholderEntry(name, false, size, now, identity)] : [],
+                        Listed: true)),
                 prepareDownload: prepareDownload);
             Assert.True(Connection.Connect(SyncRoot), "CfConnectSyncRoot failed.");
             Assert.True(new CloudPlaceholderService().EnableOnDemandPopulation(SyncRoot));
