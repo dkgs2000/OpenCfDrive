@@ -13,6 +13,13 @@ runs:
       with:
         dotnet-version: 10.0.x
 
+    # Kept between runs, so a run downloads rclone only for a new version.
+    - name: Cache rclone ${{ inputs.rclone-version }}
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/rclone
+        key: rclone-${{ inputs.rclone-version }}-windows-amd64
+
     - name: Install rclone ${{ inputs.rclone-version }}
       shell: powershell
       # Not RCLONE_VERSION: rclone reads every RCLONE_<NAME> variable as the
@@ -20,11 +27,32 @@ runs:
       env:
         WANTED_VERSION: ${{ inputs.rclone-version }}
       run: |
-        $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
-        $url = "https://downloads.rclone.org/$env:WANTED_VERSION/rclone-$env:WANTED_VERSION-windows-amd64.zip"
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
         $target = Join-Path $env:RUNNER_TEMP "rclone"
-        Expand-Archive -Path $zip -DestinationPath $target -Force
-        $folder = (Get-ChildItem -Path $target -Directory | Select-Object -First 1).FullName
+        # Not cached (or a broken cache): downloaded. The download fails now
+        # and then (the server resets the connection midway), so it is tried
+        # again at once, from rclone's own server and its GitHub release in
+        # turn, which publish the same zip.
+        if (-not (Get-ChildItem -Path $target -Filter rclone.exe -Recurse -ErrorAction SilentlyContinue)) {
+          $name = "rclone-$env:WANTED_VERSION-windows-amd64.zip"
+          $sources = @(
+            "https://downloads.rclone.org/$env:WANTED_VERSION/$name",
+            "https://github.com/rclone/rclone/releases/download/$env:WANTED_VERSION/$name")
+          $zip = Join-Path $env:RUNNER_TEMP $name
+          # Windows PowerShell's progress bar slows a download many times over.
+          $ProgressPreference = "SilentlyContinue"
+          for ($attempt = 1; ; $attempt++) {
+            $url = $sources[($attempt - 1) % $sources.Count]
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 120
+              if (Test-Path $target) { Remove-Item -Path $target -Recurse -Force }
+              Expand-Archive -Path $zip -DestinationPath $target -Force
+              break
+            } catch {
+              Write-Host "Attempt $attempt ($url) failed: $($_.Exception.Message)"
+              if ($attempt -ge 4) { throw }
+            }
+          }
+        }
+        $folder = (Get-ChildItem -Path $target -Filter rclone.exe -Recurse | Select-Object -First 1).DirectoryName
         [System.IO.File]::AppendAllText($env:GITHUB_PATH, "$folder`n")
         & (Join-Path $folder "rclone.exe") version
