@@ -170,9 +170,8 @@ When the server can't be reached, the drive goes offline and the app shows
 - folders show what is already on this computer;
 - files you downloaded open as usual, and files that were never downloaded
   can't be opened;
-- edits, new files, new folders, deletes and renames are kept, in the order you
-  made them, even across a restart. They're sent once the server answers
-  again.
+- edits, new files, new folders, deletes and renames are kept, even across a
+  restart. They're sent once the server answers again.
 
 OpenCfDrive checks for the server again when Windows reports a network change,
 when you use the drive, and on a schedule: about a minute after going offline,
@@ -186,20 +185,22 @@ copy changed in the meantime. In that case:
 
 | On the server | Here | What happens |
 | --- | --- | --- |
-| changed | edited, not sent yet | Both are kept. The server's version keeps the name. Your version is saved as `name (conflicted copy 2026-11-03 175504).ext`, using the time of your edit, and that copy is uploaded too. |
+| changed | edited, not sent yet | Both are kept. The server's version keeps the name. Your version is saved as `name (conflicted copy 2026-11-03 175504).ext`, using the time of your edit, and that copy is uploaded too. If the remote keeps content hashes and both sides now hold the same content, it's not a conflict: the file is simply in sync. |
 | deleted | edited, not sent yet | Your file is kept and uploaded again. |
 | folder deleted | files inside edited, not sent yet | Those files and their folders are kept and uploaded again. Everything else in the folder is removed. |
 | changed | deleted | Your delete isn't sent, and the server's version comes back. |
-| a new file | a different new file at the same path | Both are kept, yours as a conflict copy. Files with the same size and time count as the same file. |
+| a new file | a different new file at the same path | Both are kept, yours as a conflict copy. Files with the same content hash, or the same size and time, count as the same file. (On a remote that can't set file times, such as plain WebDAV, the times never match.) |
 | unchanged | edited | Not a conflict: your edit is uploaded. |
 
 To resolve a conflict, delete whichever version you don't want. The copy is on
 the server too, so other devices see it.
 
-OpenCfDrive tells files apart by size and modification time, not by content.
-A server change that keeps both the same isn't noticed. If the server copy
-changes in the split second between OpenCfDrive's last check and its upload,
-the upload overwrites it.
+Where the remote keeps content hashes (S3, Google Drive, OneDrive, Dropbox, B2
+and others), OpenCfDrive uses them to tell whether a file really changed. On
+remotes without them (plain WebDAV, FTP, SMB, SFTP and others) it goes by size
+and modification time, so a server change that keeps both the same isn't
+noticed there. And if the server copy changes in the split second between
+OpenCfDrive's last check and its upload, the upload overwrites it.
 
 ## Updates
 

@@ -90,13 +90,15 @@ public class SqliteMetadataStoreTests
         var store = new SqliteMetadataStore(path);
         store.Initialize();
 
-        store.AddPendingChange(PendingChangeKind.Delete, "a.txt", @"C:\drive\a.txt");
-        store.AddPendingChange(PendingChangeKind.Rename, "old/", @"C:\drive\old", @"C:\drive\new");
-        store.AddPendingChange(PendingChangeKind.Delete, "a.txt", @"C:\drive\a.txt");
+        var delete = store.AddPendingChange(PendingChangeKind.Delete, "a.txt", @"C:\drive\a.txt");
+        var rename = store.AddPendingChange(PendingChangeKind.Rename, "old/", @"C:\drive\old", @"C:\drive\new");
+        Assert.Equal(delete, store.AddPendingChange(PendingChangeKind.Delete, "a.txt", @"C:\drive\a.txt"));
+        Assert.NotEqual(delete, rename);
 
         var reopened = new SqliteMetadataStore(path);
         reopened.Initialize();
         var changes = reopened.GetPendingChanges();
+        Assert.Equal([delete, rename], changes.Select(c => c.Id));
         Assert.Collection(
             changes,
             delete => Assert.Equal((PendingChangeKind.Delete, "a.txt", (string?)null), (delete.Kind, delete.RemotePath, delete.NewLocalPath)),
@@ -104,6 +106,27 @@ public class SqliteMetadataStoreTests
 
         reopened.RemovePendingChange(changes[0].Id);
         Assert.Equal("old/", Assert.Single(reopened.GetPendingChanges()).RemotePath);
+    }
+
+    [Fact]
+    public void Hashes_AreKept_UpdatedWithTheServersVersion_AndForgotten()
+    {
+        var store = new SqliteMetadataStore(TempDbPath());
+        store.Initialize();
+
+        store.UpsertFile("a.txt", @"C:\drive\a.txt", "a.txt", 0, true, false, 5, DateTimeOffset.UtcNow, hash: "md5:aa");
+        store.UpsertFile("b.txt", @"C:\drive\b.txt", "b.txt", 0, true, false, 5, DateTimeOffset.UtcNow);
+        Assert.Equal("md5:aa", store.GetByRemotePath("a.txt")?.Hash);
+        Assert.Null(store.GetByRemotePath("b.txt")?.Hash);
+
+        store.UpdateRemoteMetadata("a.txt", 6, DateTimeOffset.UtcNow, dehydrated: true, hash: "md5:bb");
+        store.SetHash("b.txt", "md5:cc");
+        Assert.Equal("md5:bb", store.GetByRemotePath("a.txt")?.Hash);
+        Assert.Equal("md5:cc", store.GetByRemotePath("b.txt")?.Hash);
+
+        store.ClearHashes();
+        Assert.Null(store.GetByRemotePath("a.txt")?.Hash);
+        Assert.Null(store.GetByRemotePath("b.txt")?.Hash);
     }
 
     [Fact]

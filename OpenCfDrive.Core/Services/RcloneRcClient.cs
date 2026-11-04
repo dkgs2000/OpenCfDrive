@@ -5,6 +5,21 @@ using OpenCfDrive.Core.Models;
 namespace OpenCfDrive.Core.Services;
 
 /// <summary>
+/// What a listing or lookup returns besides names and sizes. Mime types are
+/// never asked for: nothing uses them, and on some remotes (S3) each costs a
+/// request per file.
+/// </summary>
+/// <param name="HashType">The hash to return with each file (rclone's name), or none.</param>
+/// <param name="WithTimes">
+/// Each file's time. On remotes where it costs a request per file (S3) a
+/// listing without them is one request for the whole folder.
+/// </param>
+public sealed record ListingOptions(string? HashType = null, bool WithTimes = true)
+{
+    public static ListingOptions Default { get; } = new();
+}
+
+/// <summary>
 /// Thin typed client over the rclone Remote Control API (rclone rcd).
 ///
 /// Endpoint quirks verified against rclone v1.75.2:
@@ -53,7 +68,7 @@ public sealed class RcloneRcClient : IDisposable
     public async Task<IReadOnlyList<CloudItem>> ListFilesAsync(string remotePath, CancellationToken cancellationToken = default)
     {
         var (fs, remote) = SplitRemote(remotePath);
-        return RelativeTo(remote, await ListAsync(fs, remote, recurse: true, cancellationToken).ConfigureAwait(false));
+        return RelativeTo(remote, await ListAsync(fs, remote, recurse: true, ListingOptions.Default, cancellationToken).ConfigureAwait(false));
     }
 
     /// <summary>
@@ -61,17 +76,42 @@ public sealed class RcloneRcClient : IDisposable
     /// returned paths are relative to <paramref name="remotePath"/>, like the
     /// paths the metadata store and the serve client use.
     /// </summary>
+    public Task<IReadOnlyList<CloudItem>> ListDirectoryAsync(
+        string remotePath,
+        string relativeDirectory,
+        CancellationToken cancellationToken = default) =>
+        ListDirectoryAsync(remotePath, relativeDirectory, ListingOptions.Default, cancellationToken);
+
     public async Task<IReadOnlyList<CloudItem>> ListDirectoryAsync(
         string remotePath,
         string relativeDirectory,
+        ListingOptions options,
         CancellationToken cancellationToken = default)
     {
         var (fs, baseRemote) = SplitRemote(remotePath);
         var directory = relativeDirectory.Replace('\\', '/').Trim('/');
         var remote = string.Join('/', new[] { baseRemote, directory }.Where(p => p.Length > 0));
 
-        var items = await ListAsync(fs, remote, recurse: false, cancellationToken).ConfigureAwait(false);
+        var items = await ListAsync(fs, remote, recurse: false, options, cancellationToken).ConfigureAwait(false);
         return RelativeTo(baseRemote, items);
+    }
+
+    /// <summary>The <c>opt</c> of operations/list and operations/stat.</summary>
+    private static Dictionary<string, object> ListingOpt(ListingOptions options, bool recurse)
+    {
+        var opt = new Dictionary<string, object> { ["recurse"] = recurse, ["noMimeType"] = true };
+        if (!options.WithTimes)
+        {
+            opt["noModTime"] = true;
+        }
+
+        if (options.HashType is { } hashType)
+        {
+            opt["showHash"] = true;
+            opt["hashTypes"] = new[] { hashType };
+        }
+
+        return opt;
     }
 
     /// <summary>
@@ -107,6 +147,7 @@ public sealed class RcloneRcClient : IDisposable
         string fs,
         string remote,
         bool recurse,
+        ListingOptions options,
         CancellationToken cancellationToken)
     {
         // rclone v1.75 ignores a top-level "recursive" key: recursion is a
@@ -116,7 +157,7 @@ public sealed class RcloneRcClient : IDisposable
         {
             fs,
             remote,
-            opt = new { recurse },
+            opt = ListingOpt(options, recurse),
         };
 
         using var request = new HttpRequestMessage(HttpMethod.Post, $"{_rcUrl}/operations/list")
@@ -141,7 +182,7 @@ public sealed class RcloneRcClient : IDisposable
 
         foreach (var entry in listElement.EnumerateArray())
         {
-            if (ParseItem(entry) is { } item)
+            if (ParseItem(entry, options.HashType) is { } item)
             {
                 items.Add(item);
             }
@@ -156,9 +197,16 @@ public sealed class RcloneRcClient : IDisposable
     /// parent costs a read of the whole folder. The path is relative to
     /// <paramref name="remotePath"/>.
     /// </summary>
+    public Task<CloudItem?> StatAsync(
+        string remotePath,
+        string relativePath,
+        CancellationToken cancellationToken = default) =>
+        StatAsync(remotePath, relativePath, ListingOptions.Default, cancellationToken);
+
     public async Task<CloudItem?> StatAsync(
         string remotePath,
         string relativePath,
+        ListingOptions options,
         CancellationToken cancellationToken = default)
     {
         var (fs, baseRemote) = SplitRemote(remotePath);
@@ -167,7 +215,7 @@ public sealed class RcloneRcClient : IDisposable
         using var request = new HttpRequestMessage(HttpMethod.Post, $"{_rcUrl}/operations/stat")
         {
             Content = new StringContent(
-                JsonSerializer.Serialize(new { fs, remote }),
+                JsonSerializer.Serialize(new { fs, remote, opt = ListingOpt(options, recurse: false) }),
                 System.Text.Encoding.UTF8,
                 "application/json"),
         };
@@ -181,10 +229,11 @@ public sealed class RcloneRcClient : IDisposable
             return null;
         }
 
-        return ParseItem(itemElement) is { } item ? RelativeTo(baseRemote, [item])[0] : null;
+        return ParseItem(itemElement, options.HashType) is { } item ? RelativeTo(baseRemote, [item])[0] : null;
     }
 
-    private static CloudItem? ParseItem(JsonElement entry)
+    /// <param name="hashType">The hash asked for, kept as "type:value"; files without one have none.</param>
+    private static CloudItem? ParseItem(JsonElement entry, string? hashType)
     {
         var path = entry.TryGetProperty("Path", out var pathProp) ? pathProp.GetString() : null;
         if (string.IsNullOrWhiteSpace(path))
@@ -212,7 +261,11 @@ public sealed class RcloneRcClient : IDisposable
             Size = entry.TryGetProperty("Size", out var sizeProp) && sizeProp.TryGetInt64(out var size) ? size : 0,
             ModifiedTime = modified,
             MimeType = entry.TryGetProperty("MimeType", out var mimeProp) ? mimeProp.GetString() : null,
-            Hash = entry.TryGetProperty("Hash", out var hashProp) ? hashProp.GetString() : null,
+            Hash = hashType is not null &&
+                   entry.TryGetProperty("Hashes", out var hashes) && hashes.ValueKind == JsonValueKind.Object &&
+                   hashes.TryGetProperty(hashType, out var hashProp) && hashProp.GetString() is { Length: > 0 } hash
+                ? $"{hashType}:{hash}"
+                : null,
         };
     }
 
@@ -313,11 +366,12 @@ public sealed class RcloneRcClient : IDisposable
     /// directory move where it has one; otherwise rclone copies and deletes.
     /// </summary>
     /// <summary>
-    /// Whether the remote keeps a folder with nothing in it (rclone's
-    /// CanHaveEmptyDirectories, from <c>operations/fsinfo</c>). Bucket stores
-    /// such as S3 only have folders as parts of file names.
+    /// What the remote keeps and what costs extra to read
+    /// (<c>operations/fsinfo</c>): its hashes, how exact its times are, and
+    /// whether it keeps a folder with nothing in it (bucket stores such as S3
+    /// only have folders as parts of file names).
     /// </summary>
-    public async Task<bool> CanHaveEmptyDirectoriesAsync(string remotePath, CancellationToken cancellationToken = default)
+    public async Task<RemoteCapabilities> GetCapabilitiesAsync(string remotePath, CancellationToken cancellationToken = default)
     {
         var (fs, _) = SplitRemote(remotePath);
         using var request = new HttpRequestMessage(HttpMethod.Post, $"{_rcUrl}/operations/fsinfo")
@@ -328,9 +382,40 @@ public sealed class RcloneRcClient : IDisposable
         using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
-        return !doc.RootElement.TryGetProperty("Features", out var features) ||
-               !features.TryGetProperty("CanHaveEmptyDirectories", out var empty) ||
-               empty.ValueKind != JsonValueKind.False;
+        return RemoteCapabilities.FromFsInfo(doc.RootElement);
+    }
+
+    /// <summary>
+    /// A local file's hash of the given type (<c>operations/hashsumfile</c>),
+    /// lowercase hex, or null if rclone has none for it. rclone makes every
+    /// type it knows, a remote's own (QuickXorHash, Dropbox's) included, so a
+    /// local file can be compared with any remote.
+    /// </summary>
+    public async Task<string?> HashLocalFileAsync(string localPath, string hashType, CancellationToken cancellationToken = default)
+    {
+        var payload = new
+        {
+            fs = Path.GetDirectoryName(Path.GetFullPath(localPath)),
+            remote = Path.GetFileName(localPath),
+            hashType,
+        };
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{_rcUrl}/operations/hashsumfile")
+        {
+            Content = new StringContent(JsonSerializer.Serialize(payload), System.Text.Encoding.UTF8, "application/json"),
+        };
+
+        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"operations/hashsumfile failed ({(int)response.StatusCode}): {body}");
+        }
+
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.TryGetProperty("hash", out var hash) && hash.GetString() is { Length: > 0 } value
+            ? value.ToLowerInvariant()
+            : null;
     }
 
     /// <summary>

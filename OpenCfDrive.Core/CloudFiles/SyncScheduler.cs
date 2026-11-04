@@ -1,34 +1,50 @@
 namespace OpenCfDrive.Core.CloudFiles;
 
 /// <summary>
-/// When the drive looks at the server for changes, the way Nextcloud's desktop
-/// client schedules its sync runs: one when it starts, then one every remote
-/// poll interval (Nextcloud's remotePollInterval, 30 s by default), and one
-/// whenever it is asked to (back online, or "sync now"). One run at a time:
-/// asking while one runs queues a single further run, since the one running
-/// may have looked at the server before the change that prompted the request.
+/// When the drive syncs, the way Nextcloud's desktop client schedules its sync
+/// runs. A full run (local changes, then a look at the server) when it starts,
+/// then every remote poll interval (Nextcloud's remotePollInterval, 30 s by
+/// default), and whenever it is asked to (back online, or "sync now"). A local
+/// run (local changes only) a moment after the last local change, as
+/// Nextcloud's folder watcher schedules a sync soon after a change.
+/// One run at a time: asking while one runs queues a single further run, since
+/// the one running may have looked before the change that prompted the request;
+/// a full request covers a local one waiting with it.
 /// </summary>
 public sealed class SyncScheduler : IDisposable
 {
     /// <summary>Nextcloud's ConfigFile::remotePollInterval default.</summary>
     public static readonly TimeSpan DefaultInterval = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// How long a local run waits after the last local change. At least a
+    /// second, so a save that deletes the file and puts a new one in its place
+    /// is seen as one replacement, not a delete.
+    /// </summary>
+    public static readonly TimeSpan LocalChangeDelay = TimeSpan.FromSeconds(1);
+
     /// <summary>Overrides the interval in seconds (tests and scripts).</summary>
     public const string IntervalVariable = "OPENCFDRIVE_REMOTE_POLL_SECONDS";
 
-    private readonly Func<CancellationToken, Task> _run;
+    private readonly Func<bool, CancellationToken, Task> _run;
     private readonly ITimer _timer;
+    private readonly ITimer _localTimer;
     private readonly CancellationTokenSource _stopping = new();
     private readonly object _gate = new();
-    private Task? _running;
-    private Task? _queued;
+    private Task? _worker;
+    private bool _wantFull;
+    private bool _wantLocal;
+    private TaskCompletionSource? _next;
 
-    /// <param name="run">One sync run; it handles its own errors.</param>
-    public SyncScheduler(Func<CancellationToken, Task> run, TimeSpan interval, TimeProvider? time = null)
+    /// <param name="run">One sync run, full when its first argument is true.</param>
+    /// <param name="time">Its two timers are made in order: the interval, then the local delay.</param>
+    public SyncScheduler(Func<bool, CancellationToken, Task> run, TimeSpan interval, TimeProvider? time = null)
     {
         _run = run;
         Interval = interval;
-        _timer = (time ?? TimeProvider.System).CreateTimer(_ => _ = SyncNowAsync(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        var clock = time ?? TimeProvider.System;
+        _timer = clock.CreateTimer(_ => _ = SyncNowAsync(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        _localTimer = clock.CreateTimer(_ => _ = RequestAsync(full: false), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
     }
 
     public TimeSpan Interval { get; }
@@ -39,11 +55,29 @@ public sealed class SyncScheduler : IDisposable
             ? TimeSpan.FromSeconds(seconds)
             : DefaultInterval;
 
-    /// <summary>The first run, at once.</summary>
+    /// <summary>The first full run, at once.</summary>
     public void Start() => _ = SyncNowAsync();
 
-    /// <summary>A run that starts after this call; completes when it has finished.</summary>
-    public Task SyncNowAsync()
+    /// <summary>A full run that starts after this call; completes when it has finished.</summary>
+    public Task SyncNowAsync() => RequestAsync(full: true);
+
+    /// <summary>
+    /// A local change was made: a local run once <see cref="LocalChangeDelay"/>
+    /// has passed without another. Under constant changes the interval's full
+    /// runs still send them.
+    /// </summary>
+    public void RequestLocalRun()
+    {
+        lock (_gate)
+        {
+            if (!_stopping.IsCancellationRequested)
+            {
+                _localTimer.Change(LocalChangeDelay, Timeout.InfiniteTimeSpan);
+            }
+        }
+    }
+
+    private Task RequestAsync(bool full)
     {
         lock (_gate)
         {
@@ -52,56 +86,63 @@ public sealed class SyncScheduler : IDisposable
                 return Task.CompletedTask;
             }
 
-            if (_running is null)
-            {
-                _running = RunAsync();
-                return _running;
-            }
+            _wantFull |= full;
+            _wantLocal |= !full;
 
-            // The one running may predate the request: one more after it,
-            // shared by everyone who asks meanwhile.
-            return _queued ??= ContinueAfterAsync(_running);
+            // Shared by everyone who asks before the next run starts.
+            var next = _next ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _worker ??= WorkAsync();
+            return next.Task;
         }
     }
 
-    private async Task ContinueAfterAsync(Task running)
-    {
-        await running.ConfigureAwait(false);
-        Task next;
-        lock (_gate)
-        {
-            _queued = null;
-            if (_stopping.IsCancellationRequested)
-            {
-                return;
-            }
-
-            next = _running ??= RunAsync();
-        }
-
-        await next.ConfigureAwait(false);
-    }
-
-    private async Task RunAsync()
+    private async Task WorkAsync()
     {
         // Off the caller's thread: a timer callback or a request handler.
         await Task.Yield();
-        try
+        while (true)
         {
-            _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-            await _run(_stopping.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (_stopping.IsCancellationRequested)
-        {
-        }
-        finally
-        {
+            bool full;
+            TaskCompletionSource done;
             lock (_gate)
             {
-                _running = null;
-                if (!_stopping.IsCancellationRequested)
+                if (_stopping.IsCancellationRequested || (!_wantFull && !_wantLocal) || _next is null)
                 {
-                    _timer.Change(Interval, Timeout.InfiniteTimeSpan);
+                    _worker = null;
+                    return;
+                }
+
+                full = _wantFull;
+                _wantFull = _wantLocal = false;
+                done = _next;
+                _next = null;
+                if (full)
+                {
+                    _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+                }
+            }
+
+            try
+            {
+                await _run(full, _stopping.Token).ConfigureAwait(false);
+                done.TrySetResult();
+            }
+            catch (OperationCanceledException) when (_stopping.IsCancellationRequested)
+            {
+                done.TrySetResult();
+            }
+            catch (Exception ex)
+            {
+                done.TrySetException(ex);
+            }
+            finally
+            {
+                lock (_gate)
+                {
+                    if (full && !_stopping.IsCancellationRequested)
+                    {
+                        _timer.Change(Interval, Timeout.InfiniteTimeSpan);
+                    }
                 }
             }
         }
@@ -120,5 +161,6 @@ public sealed class SyncScheduler : IDisposable
         }
 
         _timer.Dispose();
+        _localTimer.Dispose();
     }
 }

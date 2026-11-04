@@ -8,6 +8,7 @@ sync engine.
 - [The namespace model](#the-namespace-model)
 - [Invariants](#invariants)
 - [Detecting conflicts](#detecting-conflicts)
+- [What tells a change](#what-tells-a-change)
 - [Expected behaviour, not bugs](#expected-behaviour-not-bugs)
 - [Why .NET and Explorer sometimes disagree on placeholder state](#why-net-and-explorer-sometimes-disagree-on-placeholder-state)
 
@@ -56,8 +57,9 @@ folder on demand.
   time each folder is opened. Nothing is crawled.
 - A folder once listed stays fully populated, and the background sync keeps it
   current: every 30 s, right after the server is back, and on request.
-- Local changes are picked up by the Cloud Files notifications and a file
-  watcher, and sent to the server.
+- Local changes are recorded from the Cloud Files notifications and a file
+  watcher, and sent to the server in one plan per sync run, which starts a
+  second after the last change.
 - When the server can't be reached, the drive is offline. It serves what is
   local and keeps local changes until the server answers.
 
@@ -109,10 +111,11 @@ The invariants below spell out how.
   own network error) puts the drive offline (`ServerConnection`). Until the
   server answers again, a folder never opened shows what is local at once
   instead of waiting 10 s, an online-only file fails to open at once, as in
-  Nextcloud, and nothing made here is lost: edits and new folders wait and are
-  sent once the server answers, and deletes and renames are kept in the store
-  (`PendingChanges`, so they survive a restart, like Nextcloud's journal), in
-  the order made, with the items they change left alone by listings meanwhile.
+  Nextcloud, and nothing made here is lost: the runs send nothing and every
+  local change waits, deletes and renames in the store's journal
+  (`PendingChanges`, so they survive a restart, like Nextcloud's journal), with
+  the items they change left alone by listings meanwhile. The first run once
+  the server answers sends them in one plan.
   The server is checked again when Windows reports a network change, when the
   drive is used, and on Nextcloud's schedule: 62 s after going offline, then
   one more 62 s per failed check, at most 8 × 62 s. The app shows "Offline".
@@ -120,11 +123,12 @@ The invariants below spell out how.
   as Nextcloud's local discovery finds them: edited and new files are
   uploaded, new folders created. Deletes are not taken from it: unregistering
   the drive removes every online-only file, and that must never delete them on
-  the server. What is missing comes back from the server instead.
+  the server. What is missing comes back from the server instead; the deletes
+  made before the service stopped are in the journal.
 - **New folders, empty ones too, are created on the server**
-  (`operations/mkdir`), held for a moment like an upload so that Explorer's
-  "New folder" renamed right away reaches the server under the name that
-  stays. A folder moved in from outside the drive is reported alone, so what it
+  (`operations/mkdir`) by the run after they are made, so Explorer's "New
+  folder" renamed right away reaches the server under the name that stays. A
+  folder moved in from outside the drive is reported alone, so what it
   holds is uploaded with it. Remotes without empty folders (rclone's
   `CanHaveEmptyDirectories`, false for S3 and other bucket stores) cannot hold
   an empty one: it stays here, and its absence on the server is not taken for
@@ -133,41 +137,60 @@ The invariants below spell out how.
   changes the server does not have yet is uploaded first and freed after, as
   OneDrive does; the platform's own refusal covers only what in-sync tells.
 - **A placeholder's size is the platform's record, not the file's.** A save
-  that changes a file's size in place leaves the platform's record at the old
-  size, and a file freed after that downloads back only that much (the rest
-  reads as zeros). The size is given again when a file is marked in sync after
-  an upload and when it is freed, as Nextcloud does
-  (`EditedPlaceholderContractTest`).
+  in place leaves the platform's record at the old size. A file it made
+  bigger, once freed, downloads back only that much and zeros after it. The
+  size is given again when a file is marked in sync after an upload and when
+  it is freed, as Nextcloud does (`EditedPlaceholderContractTest`; the E2E
+  scenarios C25, C29 and S25 fail without it).
 - **"Always keep on this device" downloads through a handle without data
   access.** A write handle is refused while a program has the file open
   sharing reads only, and refuses such a program for a moment after the file
   already shows as downloaded (`HydratePlaceholderContractTest`).
+- **Local changes are sent in one plan per sync run, as Nextcloud's sync runs
+  do.** Nothing is sent the moment it is reported. Cloud Files'
+  `NOTIFY_DELETE` / `NOTIFY_RENAME` and the file watcher only record what
+  changed (`LocalChanges`), and a run starts 1 s after the last change
+  (`SyncScheduler`); the timer's full runs, "sync now" and back online send
+  them too. The run plans every item once, read from the drive as it is then
+  (`LocalChangePlanner`), and carries the plan out in order: moves in the order
+  they were made, deletes, new folders (parents first), then uploads, three at
+  a time. Changes the server made are applied after the plan, in the same run;
+  one run at a time, so nothing of one runs beside anything else. Deletes and
+  renames are written to the store's journal (`PendingChanges`) the moment
+  they are reported and leave it once they reached the server, so one made
+  just before the service stops, or while offline, still reaches the server.
 - **Deletes and renames must be acknowledged.** `NOTIFY_DELETE` and
   `NOTIFY_RENAME` arrive *before* the operation, and the platform holds it until
   the provider answers `ACK_DELETE` / `ACK_RENAME`; without that the user's
-  delete or rename hangs. Both are always allowed, and the server is updated
-  afterwards. For placeholders these notifications are the source of truth:
+  delete or rename hangs. Both are always allowed, recorded for the next run
+  just before. For placeholders these notifications are the source of truth:
   the file watcher reports a move between folders as delete + create, and its
-  own rename events for placeholders are ignored, so nothing reaches the server
-  twice.
-- **A server delete waits until the item has really gone.** Both notifications
-  come before the operation, and it may not end in a delete:
+  own delete and rename events for placeholders are ignored.
+- **A delete is read from the drive when the run plans it.** It is reported
+  before it happens, and it may not end in a delete:
   - A move out of the drive (Recycle Bin) is announced before Windows downloads
     the file to take it along. Deleting the server copy at once made that
     download fail and the move with it.
   - Replacing a file (an editor saving through a temp file, or delete then
     rename into place) reports a delete of the original.
 
-  So the server copy is deleted only once the path has stayed empty for a
-  second. If a different file (another NTFS file id) appears there, it was
-  replaced: its upload updates the server copy, with no delete in between. If
-  the same file is still there 30 s after its last download, the operation
-  failed and the server copy is kept.
+  So the run deletes the server copy only if the path is empty. If a different
+  file (another NTFS file id) is there, it was replaced: its upload updates the
+  server copy, with no delete. If the same file is still there, the delete
+  waits for a later run (the next download that completes starts one), and
+  30 s after it was reported the operation counts as failed and the server copy
+  is kept.
+- **A folder deleted with what is inside is one delete,** whatever was
+  reported inside it and in whichever order. The run deletes the files this
+  client knows in it, then removes the server folder only if it is empty
+  (`operations/rmdirs`), so files added on the server that this client never
+  listed survive. A file renamed and then deleted is deleted under its old
+  name, the one the server has.
 - **Mock mode has only the file watcher, which reports a move between folders
-  as delete + create.** So a watcher delete is held for a second too. A file
-  back at the same path is a replacement. A file appearing elsewhere with the
-  size and exact write time the deleted one last had in sync is the same file
-  moved, and becomes one server move instead of a delete and an upload.
+  as delete + create.** A file appearing elsewhere with the size and exact
+  write time the deleted one last had in sync (or the same file id) is the
+  same file moved, and becomes one server move instead of a delete and an
+  upload. A renamed item the server never had is sent under its new name.
 - **In-sync alone does not prove a file unchanged.** The platform clears
   in-sync on most writes, but not all: an append that starts on a page boundary
   (to a downloaded 4 KiB file, say) leaves it set. So, like other sync clients
@@ -184,27 +207,20 @@ The invariants below spell out how.
   server it sets the new identity together with `MARK_IN_SYNC`, but only if the
   file was unchanged (see above) and has not been written since. Otherwise the
   renamed file would look edited and be downloaded and uploaded again.
-- **Folders.** A folder deleted locally deletes the files this client knows and
-  then removes the server folder only if it is empty (`operations/rmdirs`), so
-  files added on the server that this client never listed survive. Each file
-  is deleted once: its own notification and its folder's delete claim it in
-  the store, whichever comes first, and the folder waits for claimed deletes
-  still in flight before one `rmdirs`. A subfolder of a folder being deleted
-  leaves the work to its parent. A folder renamed locally is moved on the
-  server (`sync/move`), and every row and placeholder identity below it is
-  re-keyed so files inside still open.
+- **Folders renamed** locally are moved on the server (`sync/move`), and every
+  row and placeholder identity below it is re-keyed so files inside still open.
 - **Changes and deletes are applied after the reply.** `TRANSFER_PLACEHOLDERS`
   can only add entries, so the same listing is compared against the store (which
-  holds the server's last known size and time, also after uploads). Once the
-  shell has its reply, files deleted on the server are deleted locally, and
+  holds the server's last known size and time, also after uploads). The next
+  run, after its local changes, deletes locally the files deleted on the server, and
   changed files get `CfUpdatePlaceholder(MARK_IN_SYNC | DEHYDRATE)` with the
   new size and time. A local edit is first kept as a conflict copy (see
   [Detecting conflicts](#detecting-conflicts)), so this leaves out
   `VERIFY_IN_SYNC`, which would make the platform refuse a file edited
-  locally. A plain local file is converted to a placeholder first. Only a file
-  whose own upload or rename is still on its way is left for the next listing,
-  because this listing may predate it. Deletes that come from the server are
-  not sent back to it.
+  locally. A plain local file is
+  converted to a placeholder first. Only a file whose own upload or rename is
+  still on its way is left for the next listing, because this listing may
+  predate it. Deletes that come from the server are not sent back to it.
 - **Placeholder updates need the Win32 handle.** `CfOpenFileWithOplock` returns a
   protected handle that `CfUpdatePlaceholder` and friends reject with `E_HANDLE`.
   `CloudPlaceholderService.WithWin32Handle` references it and passes
@@ -292,8 +308,8 @@ or at the end of a name without one (`.hidden`, `Makefile`).
 The client notices a conflict in two places:
 
 - **When a folder is listed**, by the background sync or the first time it's
-  opened. The listing is compared with the size and time the client last saw
-  for each file.
+  opened. The listing is compared with what the client last saw for each file
+  (see [What tells a change](#what-tells-a-change)).
 - **Just before an upload or a delete.** It looks up that one file on the
   server (`operations/stat`), and sends the change only if the server still
   has the version the client last saw. This covers an edit saved while the
@@ -301,12 +317,49 @@ The client notices a conflict in two places:
 
 Known limits:
 
-- A server change is recognised by size and modification time (a difference of
-  1 s or more), not by content. A change that keeps both isn't seen.
+- On a remote without content hashes, a server change is recognised by size
+  and modification time (a difference of 1 s or more), so a change that keeps
+  both isn't seen there.
 - The check before an upload and the upload are two separate calls. A server
   change that lands between them is overwritten by the upload.
 - A file the client is still uploading, or has just renamed, is skipped by a
   listing that may predate that change. The check before the upload covers it.
+
+## What tells a change
+
+The client works with any rclone remote, and remotes differ in what they can
+tell about a file. So it asks once at start (`operations/fsinfo`, logged in one
+line) and uses the most each one offers, the way rclone itself decides
+(`RemoteCapabilities`, `FileVersions`):
+
+- **The size first**, then **the remote's own content hash** where both sides
+  have one, else **the time**. A server that writes the same content again (a
+  re-upload, a copy) has not changed the file; an edit that keeps size and time
+  has. The hash is the remote's own type (S3, Azure, Google Cloud Storage and
+  Swift keep MD5; B2 and Box SHA-1; OneDrive QuickXorHash; Dropbox its own;
+  Google Drive several, of which SHA-1 is used), read with the listing at no
+  extra cost, and kept in the store with its type (`md5:…`). Remotes that keep
+  none (plain WebDAV, FTP, SMB, HTTP, Mega, encrypted remotes) are told by size
+  and time; so are a local disk and SFTP, where rclone would read every file to
+  hash it. A file the remote keeps no hash for (on S3, one uploaded in parts by
+  another tool) is told by its time.
+- **Times to within the remote's precision**, at least a second. A remote that
+  can't set file times (plain WebDAV) lists its own upload times, so a local
+  and a server time never say "the same file" there.
+- **Listings ask for no MIME types**, and on a remote where each file's time
+  costs a request of its own (S3: one HEAD per file, measured), **a folder
+  listed before is listed without times**. Unchanged files are told by their
+  hash, and only new or changed files, or ones without a hash, are looked up
+  (or, past eight, the folder is listed again with times). A sync run of
+  unchanged folders is then one request per folder.
+- **A local file is hashed only in a conflict**, with rclone
+  (`operations/hashsumfile`, which makes any type, a remote's own included),
+  and only when it's fully on disk. Local edits are told by size and time, as
+  in Nextcloud.
+
+rclone has no folder ETags or change feed through its API, so every listed
+folder is still listed each run. IDs that would show a server-side rename as a
+move exist on only some remotes, so they aren't used either.
 
 ## Expected behaviour, not bugs
 

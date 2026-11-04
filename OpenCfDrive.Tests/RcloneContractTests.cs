@@ -107,6 +107,73 @@ public class RcloneContractTests
     }
 
     [SkippableFact]
+    public void Hashes_ComeWithListingsAndLookups_AndALocalFileHashesTheSame()
+    {
+        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "rclone.exe unavailable.");
+
+        using var env = RcloneTestEnvironment.Start();
+        var folder = Path.Combine(env.TempRoot, "hashed");
+        Directory.CreateDirectory(folder);
+        var file = Path.Combine(folder, "a.txt");
+        File.WriteAllText(file, "hello");
+        const string helloMd5 = "md5:5d41402abc4b2a76b9719d911017c592";
+        CreateRemote(env, "hashed", "alias", new { remote = folder });
+
+        var rc = new RcloneRcClient(env.RcUrl);
+        var listed = Assert.Single(rc.ListDirectoryAsync("hashed:", string.Empty, new ListingOptions("md5")).GetAwaiter().GetResult());
+        Assert.Equal(helloMd5, listed.Hash);
+        Assert.NotNull(listed.ModifiedTime);
+
+        // Without times: one request for a whole folder on remotes like S3.
+        var untimed = Assert.Single(rc.ListDirectoryAsync("hashed:", string.Empty, new ListingOptions("md5", WithTimes: false)).GetAwaiter().GetResult());
+        Assert.Equal(helloMd5, untimed.Hash);
+        Assert.Null(untimed.ModifiedTime);
+
+        Assert.Equal(helloMd5, rc.StatAsync("hashed:", "a.txt", new ListingOptions("md5")).GetAwaiter().GetResult()?.Hash);
+        Assert.Null(rc.StatAsync("hashed:", "a.txt").GetAwaiter().GetResult()?.Hash);
+
+        // Any type rclone knows, a remote's own included.
+        Assert.Equal(helloMd5["md5:".Length..], rc.HashLocalFileAsync(file, "md5").GetAwaiter().GetResult());
+        Assert.Equal("6828031bd8f00600000000000500000000000000", rc.HashLocalFileAsync(file, "quickxor").GetAwaiter().GetResult());
+    }
+
+    [SkippableFact]
+    public void Capabilities_TellTheHashToUse()
+    {
+        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "rclone.exe unavailable.");
+
+        using var env = RcloneTestEnvironment.Start();
+        CreateRemote(env, "mem", "memory", new { });
+        CreateRemote(env, "disk", "alias", new { remote = env.TempRoot });
+        var rc = new RcloneRcClient(env.RcUrl);
+
+        // rclone's in-memory backend keeps MD5.
+        Assert.Equal("md5", rc.GetCapabilitiesAsync("mem:").GetAwaiter().GetResult().HashType);
+
+        // A local disk makes every hash by reading the file: none used.
+        var local = rc.GetCapabilitiesAsync("disk:").GetAwaiter().GetResult();
+        Assert.True(local.SlowHash);
+        Assert.Null(local.HashType);
+
+        // The WebDAV this environment serves: no hashes, no settable times.
+        var webdav = rc.GetCapabilitiesAsync(env.RemoteSpec).GetAwaiter().GetResult();
+        Assert.Null(webdav.HashType);
+        Assert.False(webdav.KeepsFileTimes);
+    }
+
+    /// <summary>A named remote, as the drive is always given one ("name:path").</summary>
+    private static void CreateRemote(RcloneTestEnvironment env, string name, string type, object parameters)
+    {
+        using var client = new HttpClient();
+        using var content = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { name, type, parameters }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        using var response = client.PostAsync($"{env.RcUrl}/config/create", content).GetAwaiter().GetResult();
+        Assert.True(response.IsSuccessStatusCode, response.Content.ReadAsStringAsync().GetAwaiter().GetResult());
+    }
+
+    [SkippableFact]
     public void UploadFile_Multipart_LandsOnRemote()
     {
         Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "rclone.exe unavailable.");
