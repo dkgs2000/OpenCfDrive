@@ -25,6 +25,11 @@ third-party components, each under its own license:
   license
   https://aka.ms/WinSDKLicenseURL
 
+The .exe installer is built with the WiX Toolset, and contains its bootstrapper
+engine (Burn) and standard bootstrapper application:
+- WiX Toolset: Microsoft Reciprocal License (MS-RL)
+  https://github.com/wixtoolset/wix/blob/main/LICENSE.TXT
+
 rclone is not included. OpenCfDrive runs an rclone you install separately, or
 one it downloads from https://downloads.rclone.org when you ask it to (MIT
 license: https://github.com/rclone/rclone/blob/master/COPYING).

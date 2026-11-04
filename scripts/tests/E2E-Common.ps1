@@ -7,7 +7,6 @@
 #                     mount/Explorer assertions on top of the common flow.
 #   E2E-Run-Mock.ps1  The same flow with the engine in forced mock mode over a
 #                     plain directory (no Cloud Files registration).
-#   E2E-Run-S3.ps1    E2E-Run.ps1 against an S3 backend instead of WebDAV.
 #
 # All of them take -Backend webdav|s3. The backend is only a server process
 # (rclone serve webdav / s3) plus an rclone remote, and the same scenarios run
@@ -31,6 +30,10 @@ $script:E2ERoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
 $script:E2ESummaryLog = ""
 $script:E2ERcPort = 0
+# The harness's rclone wants a login, as one a user runs should: never
+# --rc-no-auth, which lets any program on the PC at the remotes.
+$script:E2ERcUser = "opencfdrive-e2e"
+$script:E2ERcPass = [guid]::NewGuid().ToString("N")
 $script:E2ERemoteName = "e2e"
 $script:E2ERemoteSpec = "e2e:"
 $script:E2EBackendUrl = ""
@@ -157,7 +160,7 @@ function Remove-IfExists([string]$PathToDelete) {
 
 # Stops what a previous (possibly interrupted) run left behind, and nothing
 # else: the service only when it runs from this checkout's bin folders (never
-# an installed copy, such as .\publish, that drives a real folder), and rclone
+# an installed copy, which drives a real folder), and rclone
 # only when it uses the harness's own config under %TEMP%\opencfdrive-e2e*
 # (never an rclone GUI or a user's own mount).
 function Stop-StaleProcesses {
@@ -255,6 +258,8 @@ function Invoke-Rc([string]$Command, [hashtable]$Parameters) {
     $client = [System.Net.Http.HttpClient]::new()
     try {
         $client.Timeout = [TimeSpan]::FromSeconds(60)
+        $login = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("$($script:E2ERcUser):$($script:E2ERcPass)"))
+        $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Basic", $login)
         $json = $Parameters | ConvertTo-Json -Depth 6 -Compress
         $content = [System.Net.Http.StringContent]::new($json, [System.Text.Encoding]::UTF8, "application/json")
         $resp = $client.PostAsync("http://127.0.0.1:$($script:E2ERcPort)/$Command", $content).GetAwaiter().GetResult()
@@ -491,8 +496,10 @@ function Start-E2EService {
     Remove-Item -LiteralPath $OutLog, $ErrLog -Force -ErrorAction SilentlyContinue
 
     [Environment]::SetEnvironmentVariable("OPENCFDRIVE_ROOT", $SyncRoot, "Process")
-    [Environment]::SetEnvironmentVariable("RCLONE_FS", $script:E2ERemoteSpec, "Process")
-    [Environment]::SetEnvironmentVariable("RCLONE_RC_URL", "http://127.0.0.1:$($script:E2ERcPort)", "Process")
+    [Environment]::SetEnvironmentVariable("OPENCFDRIVE_REMOTE", $script:E2ERemoteSpec, "Process")
+    [Environment]::SetEnvironmentVariable("OPENCFDRIVE_RC_URL", "http://127.0.0.1:$($script:E2ERcPort)", "Process")
+    [Environment]::SetEnvironmentVariable("OPENCFDRIVE_RC_USER", $script:E2ERcUser, "Process")
+    [Environment]::SetEnvironmentVariable("OPENCFDRIVE_RC_PASS", $script:E2ERcPass, "Process")
     # The background sync runs only when a scenario asks (Sync-Remote), so each
     # one sees exactly the server calls it caused. Its schedule is unit-tested.
     [Environment]::SetEnvironmentVariable("OPENCFDRIVE_REMOTE_POLL_SECONDS", "86400", "Process")
@@ -667,13 +674,20 @@ function Invoke-OpenCfDriveE2E {
             "--config", $rcloneConf,
             "rcd",
             "--rc-addr", "127.0.0.1:$($script:E2ERcPort)",
-            "--rc-no-auth",
             "--rc-serve",
             "--log-file", $rcloneLog,
             "--log-level", "DEBUG"
         )
         if ($Backend -eq "s3") { $rcArgs += @("--dump", "headers") }
-        $rcloneRc = Start-Process -FilePath $rclonePath -ArgumentList $rcArgs -WindowStyle Hidden -PassThru
+        # The login goes in through rclone's own variables (its --rc-user and
+        # --rc-pass), so it is not in the process list; only this rclone gets them.
+        try {
+            $env:RCLONE_RC_USER = $script:E2ERcUser
+            $env:RCLONE_RC_PASS = $script:E2ERcPass
+            $rcloneRc = Start-Process -FilePath $rclonePath -ArgumentList $rcArgs -WindowStyle Hidden -PassThru
+        } finally {
+            Remove-Item Env:\RCLONE_RC_USER, Env:\RCLONE_RC_PASS -ErrorAction SilentlyContinue
+        }
 
         if (-not (Wait-ForCondition { Test-RcloneHealthy } -TimeoutSeconds 45)) {
             throw "rclone RC did not become healthy on http://127.0.0.1:$($script:E2ERcPort). Log: $(Read-LogText (Join-Path $TempRoot 'rclone-rc.log'))"

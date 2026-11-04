@@ -50,10 +50,65 @@ public sealed class DriveSettingsTests : IDisposable
 
         var effective = DriveSettingsFile.Resolve(saved, name => environment.GetValueOrDefault(name));
 
-        Assert.Equal(new EffectiveSetting("env:", SettingSource.Environment, "RCLONE_FS"), effective.Remote);
+        Assert.Equal(new EffectiveSetting("env:", SettingSource.Environment, "OPENCFDRIVE_REMOTE"), effective.Remote);
         Assert.Equal(new EffectiveSetting(@"D:\FromFile", SettingSource.SettingsFile, "OPENCFDRIVE_ROOT"), effective.SyncRoot);
-        Assert.Equal(new EffectiveSetting(DriveSettingsFile.DefaultRcUrl, SettingSource.Default, "RCLONE_RC_URL"), effective.RcUrl);
+        Assert.Equal(new EffectiveSetting(DriveSettingsFile.DefaultRcUrl, SettingSource.Default, "OPENCFDRIVE_RC_URL"), effective.RcUrl);
         Assert.True(effective.HasRemote);
+    }
+
+    [Fact]
+    public void ALoginForAnRcloneTheUserRuns_IsSavedEncrypted_AndReadBack()
+    {
+        const string password = "correct horse battery staple";
+        var saved = new DriveSettings
+        {
+            ManageRclone = false,
+            RcUrl = "http://127.0.0.1:6000",
+            RcUser = "me",
+            RcPasswordProtected = UserSecret.Protect(password),
+        };
+
+        DriveSettingsFile.Save(saved, SettingsPath);
+        var effective = DriveSettingsFile.Resolve(DriveSettingsFile.Load(SettingsPath), _ => null);
+
+        // Never in the file, nor in anything printed from the settings.
+        Assert.DoesNotContain(password, File.ReadAllText(SettingsPath));
+        Assert.Equal(("me", password), (effective.RcUser, effective.RcPassword));
+        Assert.DoesNotContain(password, effective.ToString());
+        Assert.Equal("Basic", effective.RcEndpoint.Authorization?.Scheme);
+    }
+
+    [Fact]
+    public void ALoginInTheEnvironment_ComesWholeFromThere()
+    {
+        var saved = new DriveSettings { RcUser = "file-user", RcPasswordProtected = UserSecret.Protect("file-password") };
+        var environment = new Dictionary<string, string>
+        {
+            [DriveSettingsFile.RcUserVariable] = "env-user",
+            [DriveSettingsFile.RcPasswordVariable] = "env-password",
+        };
+
+        var effective = DriveSettingsFile.Resolve(saved, name => environment.GetValueOrDefault(name));
+
+        Assert.Equal(("env-user", "env-password"), (effective.RcUser, effective.RcPassword));
+    }
+
+    [Fact]
+    public void WithoutALogin_NoneIsSent()
+    {
+        var effective = DriveSettingsFile.Resolve(new DriveSettings { RcUrl = "http://127.0.0.1:6000" }, _ => null);
+
+        Assert.Null(effective.RcUser);
+        Assert.Null(effective.RcEndpoint.Authorization);
+    }
+
+    [Fact]
+    public void AnEncryptedSecret_ThatIsNotOurs_ReadsAsNone()
+    {
+        Assert.Equal("s3cret", UserSecret.Unprotect(UserSecret.Protect("s3cret")));
+        Assert.Null(UserSecret.Unprotect("not base64!"));
+        Assert.Null(UserSecret.Unprotect(Convert.ToBase64String("plain text"u8.ToArray())));
+        Assert.Null(UserSecret.Unprotect(null));
     }
 
     [Fact]

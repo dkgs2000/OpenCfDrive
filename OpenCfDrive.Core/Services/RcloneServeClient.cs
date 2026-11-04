@@ -83,15 +83,6 @@ public sealed class RcloneServeClient : IDisposable
         return new LengthLimitedStream(stream, length, CountBytes);
     }
 
-    public async Task<bool> ExistsAsync(string remoteRelativePath, CancellationToken cancellationToken = default)
-    {
-        using var response = await _httpClient.SendAsync(
-            new HttpRequestMessage(HttpMethod.Head, BuildUri(remoteRelativePath)),
-            cancellationToken);
-
-        return response.IsSuccessStatusCode;
-    }
-
     private static async Task SkipAsync(Stream stream, long count, CancellationToken cancellationToken)
     {
         var buffer = new byte[81920];

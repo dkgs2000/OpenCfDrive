@@ -420,8 +420,6 @@ public sealed class SqliteMetadataStore
         return command.ExecuteNonQuery() > 0;
     }
 
-    public string? GetFileIdByRemotePath(string remotePath) => GetByRemotePath(remotePath)?.FileId.ToString();
-
     /// <summary>How many files and folders the drive tracks.</summary>
     public int Count()
     {

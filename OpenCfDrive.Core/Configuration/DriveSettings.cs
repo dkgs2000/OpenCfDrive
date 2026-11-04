@@ -32,6 +32,12 @@ public sealed record DriveSettings
     /// <summary>The base URL of an rclone remote control the user runs (rclone rcd).</summary>
     public string? RcUrl { get; init; }
 
+    /// <summary>The login that remote control was started with (--rc-user).</summary>
+    public string? RcUser { get; init; }
+
+    /// <summary>Its password (--rc-pass), encrypted for this Windows user (see <see cref="UserSecret"/>).</summary>
+    public string? RcPasswordProtected { get; init; }
+
     /// <summary>Whether the app starts when the user signs in to Windows.</summary>
     public bool? StartAtSignIn { get; init; }
 
@@ -53,34 +59,56 @@ public sealed record EffectiveSetting(string Value, SettingSource Source, string
 /// <param name="ManageRclone">OpenCfDrive runs rclone itself; otherwise it uses the one at <paramref name="RcUrl"/>.</param>
 /// <param name="RclonePath">The rclone program chosen (environment or settings), or null to find one.</param>
 /// <param name="RcloneConfig">The rclone config file chosen, or null for rclone's default.</param>
+/// <param name="RcUser">The login for the remote control at <paramref name="RcUrl"/>, or null for none.</param>
+/// <param name="RcPassword">Its password, in plain text: never logged or shown.</param>
 public sealed record EffectiveSettings(
     EffectiveSetting SyncRoot,
     EffectiveSetting Remote,
     EffectiveSetting RcUrl,
     bool ManageRclone = true,
     string? RclonePath = null,
-    string? RcloneConfig = null)
+    string? RcloneConfig = null,
+    string? RcUser = null,
+    string? RcPassword = null)
 {
     /// <summary>A remote was chosen; without one the service has nothing to sync.</summary>
     public bool HasRemote => Remote.Source != SettingSource.Default;
+
+    /// <summary>The remote control at <see cref="RcUrl"/>, with its login.</summary>
+    public Services.RcloneEndpoint RcEndpoint => new(RcUrl.Value, RcUser, RcUser is null ? null : RcPassword ?? "");
+
+    /// <summary>Never the password.</summary>
+    public override string ToString() =>
+        $"{nameof(EffectiveSettings)} {{ SyncRoot = {SyncRoot}, Remote = {Remote}, RcUrl = {RcUrl}, ManageRclone = {ManageRclone}, " +
+        $"RclonePath = {RclonePath}, RcloneConfig = {RcloneConfig}, RcUser = {RcUser} }}";
 }
 
 public static class DriveSettingsFile
 {
+    // None of these is RCLONE_...: rclone itself reads every RCLONE_<NAME>
+    // variable as its --<name> flag, and the rclone the service runs inherits them.
     public const string SyncRootVariable = "OPENCFDRIVE_ROOT";
-    public const string RemoteVariable = "RCLONE_FS";
-    public const string RcUrlVariable = "RCLONE_RC_URL";
+    public const string RemoteVariable = "OPENCFDRIVE_REMOTE";
+    public const string RcUrlVariable = "OPENCFDRIVE_RC_URL";
+
+    /// <summary>The login for the remote control at <see cref="RcUrlVariable"/> (scripts, tests).</summary>
+    public const string RcUserVariable = "OPENCFDRIVE_RC_USER";
+    public const string RcPasswordVariable = "OPENCFDRIVE_RC_PASS";
+
+    /// <summary>The names these had before, no longer read, and what replaced them.</summary>
+    public static readonly IReadOnlyDictionary<string, string> RetiredVariables = new Dictionary<string, string>
+    {
+        ["RCLONE_FS"] = RemoteVariable,
+        ["RCLONE_RC_URL"] = RcUrlVariable,
+    };
 
     /// <summary>Points the service and the app at another settings file (tests, side-by-side runs).</summary>
     public const string PathVariable = "OPENCFDRIVE_SETTINGS";
 
-    /// <summary>
-    /// The rclone program to run, ahead of the settings file. Not RCLONE_...:
-    /// rclone itself reads every RCLONE_&lt;NAME&gt; variable as its --&lt;name&gt; flag.
-    /// </summary>
+    /// <summary>The rclone program to run, ahead of the settings file.</summary>
     public const string RclonePathVariable = "OPENCFDRIVE_RCLONE";
 
-    /// <summary>Used when no remote is configured; the demo setup script creates it.</summary>
+    /// <summary>Used when no remote is configured (the name the tests give their remote).</summary>
     public const string DefaultRemote = "e2e:";
 
     public const string DefaultRcUrl = "http://127.0.0.1:5572";
@@ -150,6 +178,12 @@ public static class DriveSettingsFile
         var remote = Pick(RemoteVariable, saved.Remote, DefaultRemote);
         var rcUrl = Pick(RcUrlVariable, saved.RcUrl, DefaultRcUrl);
         var rclonePath = environment(RclonePathVariable);
+
+        // A login set in the environment comes whole from there: never one
+        // part from the environment and the other from the file.
+        var (rcUser, rcPassword) = Blank(environment(RcUserVariable)) is { } envUser
+            ? (envUser, environment(RcPasswordVariable))
+            : (Blank(saved.RcUser), UserSecret.Unprotect(saved.RcPasswordProtected));
         return new EffectiveSettings(
             Pick(SyncRootVariable, saved.SyncRoot, SyncStatePaths.DefaultSyncRoot),
             remote with { Value = SyncStatePaths.NormalizeRemote(remote.Value) },
@@ -158,7 +192,9 @@ public static class DriveSettingsFile
             // means that rclone, not one of OpenCfDrive's own.
             ManageRclone: rcUrl.Source != SettingSource.Environment && saved.ManageRclone != false,
             RclonePath: string.IsNullOrWhiteSpace(rclonePath) ? Blank(saved.RclonePath) : rclonePath.Trim(),
-            RcloneConfig: Blank(saved.RcloneConfig));
+            RcloneConfig: Blank(saved.RcloneConfig),
+            RcUser: rcUser,
+            RcPassword: rcUser is null ? null : rcPassword);
     }
 
     private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();

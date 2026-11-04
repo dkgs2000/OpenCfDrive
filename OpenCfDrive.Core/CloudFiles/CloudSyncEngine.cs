@@ -238,8 +238,6 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
     }
 
-    public SqliteMetadataStore Store => _store;
-
     /// <summary>Exposed so hosts/tests can observe cfapi callback activity.</summary>
     public SyncRootConnection? Connection => _connection;
 

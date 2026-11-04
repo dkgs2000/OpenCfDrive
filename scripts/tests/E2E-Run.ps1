@@ -10,8 +10,7 @@
 # No elevation is needed. The sync root is created under %TEMP% and removed
 # on exit, so nothing of the user's own folders is touched.
 #
-#   -Backend webdav|s3   which server to run (default webdav; E2E-Run-S3.ps1
-#                        is the S3 shortcut)
+#   -Backend webdav|s3   which server to run (default webdav)
 #   -Only "S0*,C11"      run only these scenarios
 #   -SyncRoot / -KeepRegistration   mount elsewhere / leave the mount in place
 
