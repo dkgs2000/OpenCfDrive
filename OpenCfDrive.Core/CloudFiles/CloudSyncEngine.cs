@@ -149,6 +149,26 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
     private readonly SemaphoreSlim _applyGate = new(1, 1);
 
+    /// <summary>
+    /// Held by a move on the server of something renamed here, and by a first
+    /// listing (<see cref="ListFolderForWindowsAsync"/>) or a download
+    /// (<see cref="PrepareDownload"/>) of what that move is about: neither
+    /// sees the other half done.
+    /// </summary>
+    private readonly SemaphoreSlim _moveGate = new(1, 1);
+
+    /// <summary>
+    /// How long such a listing waits for a move under way, within the
+    /// listing's own limit (<see cref="SyncRootConnection.ListingTimeout"/>).
+    /// </summary>
+    private static readonly TimeSpan FolderMoveWait = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// How long such a download waits, well within the 60 s Windows gives a
+    /// download before it fails the read.
+    /// </summary>
+    private static readonly TimeSpan DownloadMoveWait = TimeSpan.FromSeconds(30);
+
     private sealed record ChangedFile(FileRecord Record, long Size, DateTimeOffset? ModifiedUtc, string? Hash);
 
     private sealed record DirectoryDiff(
@@ -301,15 +321,17 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                     _log,
                     localDelete: RecordNotifiedDelete,
                     localRename: (oldLocalPath, newLocalPath, remotePath, source) => _changes.Renamed(oldLocalPath, newLocalPath, remotePath, source),
-                    listDirectory: ListNewRemoteEntriesAsync,
-                    server: _server);
+                    listDirectory: ListFolderForWindowsAsync,
+                    server: _server,
+                    prepareDownload: PrepareDownload);
 
                 // What a listing found changed on the server is applied by
                 // the next run, after its local changes.
                 _connection.DirectoryListed += _ => _scheduler.RequestLocalRun();
 
-                // A change that waited for a download can go now.
-                _connection.Hydrated += _ =>
+                // A change that waited for a download can go now, whether it
+                // was sent or failed.
+                _connection.DownloadEnded += _ =>
                 {
                     if (!_changes.IsEmpty)
                     {
@@ -438,6 +460,94 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     }
 
     /// <summary>
+    /// FETCH_PLACEHOLDERS: a folder opened for the first time, listed where
+    /// its placeholder says it is on the server. A folder renamed or moved
+    /// here (or one inside such a folder) whose move has not reached the
+    /// server yet still has its contents under the old path there, and its
+    /// placeholder still names that path: they are listed from there into
+    /// the folder under its new name, and the move re-keys them with the
+    /// rest. Such a listing and the move never overlap: a move under way is
+    /// waited for, and then the folder is listed where it went. Answered
+    /// with nothing, it would be marked fully populated and stay empty.
+    /// </summary>
+    private async Task<IReadOnlyList<PlaceholderEntry>?> ListFolderForWindowsAsync(
+        string remoteDirectory,
+        string localDirectory,
+        CancellationToken cancellationToken)
+    {
+        if (!IsLocalChangePending(localDirectory))
+        {
+            return await ListNewRemoteEntriesAsync(remoteDirectory, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (!await _moveGate.WaitAsync(FolderMoveWait, cancellationToken).ConfigureAwait(false))
+        {
+            _log?.Invoke($"'{RelativeOf(localDirectory)}' is being moved on the server; it is listed when it is next opened.");
+            return null;
+        }
+
+        try
+        {
+            // Moved while this waited: its row says where it is now.
+            var current = _store.GetByLocalPath(localDirectory) is { IsDirectory: true } row
+                ? row.RemotePath.TrimEnd('/')
+                : remoteDirectory;
+            return await ListNewRemoteEntriesAsync(current, cancellationToken, landingDirectory: localDirectory).ConfigureAwait(false);
+        }
+        finally
+        {
+            _moveGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// FETCH_DATA: a file renamed or moved here, or inside a folder that was,
+    /// whose move has not reached the server yet is read from the path its
+    /// placeholder names, which the server still has; the move waits until
+    /// the read has begun. A read waits for a move under way, then reads from
+    /// where the move put the file: its row is gone from the old path once the
+    /// move re-keyed it. The move updates the placeholders only after it lets
+    /// reads go, because marking a file in sync waits for its download
+    /// (RenamedFolderContractTest).
+    /// </summary>
+    private SyncRootConnection.DownloadSource? PrepareDownload(string remotePath)
+    {
+        if (_changes.PendingRenameOf(remotePath) is not { NewLocalPath: { } newLocalPath } rename)
+        {
+            return new SyncRootConnection.DownloadSource(remotePath, null);
+        }
+
+        if (!_moveGate.Wait(DownloadMoveWait))
+        {
+            _log?.Invoke($"'{remotePath}' is being moved on the server; it opens once that is done.");
+            return null;
+        }
+
+        var current = remotePath;
+        if (_store.GetByRemotePath(remotePath) is null)
+        {
+            var oldPrefix = rename.RemotePath!.TrimEnd('/');
+            current = RelativeOf(newLocalPath) + remotePath[oldPrefix.Length..];
+        }
+
+        return new SyncRootConnection.DownloadSource(current, new GateHold(_moveGate));
+    }
+
+    /// <summary>Lets go of a gate once, however often it is disposed.</summary>
+    private sealed class GateHold(SemaphoreSlim gate) : IDisposable
+    {
+        private int _released;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+            {
+                gate.Release();
+            }
+        }
+    }
+
+    /// <summary>
     /// FETCH_PLACEHOLDERS source: lists one remote directory live and returns
     /// the entries that have no placeholder yet. Their rows are written before
     /// returning, because the platform can issue FETCH_DATA as soon as the
@@ -454,9 +564,15 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     /// here and applied by <see cref="ApplyServerChangesAsync"/> once the
     /// shell has its reply (see <see cref="SyncRootConnection.DirectoryListed"/>).
     /// </summary>
+    /// <param name="landingDirectory">
+    /// Set for a folder renamed here whose move has not reached the server:
+    /// where its entries land on disk. Their rows keep the server's paths
+    /// until the move re-keys them.
+    /// </param>
     private async Task<IReadOnlyList<PlaceholderEntry>> ListNewRemoteEntriesAsync(
         string relativeDirectory,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? landingDirectory = null)
     {
         _rc ??= new RcloneRcClient(_rclone);
         var listedAt = DateTimeOffset.UtcNow;
@@ -490,7 +606,10 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             listedPaths.Add(remotePath);
 
             var localPath = Path.Combine(_syncRootPath, relative.Replace('/', Path.DirectorySeparatorChar));
-            if (IsLocalChangePending(localPath))
+
+            // Listed into a renamed folder, its contents are what is given
+            // out: only an item's own delete or rename leaves it alone.
+            if (landingDirectory is null ? IsLocalChangePending(localPath) : _changes.IsPendingAt(localPath))
             {
                 continue;
             }
@@ -569,7 +688,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 inSync: true,
                 hash: item.IsDirectory ? null : item.Hash);
 
-            _providerWrites[localPath] = now;
+            _providerWrites[landingDirectory is null ? localPath : Path.Combine(landingDirectory, Path.GetFileName(relative))] = now;
             entries.Add(new PlaceholderEntry(
                 RelativeName: Path.GetFileName(relative),
                 IsDirectory: item.IsDirectory,
@@ -765,6 +884,13 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                     {
                         Follow(move.NewLocalPath);
                     }
+                    else if (!IsSimulated && File.Exists(move.NewLocalPath) && !_placeholders.QueryState(move.NewLocalPath).IsPlaceholder)
+                    {
+                        // Renamed just as its upload finished, before it was
+                        // made a placeholder: the upload step makes it one
+                        // (and sends it only if it changed since).
+                        Follow(move.NewLocalPath);
+                    }
                 }).ConfigureAwait(false);
             }
 
@@ -793,7 +919,19 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 await slots.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
-                    await StepAsync(upload.From, $"Upload failed for '{upload.LocalPath}'", () => UploadAsync(upload.LocalPath, cancellationToken)).ConfigureAwait(false);
+                    await StepAsync(upload.From, $"Upload failed for '{upload.LocalPath}'", async () =>
+                    {
+                        try
+                        {
+                            await UploadAsync(upload.LocalPath, cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException && !File.Exists(upload.LocalPath))
+                        {
+                            // Renamed or deleted here while it was sent: that
+                            // change was recorded, and the next run sends it.
+                            _log?.Invoke($"'{RelativeOf(upload.LocalPath)}' was renamed or deleted here while it was sent; the next run sends that change.");
+                        }
+                    }).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -2108,13 +2246,25 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         var (_, newRemote) = ResolveRemoteFile(newRelative);
 
         _rc ??= new RcloneRcClient(_rclone);
-        await _rc.MoveFileAsync(fs, oldRemote, newRemote).ConfigureAwait(false);
 
-        _store.RenameRemotePath(oldRelative, newRelative, newLocalPath, newRelative);
-        _localChangeAt[newRelative] = DateTimeOffset.UtcNow;
-        if (_lastSyncedState.TryRemove(Path.Combine(_syncRootPath, oldRelative.Replace('/', Path.DirectorySeparatorChar)), out var state))
+        // A download of it meanwhile waits, and one starting is waited for
+        // (see PrepareDownload). The placeholder is updated after: marking
+        // it in sync waits for a download of it.
+        await _moveGate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            _lastSyncedState[newLocalPath] = state;
+            await _rc.MoveFileAsync(fs, oldRemote, newRemote).ConfigureAwait(false);
+
+            _store.RenameRemotePath(oldRelative, newRelative, newLocalPath, newRelative);
+            _localChangeAt[newRelative] = DateTimeOffset.UtcNow;
+            if (_lastSyncedState.TryRemove(Path.Combine(_syncRootPath, oldRelative.Replace('/', Path.DirectorySeparatorChar)), out var state))
+            {
+                _lastSyncedState[newLocalPath] = state;
+            }
+        }
+        finally
+        {
+            _moveGate.Release();
         }
 
         _log?.Invoke($"Renamed remote '{fs}{oldRemote}' -> '{newRemote}'.");
@@ -2165,6 +2315,10 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     /// A folder renamed/moved locally: moves it on the server, then re-keys
     /// every row below it and gives every placeholder below it its new
     /// identity, so opening a file there still downloads from the right path.
+    /// A first listing of the folder or a download in it meanwhile waits (see
+    /// <see cref="ListFolderForWindowsAsync"/> and <see cref="PrepareDownload"/>),
+    /// and one under way is waited for. The placeholders are updated after
+    /// they may go: marking one in sync waits for a download of it.
     /// </summary>
     private async Task RenameRemoteDirectoryAsync(
         string oldRelative,
@@ -2177,11 +2331,19 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         var (fs, oldRemote) = ResolveRemoteFile(oldRelative);
         var (_, newRemote) = ResolveRemoteFile(newRelative);
         _rc ??= new RcloneRcClient(_rclone);
-        await _rc.MoveDirectoryAsync(fs + oldRemote, fs + newRemote).ConfigureAwait(false);
-        await _rc.RemoveEmptyDirectoriesAsync(fs, oldRemote).ConfigureAwait(false);
-
         var oldLocalPath = Path.Combine(_syncRootPath, oldRelative.Replace('/', Path.DirectorySeparatorChar));
-        _store.RenameTree(oldRelative, newRelative, oldLocalPath, newLocalPath);
+
+        await _moveGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await _rc.MoveDirectoryAsync(fs + oldRemote, fs + newRemote).ConfigureAwait(false);
+            await _rc.RemoveEmptyDirectoriesAsync(fs, oldRemote).ConfigureAwait(false);
+            _store.RenameTree(oldRelative, newRelative, oldLocalPath, newLocalPath);
+        }
+        finally
+        {
+            _moveGate.Release();
+        }
 
         var now = DateTimeOffset.UtcNow;
         foreach (var row in _store.GetTree(newRelative))
@@ -2320,8 +2482,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             return false;
         }
 
+        // Never read while a download is still writing it: the change waits
+        // for the run that the download's end asks for.
         if (_connection?.IsHydrating(localPath) == true)
         {
+            _changes.Changed(localPath);
             return false;
         }
 

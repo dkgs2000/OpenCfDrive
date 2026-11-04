@@ -1,8 +1,5 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
 using OpenCfDrive.Core.CloudFiles;
 using OpenCfDrive.Core.Services;
 using OpenCfDrive.Core.Storage;
@@ -46,7 +43,7 @@ public class RenamedFolderContractTest(ITestOutputHelper output)
         var inWindow = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var updated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        async Task<IReadOnlyList<PlaceholderEntry>> ListDirectory(string directory, CancellationToken cancellationToken)
+        async Task<IReadOnlyList<PlaceholderEntry>?> ListDirectory(string directory, string localDirectory, CancellationToken cancellationToken)
         {
             if (directory.Length == 0)
             {
@@ -73,6 +70,7 @@ public class RenamedFolderContractTest(ITestOutputHelper output)
         });
 
         var placeholders = new CloudPlaceholderService();
+        TimeSpan? fileUpdate = null;
 
         // The run's part once the rename is on the server (RenameRemoteDirectoryAsync).
         async Task RenameRemote(string targetLocal)
@@ -84,6 +82,20 @@ public class RenamedFolderContractTest(ITestOutputHelper output)
                 ? placeholders.MarkInSync(targetLocal, identity)
                 : placeholders.UpdateFileIdentity(targetLocal, identity);
             log.Enqueue($"folder update ({(markInSync ? "in sync" : "identity")}) -> {ok}");
+
+            // And what is inside, as the move does (a new identity, nothing
+            // else): also while that file is being downloaded, which this
+            // does not wait for. Marking a file in sync does wait for its
+            // download (60 s here), so the move lets downloads go first.
+            var file = Path.Combine(targetLocal, "z.txt");
+            if (File.Exists(file))
+            {
+                var clock = Stopwatch.StartNew();
+                var fileOk = placeholders.UpdateFileIdentity(file, CloudPlaceholderService.BuildFileIdentity("new/z.txt"));
+                fileUpdate = clock.Elapsed;
+                log.Enqueue($"file update -> {fileOk} in {clock.ElapsedMilliseconds} ms");
+            }
+
             updated.TrySetResult();
         }
 
@@ -123,6 +135,12 @@ public class RenamedFolderContractTest(ITestOutputHelper output)
             Assert.True(updated.Task.IsCompleted, "The folder update never ran.");
             Assert.DoesNotContain(log, line => line.Contains("failed", StringComparison.OrdinalIgnoreCase));
             Assert.Equal("z", read.Output.Trim());
+            if (window == Window.Download)
+            {
+                // The download is still waiting for its server when the file
+                // is updated: the update must not wait for it.
+                Assert.True(fileUpdate is { } took && took < TimeSpan.FromSeconds(5), $"Updating the file took {fileUpdate}.");
+            }
         }
         finally
         {
@@ -156,50 +174,5 @@ public class RenamedFolderContractTest(ITestOutputHelper output)
         Assert.True(process.WaitForExit(TimeSpan.FromSeconds(70)), $"'{command}' did not finish.");
         output.WriteLine($"{command}: exit {process.ExitCode} {stderr.Result.Trim()}");
         return (process.ExitCode, stdout.Result);
-    }
-
-    /// <summary>Answers every GET with the one byte "z", once <c>beforeAnswer</c> is done.</summary>
-    private sealed class OneByteServer : IDisposable
-    {
-        private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
-        private readonly CancellationTokenSource _stop = new();
-
-        public OneByteServer(Func<Task> beforeAnswer)
-        {
-            _listener.Start();
-            Url = $"http://127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}";
-            _ = Task.Run(async () =>
-            {
-                while (!_stop.IsCancellationRequested)
-                {
-                    using var client = await _listener.AcceptTcpClientAsync(_stop.Token);
-                    var stream = client.GetStream();
-                    var request = new StringBuilder();
-                    var buffer = new byte[4096];
-                    while (!request.ToString().Contains("\r\n\r\n"))
-                    {
-                        var read = await stream.ReadAsync(buffer, _stop.Token);
-                        if (read == 0)
-                        {
-                            break;
-                        }
-
-                        request.Append(Encoding.ASCII.GetString(buffer, 0, read));
-                    }
-
-                    await beforeAnswer();
-                    var answer = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nz"u8.ToArray();
-                    await stream.WriteAsync(answer, _stop.Token);
-                }
-            });
-        }
-
-        public string Url { get; }
-
-        public void Dispose()
-        {
-            _stop.Cancel();
-            _listener.Stop();
-        }
     }
 }

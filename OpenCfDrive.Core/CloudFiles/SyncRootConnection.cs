@@ -22,19 +22,13 @@ public sealed class SyncRootConnection : IDisposable
     /// </summary>
     private const int TransferChunkSize = 4 * 1024 * 1024;
 
-    /// <summary>
-    /// Grace period after a hydration completes. Windows finishes flushing the
-    /// placeholder slightly after CfExecute returns; the watcher must not treat
-    /// those writes as local user edits and push a partial file upstream.
-    /// </summary>
-    private static readonly TimeSpan HydrationGuard = TimeSpan.FromSeconds(5);
-
     private readonly SqliteMetadataStore _store;
     private readonly RcloneServeClient _serve;
     private readonly Action<string>? _log;
     private readonly LocalDelete? _localDelete;
     private readonly LocalRename? _localRename;
-    private readonly Func<string, CancellationToken, Task<IReadOnlyList<PlaceholderEntry>>>? _listDirectory;
+    private readonly ListDirectory? _listDirectory;
+    private readonly PrepareDownload? _prepareDownload;
     private readonly ServerConnection? _server;
 
     /// <summary>
@@ -45,14 +39,17 @@ public sealed class SyncRootConnection : IDisposable
     /// </summary>
     internal static readonly TimeSpan ListingTimeout = TimeSpan.FromSeconds(10);
 
+    /// <summary>A listing answered without the server this slowly is logged.</summary>
+    private static readonly TimeSpan SlowAnswer = TimeSpan.FromSeconds(1);
+
     private readonly TimeSpan _listingReuseWindow;
     private readonly ConcurrentDictionary<string, DateTimeOffset> _lastListed = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> _listedOk = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _listingGates = new(StringComparer.OrdinalIgnoreCase);
     private readonly CloudPlaceholderService _placeholders = new();
     private readonly List<CF_CALLBACK> _callbackRoots = [];
-    // Full local path -> hydrations in flight and when the last one began or ended.
-    private readonly ConcurrentDictionary<string, (int Active, DateTimeOffset LastActivity)> _hydratingPaths =
+    // Full local path -> downloads of it under way; gone at none.
+    private readonly ConcurrentDictionary<string, int> _hydratingPaths =
         new(StringComparer.OrdinalIgnoreCase);
 
     private CF_CONNECTION_KEY _connectionKey;
@@ -68,13 +65,38 @@ public sealed class SyncRootConnection : IDisposable
     /// <summary>A local rename or move within the drive, reported on the callback thread.</summary>
     public delegate void LocalRename(string oldLocalPath, string newLocalPath, string remotePath, RenameSource? source);
 
+    /// <summary>
+    /// Answers FETCH_PLACEHOLDERS: the server entries of one folder that have
+    /// no placeholder yet, or null when it is not listed now (it is then
+    /// listed when it is next opened).
+    /// </summary>
+    /// <param name="remoteDirectory">The server path its placeholder names ('/' separated, empty for the root).</param>
+    /// <param name="localDirectory">
+    /// Where it is on disk now: under another name than its server path while
+    /// a rename made here has not reached the server.
+    /// </param>
+    public delegate Task<IReadOnlyList<PlaceholderEntry>?> ListDirectory(
+        string remoteDirectory, string localDirectory, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Asked before a file is downloaded (FETCH_DATA): where the server has it
+    /// now, or null when it cannot be read now (the download then fails, and
+    /// opening the file again tries again).
+    /// </summary>
+    /// <param name="remotePath">The server path its placeholder names.</param>
+    public delegate DownloadSource? PrepareDownload(string remotePath);
+
+    /// <summary>
+    /// Where a download reads from. <paramref name="Hold"/>, when set, keeps the
+    /// file from being moved on the server until the read has begun, and is
+    /// disposed then.
+    /// </summary>
+    public sealed record DownloadSource(string RemotePath, IDisposable? Hold);
+
     /// <param name="localDelete">Records a delete for the next sync run; called before it is let happen.</param>
     /// <param name="localRename">Records a rename for the next sync run; called before it is let happen.</param>
-    /// <param name="listDirectory">
-    /// Answers FETCH_PLACEHOLDERS: given a sync-root-relative directory ('/'
-    /// separated, empty for the root), returns the remote entries that do not
-    /// have a placeholder yet.
-    /// </param>
+    /// <param name="listDirectory">Answers FETCH_PLACEHOLDERS (see <see cref="ListDirectory"/>).</param>
+    /// <param name="prepareDownload">Asked before each download (see <see cref="PrepareDownload"/>); without it, the placeholder's path is read.</param>
     /// <param name="listingReuseWindow">
     /// How long one remote listing answers further FETCH_PLACEHOLDERS for the
     /// same directory (default 1 s): requests that were already waiting when
@@ -90,9 +112,10 @@ public sealed class SyncRootConnection : IDisposable
         Action<string>? log = null,
         LocalDelete? localDelete = null,
         LocalRename? localRename = null,
-        Func<string, CancellationToken, Task<IReadOnlyList<PlaceholderEntry>>>? listDirectory = null,
+        ListDirectory? listDirectory = null,
         TimeSpan? listingReuseWindow = null,
-        ServerConnection? server = null)
+        ServerConnection? server = null,
+        PrepareDownload? prepareDownload = null)
     {
         _store = store;
         _serve = serve;
@@ -100,6 +123,7 @@ public sealed class SyncRootConnection : IDisposable
         _localDelete = localDelete;
         _localRename = localRename;
         _listDirectory = listDirectory;
+        _prepareDownload = prepareDownload;
         _listingReuseWindow = listingReuseWindow ?? TimeSpan.FromSeconds(1);
         _server = server;
     }
@@ -108,6 +132,13 @@ public sealed class SyncRootConnection : IDisposable
 
     /// <summary>Raised after a successful hydration so callers/tests can observe progress.</summary>
     public event Action<HydrationCompleted>? Hydrated;
+
+    /// <summary>
+    /// Raised with the file's full local path once a download of it has
+    /// ended, sent or failed, and no longer counts in <see cref="IsHydrating"/>.
+    /// What waited for it can go now.
+    /// </summary>
+    public event Action<string>? DownloadEnded;
 
     /// <summary>
     /// Raised on the callback thread after a directory was listed from the
@@ -173,12 +204,14 @@ public sealed class SyncRootConnection : IDisposable
             },
         };
 
-        // Process info: the log says which program asked for a listing.
+        // Process info: the log says which program asked for a listing. The
+        // full path: without it a download (FETCH_DATA) comes with none, and
+        // could not be told by the file it is for (IsHydrating).
         var hr = CfApi.CfConnectSyncRoot(
             syncRootPath,
             table,
             IntPtr.Zero,
-            CF_CONNECT_FLAGS.CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO,
+            CF_CONNECT_FLAGS.CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO | CF_CONNECT_FLAGS.CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
             out _connectionKey);
 
         _connected = CfApi.Succeeded(hr);
@@ -195,6 +228,7 @@ public sealed class SyncRootConnection : IDisposable
         CF_CALLBACK_INFO info = default;
         CF_CALLBACK_FETCH_DATA_PARAMETERS fetch = default;
         var delivered = 0L;
+        DownloadSource? download = null;
         try
         {
             info = Marshal.PtrToStructure<CF_CALLBACK_INFO>(callbackInfoPtr);
@@ -218,19 +252,30 @@ public sealed class SyncRootConnection : IDisposable
                 return;
             }
 
+            var normalizedPath = Marshal.PtrToStringUni(info.NormalizedPath) ?? string.Empty;
+
+            // Renamed or moved here, or inside a folder that was: where the
+            // server has it depends on whether that move has reached it.
+            if (_prepareDownload is not null)
+            {
+                download = _prepareDownload(remotePath);
+                if (download is null)
+                {
+                    CompleteWithFailure(info, fetch.RequiredFileOffset, fetch.RequiredLength);
+                    return;
+                }
+
+                remotePath = download.RemotePath;
+            }
+
             _log?.Invoke(
                 $"[{DateTimeOffset.Now:HH:mm:ss.fff}] FETCH_DATA '{remotePath}' for {RequesterOf(info)} offset={fetch.RequiredFileOffset} length={fetch.RequiredLength} " +
                 $"optional={fetch.OptionalFileOffset}+{fetch.OptionalLength}");
 
-            var normalizedPath = Marshal.PtrToStringUni(info.NormalizedPath) ?? string.Empty;
-
             // Keyed by the full path, which is what IsHydrating is asked about
             // (NormalizedPath has no drive letter).
             var guardKey = string.IsNullOrEmpty(normalizedPath) ? remotePath : ToLocalPath(normalizedPath);
-            _hydratingPaths.AddOrUpdate(
-                guardKey,
-                _ => (1, DateTimeOffset.UtcNow),
-                (_, mark) => (mark.Active + 1, DateTimeOffset.UtcNow));
+            _hydratingPaths.AddOrUpdate(guardKey, 1, (_, active) => active + 1);
 
             try
             {
@@ -241,14 +286,11 @@ public sealed class SyncRootConnection : IDisposable
                     _log?.Invoke($"  optional range {fetch.OptionalFileOffset}+{fetch.OptionalLength} deferred.");
                 }
 
-                TransferRange(info, remotePath, fetch.RequiredFileOffset, fetch.RequiredLength, ref delivered);
+                TransferRange(info, remotePath, fetch.RequiredFileOffset, fetch.RequiredLength, ref delivered, download?.Hold);
             }
             finally
             {
-                _hydratingPaths.AddOrUpdate(
-                    guardKey,
-                    _ => (0, DateTimeOffset.UtcNow),
-                    (_, mark) => (Math.Max(0, mark.Active - 1), DateTimeOffset.UtcNow));
+                EndDownload(guardKey);
             }
 
             _server?.Succeeded();
@@ -283,6 +325,10 @@ public sealed class SyncRootConnection : IDisposable
                 // ignored: never throw across the native boundary
             }
         }
+        finally
+        {
+            download?.Hold?.Dispose();
+        }
     }
 
     /// <summary>
@@ -296,13 +342,15 @@ public sealed class SyncRootConnection : IDisposable
     ///   * there is no completion call: a trailing zero-length TRANSFER_DATA
     ///     is rejected with ERROR_CLOUD_FILE_INVALID_REQUEST (0x8007017C).
     /// <paramref name="delivered"/> counts the bytes the platform accepted.
+    /// <paramref name="hold"/> is let go once the server is sending.
     /// </summary>
     private void TransferRange(
         CF_CALLBACK_INFO info,
         string remotePath,
         long offset,
         long length,
-        ref long delivered)
+        ref long delivered,
+        IDisposable? hold = null)
     {
         if (length <= 0)
         {
@@ -313,6 +361,7 @@ public sealed class SyncRootConnection : IDisposable
             .OpenRangeAsync(remotePath, offset, length)
             .GetAwaiter()
             .GetResult();
+        hold?.Dispose();
 
         var clock = Stopwatch.StartNew();
         var executeMs = 0L;
@@ -456,11 +505,22 @@ public sealed class SyncRootConnection : IDisposable
             var requester = $"{RequesterOf(info)}, pattern '{pattern}'";
 
             var clock = Stopwatch.StartNew();
-            var (entries, listed) = ListCoalesced(directory, requester);
+            var localDirectory = normalized.Length == 0 ? _syncRootPath : ToLocalPath(normalized);
+            var (entries, listed, notListed) = ListCoalesced(directory, localDirectory, requester);
 
             // Offline, a folder never listed shows what is local and stays
             // unlisted, so opening it once the server answers lists it.
-            TransferPlaceholders(info, entries, StatusSuccess, populated: listed || IsListedRecently(directory));
+            var populated = listed || IsListedRecently(directory);
+            TransferPlaceholders(info, entries, StatusSuccess, populated);
+            // Only a slow one: Windows asks again at once for a folder left
+            // unlisted, so quick ones come by the hundred.
+            if (notListed is not null && clock.Elapsed >= SlowAnswer)
+            {
+                _log?.Invoke(
+                    $"[{DateTimeOffset.Now:HH:mm:ss.fff}] FETCH_PLACEHOLDERS '{directory}' for {requester}: not listed ({notListed}), " +
+                    $"answered in {clock.ElapsedMilliseconds} ms{(populated ? "" : ", still to be listed")}.");
+            }
+
             if (listed)
             {
                 _log?.Invoke(
@@ -492,13 +552,16 @@ public sealed class SyncRootConnection : IDisposable
     /// entries (empty if there are none) instead of an error; if the server
     /// could not be reached, the drive goes offline, and until it answers
     /// again every listing shows what is local at once (see ServerConnection).
+    /// One the lister declines also returns nothing, and leaves the next
+    /// request free to list.
     /// </summary>
-    private (IReadOnlyList<PlaceholderEntry> Entries, bool Listed) ListCoalesced(string directory, string requester)
+    /// <returns>Also why nothing was listed, when that was not a failure (failures are logged here).</returns>
+    private (IReadOnlyList<PlaceholderEntry> Entries, bool Listed, string? NotListed) ListCoalesced(string directory, string localDirectory, string requester)
     {
         if (_server is { IsOnline: false })
         {
             _server.CheckNow();
-            return ([], false);
+            return ([], false, "offline");
         }
 
         var gate = _listingGates.GetOrAdd(directory, _ => new SemaphoreSlim(1, 1));
@@ -508,22 +571,29 @@ public sealed class SyncRootConnection : IDisposable
             if (_lastListed.TryGetValue(directory, out var at) &&
                 DateTimeOffset.UtcNow - at < _listingReuseWindow)
             {
-                return ([], false);
+                return ([], false, $"tried {(DateTimeOffset.UtcNow - at).TotalMilliseconds:0} ms ago");
             }
 
             // Gone offline while this one waited for the gate.
             if (_server is { IsOnline: false })
             {
-                return ([], false);
+                return ([], false, "offline");
             }
 
             using var timeout = new CancellationTokenSource(ListingTimeout);
+            var declined = false;
             try
             {
-                var entries = _listDirectory!(directory, timeout.Token).GetAwaiter().GetResult();
+                var entries = _listDirectory!(directory, localDirectory, timeout.Token).GetAwaiter().GetResult();
+                if (entries is null)
+                {
+                    declined = true;
+                    return ([], false, "declined");
+                }
+
                 _server?.Succeeded();
                 _listedOk[directory] = DateTimeOffset.UtcNow;
-                return (entries, true);
+                return (entries, true, null);
             }
             catch (Exception ex)
             {
@@ -534,11 +604,14 @@ public sealed class SyncRootConnection : IDisposable
                     _server?.Failed(reason);
                 }
 
-                return ([], false);
+                return ([], false, null);
             }
             finally
             {
-                _lastListed[directory] = DateTimeOffset.UtcNow;
+                if (!declined)
+                {
+                    _lastListed[directory] = DateTimeOffset.UtcNow;
+                }
             }
         }
         finally
@@ -717,29 +790,33 @@ public sealed class SyncRootConnection : IDisposable
     }
 
     /// <summary>
-    /// True while this process is writing hydration bytes for the full local
-    /// path, however long that takes, plus a short grace period after. The
-    /// upload watcher must ignore these writes.
+    /// True while a download of the file at this full local path is under
+    /// way, however long it takes: a change to it waits until the download
+    /// ends (<see cref="DownloadEnded"/>). What the download writes is no
+    /// edit either way: it leaves the file in sync, which is what tells an
+    /// edit.
     /// </summary>
-    public bool IsHydrating(string localPath)
+    public bool IsHydrating(string localPath) =>
+        _hydratingPaths.TryGetValue(localPath, out var active) && active > 0;
+
+    /// <summary>One download of the file has ended, sent or failed.</summary>
+    private void EndDownload(string guardKey)
     {
-        if (!_hydratingPaths.TryGetValue(localPath, out var mark))
+        while (_hydratingPaths.TryGetValue(guardKey, out var active))
         {
-            return false;
+            var done = active <= 1
+                ? _hydratingPaths.TryRemove(new KeyValuePair<string, int>(guardKey, active))
+                : _hydratingPaths.TryUpdate(guardKey, active - 1, active);
+            if (done)
+            {
+                break;
+            }
         }
 
-        if (mark.Active > 0 || DateTimeOffset.UtcNow - mark.LastActivity <= HydrationGuard)
-        {
-            return true;
-        }
-
-        // Only drops the entry if no hydration began since it was read.
-        _hydratingPaths.TryRemove(new KeyValuePair<string, (int, DateTimeOffset)>(localPath, mark));
-        return false;
+        DownloadEnded?.Invoke(guardKey);
     }
 
-    /// <summary>IsHydrating for the path itself or anything under it.</summary>
-    /// <summary>A download is on its way for the item or anything below it.</summary>
+    /// <summary>A download is under way for the item or anything below it.</summary>
     public bool IsHydratingUnder(string localPath)
     {
         var prefix = localPath.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
