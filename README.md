@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Any rclone remote, as a cloud drive in Windows Explorer.</b><br>
-  Files on demand, the way OneDrive does it, for S3, WebDAV, Google Drive, SFTP
+  Files on demand, the way OneDrive does it, for S3, WebDAV, SFTP
   and every other backend rclone supports.
 </p>
 
