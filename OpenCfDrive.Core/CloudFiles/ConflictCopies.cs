@@ -30,18 +30,57 @@ public static class ConflictCopies
     /// conflict name, or with " (2)", " (3)"... before the extension if two
     /// conflicts fall in the same second.
     /// </summary>
-    public static string PathFor(string localPath, DateTime modifiedLocal)
+    public static string PathFor(string localPath, DateTime modifiedLocal) =>
+        Candidates(localPath, modifiedLocal).First(candidate => !File.Exists(candidate) && !Directory.Exists(candidate));
+
+    /// <summary>
+    /// The conflict copy already kept of the file as it is now, if there is
+    /// one: a copy under one of its conflict names with its size and write
+    /// time (a copy keeps the write time). When the server's version could
+    /// not be put in place (the file was in use), the next try finds it, so
+    /// the file is not copied aside again and again.
+    /// </summary>
+    public static string? KeptCopyOf(string localPath)
+    {
+        var file = new FileInfo(localPath);
+        if (!file.Exists)
+        {
+            return null;
+        }
+
+        foreach (var candidate in Candidates(localPath, file.LastWriteTime))
+        {
+            var copy = new FileInfo(candidate);
+            if (!copy.Exists)
+            {
+                if (!Directory.Exists(candidate))
+                {
+                    return null;
+                }
+
+                continue;
+            }
+
+            if (copy.Length == file.Length && copy.LastWriteTimeUtc == file.LastWriteTimeUtc)
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>The conflict names in the order they are taken: the name, then " (2)", " (3)"...</summary>
+    private static IEnumerable<string> Candidates(string localPath, DateTime modifiedLocal)
     {
         var directory = Path.GetDirectoryName(localPath)!;
         var name = Name(Path.GetFileName(localPath), modifiedLocal);
-        var candidate = Path.Combine(directory, name);
-        for (var n = 2; File.Exists(candidate) || Directory.Exists(candidate); n++)
+        yield return Path.Combine(directory, name);
+        var dot = name.LastIndexOf(')') + 1;
+        for (var n = 2; ; n++)
         {
-            var dot = name.LastIndexOf(')') + 1;
-            candidate = Path.Combine(directory, name.Insert(dot, $" ({n})"));
+            yield return Path.Combine(directory, name.Insert(dot, $" ({n})"));
         }
-
-        return candidate;
     }
 
     /// <summary>Whether a name is a conflict copy's.</summary>

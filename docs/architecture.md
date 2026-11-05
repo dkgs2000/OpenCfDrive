@@ -249,7 +249,10 @@ The invariants below spell out how.
   new size and time. A local edit is first kept as a conflict copy (see
   [Detecting conflicts](#detecting-conflicts)), so this leaves out
   `VERIFY_IN_SYNC`, which would make the platform refuse a file edited
-  locally. A plain local file is
+  locally. Instead the update refuses a file whose size or write time changed
+  since the client looked at it (see
+  [Putting the server's version in place](#putting-the-servers-version-in-place)).
+  A plain local file is
   converted to a placeholder first. Only a file whose own upload or rename is
   still on its way is left for the next listing, because this listing may
   predate it. Deletes that come from the server are not sent back to it.
@@ -347,6 +350,35 @@ The client notices a conflict in two places:
   has the version the client last saw. This covers an edit saved while the
   server copy changed and no listing happened in between.
 
+### Putting the server's version in place
+
+What the local file holds goes only if it is still what the client decided
+about: the server's content, or a version kept as a conflict copy. A save made
+in between must not be thrown away, so the client notes the file's size and
+write time when it looks at it, and the step that replaces the file checks
+them again:
+
+- **Cloud mode:** the check and `CfUpdatePlaceholder` run through one handle
+  from `CfOpenFileWithOplock(EXCLUSIVE)`, which shares nothing. The platform
+  gives none while another program has the file open (then the file is "in
+  use" and a later run tries again). While it's held, another program's open
+  waits for it, so nothing can write to the file between the check and the
+  update (`TheExclusiveHandle_IsNotGivenWhileTheFileIsOpen_AndKeepsOthersOut`).
+  The plain write handle shares everything and is given even while the file
+  is open elsewhere. The update's own USN check (`UpdateUsn`) can't serve: the
+  platform refuses even the USN read just before the call, and Explorer
+  states written on the file change it too.
+- **Mock mode:** the file is opened sharing nothing, checked, then written.
+- A file that changed meanwhile is left as it is and recorded as a local
+  change again. The check before its upload then finds the server's newer
+  version and keeps this one as a conflict copy too.
+- When the server's version can't be put in place after the copy was made
+  (the file was in use), the next try uses that copy again: a copy with the
+  file's current size and write time (`ConflictCopies.KeptCopyOf`).
+- When both sides hold the same content, what is recorded as in sync is the
+  size and write time from before the content was compared, so a save made
+  meanwhile still counts as an edit.
+
 Known limits:
 
 - On a remote without content hashes, a server change is recognised by size
@@ -427,12 +459,15 @@ move exist on only some remotes, so they aren't used either.
   answers again.
 - A conflict leaves a conflict copy next to the file ("name (conflicted copy
   date time).ext"), on the server too. A file open in another program is
-  updated on a later run.
+  updated on a later run, which uses the copy already kept of that version
+  (same size and write time) instead of making another.
 - On S3 and other bucket stores, an empty folder exists only here until a file
   is put in it, because those stores have no folders of their own.
-- A program that opens a file in the few milliseconds while the client applies
-  a server change to it can get "being used by another process". Opening it
-  again works.
+- A program that opens a file in the few milliseconds while the client works
+  on it (makes it a placeholder, frees up its space) can get "being used by
+  another process". Opening it again works. While a server change is put in
+  place, an open waits for those milliseconds instead (mock mode: it is
+  refused).
 
 ## Why .NET and Explorer sometimes disagree on placeholder state
 

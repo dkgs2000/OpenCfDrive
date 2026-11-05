@@ -200,7 +200,19 @@ public sealed class CloudPlaceholderService
     /// was last in sync. Without it the platform refuses such a file
     /// (VERIFY_IN_SYNC, ERROR_CLOUD_FILE_NOT_IN_SYNC).
     /// </param>
-    public int UpdateFromRemote(string localPath, long size, DateTimeOffset? modifiedUtc, bool discardLocalChanges = false)
+    /// <param name="unchangedFrom">
+    /// The file's size and write time when the caller made sure that what it
+    /// holds may go (it is the server's, or kept as a conflict copy). The
+    /// update refuses a file that no longer has them, with
+    /// <see cref="ChangedSinceLookedAt"/>, in the same step that replaces
+    /// it, so nothing written after that is thrown away.
+    /// </param>
+    public int UpdateFromRemote(
+        string localPath,
+        long size,
+        DateTimeOffset? modifiedUtc,
+        bool discardLocalChanges = false,
+        (long Length, DateTime WriteUtc)? unchangedFrom = null)
     {
         if (!CloudFilesCapability.Current.IsSupported)
         {
@@ -208,11 +220,55 @@ public sealed class CloudPlaceholderService
         }
 
         // A file that is not fully on disk has no local data to protect, and
-        // a write-access open would download all of it just to drop it.
-        return QueryState(localPath).Partial
-            ? WithMetadataHandle(localPath, handle => UpdateFromRemote(handle, size, modifiedUtc, discardLocalChanges))
-            : WithWin32Handle(localPath, handle => UpdateFromRemote(handle, size, modifiedUtc, discardLocalChanges));
+        // a write-access open would download all of it just to drop it. No
+        // handle can hold it meanwhile, so it is checked just before.
+        if (QueryState(localPath).Partial)
+        {
+            if (unchangedFrom is { } before && LocalVersion(localPath) != before)
+            {
+                return ChangedSinceLookedAt;
+            }
+
+            return WithMetadataHandle(localPath, handle => UpdateFromRemote(handle, size, modifiedUtc, discardLocalChanges));
+        }
+
+        if (unchangedFrom is not { } expected)
+        {
+            return WithWin32Handle(localPath, handle => UpdateFromRemote(handle, size, modifiedUtc, discardLocalChanges));
+        }
+
+        // Checked and replaced through one handle that shares nothing: the
+        // platform gives none while another program has the file open, and
+        // while it is held another program's open waits for it (pinned by
+        // TheExclusiveHandle_IsNotGivenWhileTheFileIsOpen_AndKeepsOthersOut).
+        // So nothing can write to the file between the check and the update.
+        return WithWin32Handle(
+            localPath,
+            handle => LocalVersion(handle) == expected
+                ? UpdateFromRemote(handle, size, modifiedUtc, discardLocalChanges)
+                : ChangedSinceLookedAt,
+            exclusive: true);
     }
+
+    /// <summary>
+    /// What <see cref="UpdateFromRemote"/> returns for a file that changed
+    /// since the caller looked at it (ERROR_CLOUD_FILE_NOT_IN_SYNC, as the
+    /// platform's own VERIFY_IN_SYNC refuses an edited file).
+    /// </summary>
+    public const int ChangedSinceLookedAt = unchecked((int)0x80070179);
+
+    /// <summary>A file's size and write time, by its path (no handle to its data).</summary>
+    public static (long Length, DateTime WriteUtc)? LocalVersion(string localPath)
+    {
+        var info = new FileInfo(localPath);
+        return info.Exists ? (info.Length, info.LastWriteTimeUtc) : null;
+    }
+
+    private static (long Length, DateTime WriteUtc)? LocalVersion(IntPtr handle) =>
+        GetFileInformationByHandle(handle, out var info)
+            ? (((long)info.FileSizeHigh << 32) | info.FileSizeLow,
+               DateTime.FromFileTimeUtc(((long)info.LastWriteTimeHigh << 32) | info.LastWriteTimeLow))
+            : null;
 
     private static int UpdateFromRemote(IntPtr handle, long size, DateTimeOffset? modifiedUtc, bool discardLocalChanges)
     {
@@ -262,11 +318,16 @@ public sealed class CloudPlaceholderService
     /// program opening the file) invalidates it, and then the reference fails
     /// instead of the operation touching a file someone else is using.
     /// </summary>
-    private static int WithWin32Handle(string localPath, Func<IntPtr, int> action)
+    /// <param name="exclusive">
+    /// A handle that shares nothing: refused while another program has the
+    /// file open, and while it is held another program's open waits.
+    /// Without it the handle shares everything and is given even then.
+    /// </param>
+    private static int WithWin32Handle(string localPath, Func<IntPtr, int> action, bool exclusive = false)
     {
         var hr = CfApi.CfOpenFileWithOplock(
             localPath,
-            CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+            CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_WRITE_ACCESS | (exclusive ? CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_EXCLUSIVE : 0),
             out var protectedHandle);
 
         if (!CfApi.Succeeded(hr) || protectedHandle == IntPtr.Zero)
