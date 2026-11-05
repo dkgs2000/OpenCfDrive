@@ -240,6 +240,26 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
     }
 
+    /// <summary>
+    /// A sync step that failed for a file or folder (an upload, rename,
+    /// delete, download, a listing, a server change that could not be put in
+    /// place), as one line. The service shows each to the user. Without a
+    /// handler it goes to the log like any other line.
+    /// </summary>
+    public event Action<string>? ProblemReported;
+
+    private void ReportProblem(string message)
+    {
+        if (ProblemReported is { } report)
+        {
+            report(message);
+        }
+        else
+        {
+            _log?.Invoke(message);
+        }
+    }
+
     private bool IsStateFile(string localPath)
     {
         try
@@ -335,7 +355,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                     localRename: (oldLocalPath, newLocalPath, remotePath, source) => _changes.Renamed(oldLocalPath, newLocalPath, remotePath, source),
                     listDirectory: ListFolderForWindowsAsync,
                     server: _server,
-                    prepareDownload: PrepareDownload);
+                    prepareDownload: PrepareDownload,
+                    problem: ReportProblem);
 
                 // What a listing found changed on the server is applied by
                 // the next run, after its local changes.
@@ -812,7 +833,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                _log?.Invoke($"Looking for changes made while OpenCfDrive was not running failed: {ex.Message}");
+                ReportProblem($"Looking for changes made while OpenCfDrive was not running failed: {ex.Message}");
             }
 
             _scheduler.Start();
@@ -1014,7 +1035,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
         catch (Exception ex) when (ex is not OperationCanceledException && !(_server is not null && ServerConnection.IsUnreachable(ex)))
         {
-            _log?.Invoke($"{failure}: {ex.Message}");
+            ReportProblem($"{failure}: {ex.Message}");
             foreach (var localPath in ChangedPaths(from))
             {
                 if (File.Exists(localPath) || Directory.Exists(localPath))
@@ -1371,7 +1392,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
                 // Typically a folder the server removed since its parent was
                 // listed; the parent's next listing removes it here.
-                _log?.Invoke($"Background sync could not list '{directory}' ({reason}); the next run tries again.");
+                ReportProblem($"Background sync could not list '{directory}' ({reason}); the next run tries again.");
                 return true;
             }
         }
@@ -1450,7 +1471,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
         catch (Exception ex)
         {
-            _log?.Invoke($"Applying server changes in '{relativeDirectory}' failed: {ex.Message}");
+            ReportProblem($"Applying server changes in '{relativeDirectory}' failed: {ex.Message}");
         }
         finally
         {
@@ -1487,7 +1508,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             // Typically open in another program. The row stays, so the next
             // listing of this directory tries again.
             _serverDeletes.TryRemove(record.RemotePath, out _);
-            _log?.Invoke($"Server deleted '{record.RemotePath}', but the local file could not be removed: {ex.Message}");
+            ReportProblem($"Server deleted '{record.RemotePath}', but the local file could not be removed: {ex.Message}");
         }
     }
 
@@ -1550,7 +1571,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _serverDeletes.TryRemove(prefix, out _);
-            _log?.Invoke($"Server deleted folder '{prefix}', but the local folder could not be removed: {ex.Message}");
+            ReportProblem($"Server deleted folder '{prefix}', but the local folder could not be removed: {ex.Message}");
         }
     }
 
@@ -1580,7 +1601,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 _serverDeletes.TryRemove(remotePath, out _);
-                _log?.Invoke($"Server deleted '{remotePath}', but the local file could not be removed: {ex.Message}");
+                ReportProblem($"Server deleted '{remotePath}', but the local file could not be removed: {ex.Message}");
             }
         }
 
@@ -1655,7 +1676,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            _log?.Invoke($"Conflict: '{remotePath}' changed here and on the server, and the local version could not be copied aside ({ex.Message}); it is kept as it is for now.");
+            ReportProblem($"Conflict: '{remotePath}' changed here and on the server, and the local version could not be copied aside ({ex.Message}); it is kept as it is for now.");
             return null;
         }
     }
@@ -1715,7 +1736,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             if (!_placeholders.QueryState(localPath).IsPlaceholder &&
                 !_placeholders.ConvertToPlaceholder(localPath, CloudPlaceholderService.BuildFileIdentity(remotePath), markInSync: false))
             {
-                _log?.Invoke($"Server changed '{remotePath}', but the local file could not be made a placeholder to take it.");
+                ReportProblem($"Server changed '{remotePath}', but the local file could not be made a placeholder to take it.");
                 return false;
             }
 
@@ -1727,7 +1748,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             {
                 // Typically open in another program. The row keeps the old
                 // metadata, so the next listing retries.
-                _log?.Invoke($"Server changed '{remotePath}', but the local copy could not be updated: {HResult.Describe(hr)}.");
+                ReportProblem($"Server changed '{remotePath}', but the local copy could not be updated: {HResult.Describe(hr)}.");
             }
         }
 
@@ -1868,7 +1889,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or HttpRequestException)
         {
-            _log?.Invoke($"Server changed '{remotePath}', but the local file could not be replaced: {ex.Message}");
+            ReportProblem($"Server changed '{remotePath}', but the local file could not be replaced: {ex.Message}");
             return Replacement.Failed;
         }
     }
@@ -1886,7 +1907,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
         catch (Exception ex)
         {
-            _log?.Invoke($"Could not read server metadata for '{relative}': {ex.Message}");
+            ReportProblem($"Could not read server metadata for '{relative}': {ex.Message}");
             return (null, null, null);
         }
     }
@@ -2078,7 +2099,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 }
                 catch (Exception ex)
                 {
-                    _log?.Invoke($"Mock download failed for '{file.RelativePath}': {ex.Message}");
+                    ReportProblem($"Mock download failed for '{file.RelativePath}': {ex.Message}");
                 }
             }
 
@@ -2202,7 +2223,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             }
             catch (Exception ex)
             {
-                _log?.Invoke($"Pin/unpin handling failed for '{localPath}': {ex.Message}");
+                ReportProblem($"Pin/unpin handling failed for '{localPath}': {ex.Message}");
             }
         });
     }
@@ -2485,7 +2506,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             catch (Exception ex) when (!ServerConnection.IsUnreachable(ex))
             {
                 // One file must not stop the rest; the folder then stays.
-                _log?.Invoke($"Could not delete remote '{fs}{remoteFile}': {ex.Message}");
+                ReportProblem($"Could not delete remote '{fs}{remoteFile}': {ex.Message}");
             }
         }
 

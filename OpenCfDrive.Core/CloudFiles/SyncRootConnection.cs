@@ -33,6 +33,9 @@ public sealed class SyncRootConnection : IDisposable
     private readonly SqliteMetadataStore _store;
     private readonly RcloneServeClient _serve;
     private readonly Action<string>? _log;
+
+    /// <summary>A download or listing that failed, for the user (see CloudSyncEngine.ProblemReported).</summary>
+    private readonly Action<string>? _problem;
     private readonly LocalDelete? _localDelete;
     private readonly LocalRename? _localRename;
     private readonly ListDirectory? _listDirectory;
@@ -136,11 +139,13 @@ public sealed class SyncRootConnection : IDisposable
         ListDirectory? listDirectory = null,
         TimeSpan? listingReuseWindow = null,
         ServerConnection? server = null,
-        PrepareDownload? prepareDownload = null)
+        PrepareDownload? prepareDownload = null,
+        Action<string>? problem = null)
     {
         _store = store;
         _serve = serve;
         _log = log;
+        _problem = problem;
         _localDelete = localDelete;
         _localRename = localRename;
         _listDirectory = listDirectory;
@@ -315,7 +320,12 @@ public sealed class SyncRootConnection : IDisposable
             _log?.Invoke($"[{DateTimeOffset.Now:HH:mm:ss.fff}] FETCH_DATA failed ({DescribeFile(info)}): {ex}");
             if (ServerConnection.IsUnreachable(ex))
             {
+                // Told once, as the drive going offline.
                 _server?.Failed(ex.Message);
+            }
+            else
+            {
+                _problem?.Invoke($"Download failed for {DescribeFile(info)}: {ex.Message}");
             }
 
             try
@@ -379,14 +389,35 @@ public sealed class SyncRootConnection : IDisposable
         var chunk = new byte[(int)Math.Min(TransferChunkSize, length)];
         var pinned = GCHandle.Alloc(chunk, GCHandleType.Pinned);
 
-        // Progress shown by Windows on the item, and what keeps a long
-        // download from hitting the platform's 60 s callback timeout.
+        // Progress shown by Windows (on the item, in its copy dialog and in
+        // the "Automatic file downloads" notification), and what keeps a long
+        // download from hitting the platform's 60 s callback timeout. As
+        // Nextcloud reports it (cfApiSendTransferInfo): of the whole file,
+        // how far into it the download is, not of this one request, so a
+        // program that reads a big file a piece at a time shows the file's
+        // progress. It goes to the session that shows the notification: the
+        // requesting program's, or ours when that is a service's (session 0,
+        // as Windows Installer reads a package).
+        var fileTotal = Math.Max(info.FileSize, end);
+        var requestKey = RequestKeyOf(info);
+        var session = SessionToShow(info);
         var progressReported = 0L;
         var lastReportMs = 0L;
         var progressFailureLogged = false;
-        void ReportProgress(long completed)
+        var reportV1 = false;
+        void ReportProgress(long received)
         {
-            var hr = CfApi.CfReportProviderProgress(info.ConnectionKey, info.TransferKey, length, completed);
+            var completed = offset + received;
+            var hr = reportV1
+                ? CfApi.CfReportProviderProgress(info.ConnectionKey, info.TransferKey, fileTotal, completed)
+                : CfApi.CfReportProviderProgress2(info.ConnectionKey, info.TransferKey, requestKey, fileTotal, completed, session);
+            if (!CfApi.Succeeded(hr) && !reportV1)
+            {
+                // A platform without the session-aimed report.
+                reportV1 = true;
+                hr = CfApi.CfReportProviderProgress(info.ConnectionKey, info.TransferKey, fileTotal, completed);
+            }
+
             if (CfApi.Succeeded(hr))
             {
                 Interlocked.Increment(ref _progressReports);
@@ -606,6 +637,7 @@ public sealed class SyncRootConnection : IDisposable
         catch (Exception ex)
         {
             _log?.Invoke($"FETCH_PLACEHOLDERS failed: {ex.Message}");
+            _problem?.Invoke($"Listing a folder for Windows failed: {ex.Message}");
             try
             {
                 TransferPlaceholders(info, [], StatusUnsuccessful, populated: false);
@@ -676,6 +708,10 @@ public sealed class SyncRootConnection : IDisposable
             {
                 var reason = timeout.IsCancellationRequested ? $"no answer within {ListingTimeout.TotalSeconds:0} s" : ex.Message;
                 _log?.Invoke($"[{DateTimeOffset.Now:HH:mm:ss.fff}] FETCH_PLACEHOLDERS '{directory}' for {requester}: remote listing failed, showing local entries: {reason}");
+                if (!ServerConnection.IsUnreachable(ex))
+                {
+                    _problem?.Invoke($"Listing '{directory}' from the server failed, so it shows only what is on this PC: {reason}");
+                }
                 if (timeout.IsCancellationRequested || ServerConnection.IsUnreachable(ex))
                 {
                     _server?.Failed(reason);
@@ -778,7 +814,33 @@ public sealed class SyncRootConnection : IDisposable
 
         var process = Marshal.PtrToStructure<CF_PROCESS_INFO>(info.ProcessInfo);
         var image = process.ImagePath == IntPtr.Zero ? null : Marshal.PtrToStringUni(process.ImagePath);
-        return $"{(string.IsNullOrEmpty(image) ? "pid" : Path.GetFileName(image))} ({process.ProcessId})";
+        var session = SessionOf(process) is { } id ? $", session {id}" : "";
+        return $"{(string.IsNullOrEmpty(image) ? "pid" : Path.GetFileName(image))} ({process.ProcessId}{session})";
+    }
+
+    private static readonly int RequestKeyEnd = (int)Marshal.OffsetOf<CF_CALLBACK_INFO>(nameof(CF_CALLBACK_INFO.RequestKey)) + sizeof(long);
+    private static readonly int SessionIdEnd = (int)Marshal.OffsetOf<CF_PROCESS_INFO>(nameof(CF_PROCESS_INFO.SessionId)) + sizeof(uint);
+    private static readonly uint OwnSession = (uint)Process.GetCurrentProcess().SessionId;
+
+    /// <summary>The request a callback serves, where the platform's structure carries it (else the default, 0).</summary>
+    private static long RequestKeyOf(CF_CALLBACK_INFO info) => info.StructSize >= RequestKeyEnd ? info.RequestKey : 0;
+
+    private static uint? SessionOf(CF_PROCESS_INFO process) => process.StructSize >= SessionIdEnd ? process.SessionId : null;
+
+    /// <summary>
+    /// The session whose UI shows a download's progress: the requesting
+    /// program's, or this process's (the user's) when the program runs in
+    /// session 0, where services run and nothing is shown.
+    /// </summary>
+    private static uint SessionToShow(CF_CALLBACK_INFO info)
+    {
+        if (info.ProcessInfo != IntPtr.Zero &&
+            SessionOf(Marshal.PtrToStructure<CF_PROCESS_INFO>(info.ProcessInfo)) is { } session and not 0)
+        {
+            return session;
+        }
+
+        return OwnSession;
     }
 
     /// <summary>Sync-root-relative directory ('/' separated, empty for the root).</summary>
@@ -880,6 +942,7 @@ public sealed class SyncRootConnection : IDisposable
                 if (!CfApi.Succeeded(result) && result != HRESULT_ALREADY_EXISTS)
                 {
                     _log?.Invoke($"  placeholder error: {entries[i].RelativeName}: {HResult.Describe(result)}");
+                    _problem?.Invoke($"'{entries[i].RelativeName}' on the server could not be shown in the drive: {HResult.Describe(result)}");
                 }
             }
         }
@@ -1054,6 +1117,7 @@ public sealed class SyncRootConnection : IDisposable
         catch (Exception ex)
         {
             _log?.Invoke($"NOTIFY_DELETE handler failed: {ex.Message}");
+            _problem?.Invoke($"A delete in the drive could not be handled: {ex.Message}");
         }
         finally
         {
@@ -1103,6 +1167,7 @@ public sealed class SyncRootConnection : IDisposable
         catch (Exception ex)
         {
             _log?.Invoke($"NOTIFY_RENAME handler failed: {ex.Message}");
+            _problem?.Invoke($"A rename in the drive could not be handled: {ex.Message}");
         }
         finally
         {
@@ -1120,6 +1185,7 @@ public sealed class SyncRootConnection : IDisposable
         catch (Exception ex)
         {
             _log?.Invoke($"{type} failed: {ex.Message}");
+            _problem?.Invoke($"Windows could not be answered ({type}): {ex.Message}");
         }
     }
 

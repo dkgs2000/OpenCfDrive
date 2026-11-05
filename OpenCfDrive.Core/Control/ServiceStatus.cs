@@ -16,7 +16,11 @@ public sealed record ServiceStatus(
     long BytesDownloaded,
     string LogPath,
     IReadOnlyList<ActivityEntry> RecentActivity,
-    RcloneStatus? Rclone = null);
+    RcloneStatus? Rclone = null,
+    // How many sync problems the service has had since it started, and the
+    // latest of them: the app tells the user about each new one.
+    int ProblemsReported = 0,
+    IReadOnlyList<ActivityEntry>? RecentProblems = null);
 
 /// <summary>The rclone the service talks to.</summary>
 /// <param name="Managed">The service runs it itself; otherwise the user runs it at <paramref name="Url"/>.</param>

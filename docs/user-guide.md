@@ -110,6 +110,12 @@ Drag its icon onto the taskbar to keep it in view.
   app, and syncing carries on in the background.
 - The installed app **starts when you sign in** to Windows. You can turn that
   off in Settings.
+- **A notification tells you about every problem:** a file or folder that
+  couldn't be synced (with the server's answer, for example "413 Payload Too
+  Large" from a server that refuses big uploads), a download that failed, and
+  the drive going offline or stopping. Several at once come as one. A file
+  that keeps failing isn't announced again for 30 minutes. Click the
+  notification to open the app, whose Recent activity has the details.
 
 The **Status** tab shows:
 
@@ -290,6 +296,12 @@ sync service ends, and OpenCfDrive restarts it if it stops on its own.
 - **"Being used by another process."** A program that opens a file at the
   exact moment OpenCfDrive applies a server change to it can see this error.
   Opening the file again works.
+- **Big files on a plain WebDAV server** are uploaded in one request each
+  (rclone uploads in parts only to Nextcloud and ownCloud). A proxy in front
+  of the server may refuse large requests: Cloudflare's free plan refuses
+  anything over 100 MB with "413 Payload Too Large". OpenCfDrive tells you
+  which file it couldn't upload. Raise the proxy's limit, or let uploads to
+  the server bypass it.
 - **Sync states in Explorer's Status column.** OpenCfDrive shows a per-file
   sync state in Explorer's Status column:
   - **Waiting to upload** - the file has a local edit that has not reached the

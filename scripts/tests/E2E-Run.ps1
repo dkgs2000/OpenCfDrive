@@ -11,11 +11,25 @@
 # on exit, so nothing of the user's own folders is touched.
 #
 #   -Backend webdav|s3   which server to run (default webdav)
+#   -Backend remote -Remote "myremote:"   a real server instead: every
+#                        scenario runs in a new folder opencfdrive-e2e-<time>
+#                        on that rclone remote, which is deleted at the end.
+#                        -RcloneConfig picks the config (default: rclone's).
+#                        -RemoteAsPath makes the drive "myremote:<folder>",
+#                        a remote with a path, instead of the remote's root.
+#                        -ChunkSize 50Mi puts rclone's chunker in front (files
+#                        above the size in pieces, for a proxy that caps a
+#                        request's size, as Cloudflare does at 100 MB).
+#                        Scenarios that take the server offline are skipped.
 #   -Only "S0*,C11"      run only these scenarios
 #   -SyncRoot / -KeepRegistration   mount elsewhere / leave the mount in place
 
 param(
-    [ValidateSet("webdav", "s3")][string]$Backend = "webdav",
+    [ValidateSet("webdav", "s3", "remote")][string]$Backend = "webdav",
+    [string]$Remote = "",
+    [string]$RcloneConfig = "",
+    [switch]$RemoteAsPath,
+    [string]$ChunkSize = "",
     [string]$Only = "",
     [string]$SyncRoot = "",
     [string]$RemoteName = "e2e",
@@ -199,6 +213,10 @@ $mountCheck = {
 Invoke-OpenCfDriveE2E `
     -Mode "cloud" `
     -Backend $Backend `
+    -Remote $Remote `
+    -RcloneConfig $RcloneConfig `
+    -RemoteAsPath:$RemoteAsPath `
+    -ChunkSize $ChunkSize `
     -Only $Only `
     -SyncRoot $SyncRoot `
     -RemoteName $RemoteName `

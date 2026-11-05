@@ -24,6 +24,7 @@ internal static class Program
             if (Has(args, "--uninstall"))
             {
                 SignInStartup.Disable();
+                WindowsNotifications.Unregister();
                 RemoveDownloadedRclone();
             }
 

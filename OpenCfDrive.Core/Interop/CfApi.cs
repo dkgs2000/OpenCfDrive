@@ -78,6 +78,19 @@ internal static class CfApi
         long providerProgressTotal,
         long providerProgressCompleted);
 
+    /// <summary>
+    /// <see cref="CfReportProviderProgress"/> for one request, aimed at the
+    /// session whose UI shows it (Windows 10 1809 and later).
+    /// </summary>
+    [DllImport("cldapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    internal static extern int CfReportProviderProgress2(
+        CF_CONNECTION_KEY connectionKey,
+        long transferKey,
+        long requestKey,
+        long providerProgressTotal,
+        long providerProgressCompleted,
+        uint targetSessionId);
+
     [DllImport("cldapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
     internal static extern int CfUpdatePlaceholder(
         IntPtr fileHandle,
@@ -251,7 +264,8 @@ internal struct CF_CALLBACK_INFO
     public IntPtr CorrelationVector;
     public IntPtr ProcessInfo;
 
-    // Added in later SDKs; trailing, never read by this provider.
+    // Added in later SDKs (read only when StructSize covers it, see
+    // SyncRootConnection.RequestKeyOf).
     public long RequestKey;
 }
 

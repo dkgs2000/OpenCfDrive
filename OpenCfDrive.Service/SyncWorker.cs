@@ -13,6 +13,7 @@ public sealed class SyncWorker(
     IHostApplicationLifetime lifetime) : BackgroundService
 {
     private readonly DateTimeOffset _startedAt = DateTimeOffset.Now;
+    private readonly ProblemLog _problems = new();
     private CloudSyncEngine? _engine;
     private SqliteMetadataStore? _store;
     private ServiceControlServer? _control;
@@ -102,6 +103,13 @@ public sealed class SyncWorker(
         }
 
         _engine = new CloudSyncEngine(syncRoot, remote, endpoint, dbPath, msg => logger.LogInformation("{Message}", msg));
+
+        // Every failed sync step, for the app to tell the user about.
+        _engine.ProblemReported += message =>
+        {
+            logger.LogWarning("{Message}", message);
+            _problems.Report(message);
+        };
 
         try
         {
@@ -249,7 +257,9 @@ public sealed class SyncWorker(
             _engine?.BytesFetched ?? 0,
             ConsoleOutput.ActiveLogPath ?? "",
             activity.Recent(100),
-            RcloneNow());
+            RcloneNow(),
+            _problems.Count,
+            _problems.Recent());
     }
 
     private static string Version =>
