@@ -212,7 +212,8 @@ function Get-ConflictCopy([string]$Folder, [string]$BaseName) {
     $copies = @(Get-ChildItem -LiteralPath (Get-LocalPath $Folder) -Force -File |
         Where-Object { $_.Name -like "$BaseName (conflicted copy *)*" })
     if ($copies.Count -ne 1) {
-        throw "Expected one conflict copy of $BaseName in '$Folder', found $($copies.Count): $($copies.Name -join ', ')"
+        # Not $copies.Name: with none found, strict mode rejects it and hides this message.
+        throw "Expected one conflict copy of $BaseName in '$Folder', found $($copies.Count): $((@($copies | ForEach-Object { $_.Name })) -join ', ')"
     }
     return $(if ($Folder) { "$Folder/$($copies[0].Name)" } else { $copies[0].Name })
 }
@@ -933,9 +934,19 @@ function Get-E2EScenarios {
             Set-RemoteFile "s34.txt" "s34-server-v1"
             Wait-Local "" { Test-Local "s34.txt" } "s34.txt did not appear locally."
             Assert-Local "s34.txt" "s34-server-v1"
+            # The server changes first, as in S15, so the check before the
+            # upload always sees it. Edited first, the edit can reach the
+            # server before the change does (writing the server starts an
+            # rclone process, which can take longer than the client's one
+            # second before it sends an edit): then it is simply uploaded and
+            # overwritten, with no conflict. And to another length: a server
+            # without hashes (WebDAV here) tells a change by size and time to
+            # within a second, and both versions are written within one.
+            Set-RemoteFile "s34.txt" "s34-server-v2-longer"
             Write-Local "s34.txt" "s34-local-edit"
-            Set-RemoteFile "s34.txt" "s34-server-v2"
-            Sync-Remote
+            Wait-Local "" {
+                @(Get-ChildItem -LiteralPath (Get-LocalPath "") -Force -File | Where-Object { $_.Name -like "s34 (conflicted copy *)*" }).Count -eq 1
+            } "No conflict copy of s34.txt was kept."
             $copy = Get-ConflictCopy "" "s34"
             # The state is written on a background thread. Use the successful
             # provider write in the service log here; the shell contract test
@@ -947,7 +958,7 @@ function Get-E2EScenarios {
             } -TimeoutSeconds 10 -PollMilliseconds 100
             if (-not $marked) { throw "The conflict copy $copy is not marked 'conflict copy' in the provider." }
             Assert-Local $copy "s34-local-edit"
-            Assert-RemoteText "s34.txt" "s34-server-v2"
+            Assert-RemoteText "s34.txt" "s34-server-v2-longer"
         }
 
         # A folder holding nothing local is not listed by sync runs: a run
