@@ -1632,12 +1632,21 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     /// Keeps the local version of a file the server changed too: a copy of
     /// it next to it, named like Nextcloud's conflict copies, which is
     /// uploaded as a file of its own (OneDrive and Nextcloud keep both).
-    /// Returns the copy's path, or null if it could not be made.
+    /// A copy kept already of the file as it is now is used again: the
+    /// server's version could not be put in place then (the file was in
+    /// use), and this is the next try. Returns the copy's path, or null if it
+    /// could not be made.
     /// </summary>
     private string? KeepConflictCopy(string localPath, string remotePath)
     {
         try
         {
+            if (ConflictCopies.KeptCopyOf(localPath) is { } kept)
+            {
+                _log?.Invoke($"Conflict: '{remotePath}' changed here and on the server; this PC's version is kept as '{RelativeOf(kept)}' already.");
+                return kept;
+            }
+
             var copy = ConflictCopies.PathFor(localPath, File.GetLastWriteTime(localPath));
             File.Copy(localPath, copy);
             _itemStates.ConflictCopy(copy);
@@ -1659,6 +1668,10 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     /// cloud mode the file becomes a dehydrated placeholder with the server's
     /// size and time (a plain local file is made a placeholder first); in mock
     /// mode the server's bytes are written over it.
+    /// What the file holds goes only if it is still as it was when this was
+    /// decided: the step that replaces it checks the file's size and write
+    /// time while no other program can open it, so a save made meanwhile is
+    /// never thrown away. Such a file is left as it is and looked at again.
     /// </summary>
     /// <param name="hash">The server version's hash, when the remote keeps one.</param>
     /// <param name="compareContent">False when the caller has just found the content differs.</param>
@@ -1670,7 +1683,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         string? hash,
         bool compareContent = true)
     {
-        if (!File.Exists(localPath))
+        // The file as it is when what to do with it is decided.
+        if (CloudPlaceholderService.LocalVersion(localPath) is not { } seen)
         {
             return false;
         }
@@ -1679,7 +1693,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         {
             if (compareContent && await IsServerContentAsync(localPath, hash).ConfigureAwait(false))
             {
-                TakeAsInSync(localPath, remotePath, size, modifiedUtc, hash);
+                TakeAsInSync(localPath, remotePath, size, modifiedUtc, hash, seen);
                 ClearState(localPath);
                 return true;
             }
@@ -1691,10 +1705,10 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
 
         _providerWrites[localPath] = DateTimeOffset.UtcNow;
-        bool replaced;
+        Replacement replaced;
         if (IsSimulated)
         {
-            replaced = DownloadOver(localPath, remotePath);
+            replaced = DownloadOver(localPath, remotePath, seen);
         }
         else
         {
@@ -1705,18 +1719,30 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 return false;
             }
 
-            var hr = _placeholders.UpdateFromRemote(localPath, size, modifiedUtc, discardLocalChanges: true);
-            replaced = CfApi.Succeeded(hr);
-            if (!replaced)
+            var hr = _placeholders.UpdateFromRemote(localPath, size, modifiedUtc, discardLocalChanges: true, unchangedFrom: seen);
+            replaced = CfApi.Succeeded(hr) ? Replacement.Done
+                : hr == CloudPlaceholderService.ChangedSinceLookedAt ? Replacement.ChangedMeanwhile
+                : Replacement.Failed;
+            if (replaced == Replacement.Failed)
             {
                 // Typically open in another program. The row keeps the old
                 // metadata, so the next listing retries.
                 _log?.Invoke($"Server changed '{remotePath}', but the local copy could not be updated: {HResult.Describe(hr)}.");
-                return false;
             }
         }
 
-        if (!replaced)
+        if (replaced == Replacement.ChangedMeanwhile)
+        {
+            // Saved again meanwhile: that is a change of its own, which the
+            // check before its upload compares with the server again (and,
+            // the server's version being newer, keeps as a conflict copy).
+            _log?.Invoke($"Server changed '{remotePath}', but the local file changed again meanwhile; it is left as it is and looked at again.");
+            _changes.Changed(localPath);
+            _itemStates.WaitingToUpload(localPath);
+            return false;
+        }
+
+        if (replaced != Replacement.Done)
         {
             return false;
         }
@@ -1759,9 +1785,14 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     /// both sides (the same edit made twice, or saved again): it is recorded
     /// as in sync with no copy and nothing sent.
     /// </summary>
-    private void TakeAsInSync(string localPath, string remotePath, long size, DateTimeOffset? modifiedUtc, string? hash)
+    /// <param name="compared">
+    /// The file's size and write time from before its content was compared.
+    /// They are what is recorded as in sync, not the file's as it is now: if
+    /// it was saved again meanwhile, it no longer matches them and still
+    /// counts as edited.
+    /// </param>
+    private void TakeAsInSync(string localPath, string remotePath, long size, DateTimeOffset? modifiedUtc, string? hash, (long Length, DateTime WriteUtc) compared)
     {
-        var info = new FileInfo(localPath);
         var state = _placeholders.QueryState(localPath);
         _store.UpsertFile(
             remotePath: remotePath,
@@ -1773,18 +1804,18 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             size: size,
             modifiedUtc: modifiedUtc,
             inSync: true,
-            localSize: info.Length,
-            localWriteUtc: info.LastWriteTimeUtc,
+            localSize: compared.Length,
+            localWriteUtc: compared.WriteUtc,
             hash: hash);
         _localChangeAt[remotePath] = DateTimeOffset.UtcNow;
-        RememberSyncedState(localPath);
+        _lastSyncedState[localPath] = compared;
 
         if (!IsSimulated)
         {
             var identity = CloudPlaceholderService.BuildFileIdentity(remotePath);
             if (state.IsPlaceholder)
             {
-                _placeholders.MarkInSync(localPath, identity, info.Length);
+                _placeholders.MarkInSync(localPath, identity, compared.Length);
             }
             else
             {
@@ -1795,29 +1826,50 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         _log?.Invoke($"'{remotePath}' changed here and on the server to the same content: no conflict, nothing to send.");
     }
 
-    /// <summary>Mock mode: writes the server's current bytes over the local file.</summary>
-    private bool DownloadOver(string localPath, string remotePath)
+    /// <summary>How putting the server's version in place of a local file went.</summary>
+    private enum Replacement
+    {
+        Done,
+        Failed,
+
+        /// <summary>The file changed since it was looked at, and was left as it is.</summary>
+        ChangedMeanwhile,
+    }
+
+    /// <summary>
+    /// Mock mode: writes the server's current bytes over the local file, if
+    /// it still has the size and write time it had when this was decided. It
+    /// is opened sharing nothing, so no other program has it open or can open
+    /// it while it is checked and written.
+    /// </summary>
+    private Replacement DownloadOver(string localPath, string remotePath, (long Length, DateTime WriteUtc) unchangedFrom)
     {
         if (_serve is null)
         {
-            return false;
+            return Replacement.Failed;
         }
 
         try
         {
             using (var source = _serve.OpenRangeAsync(remotePath, 0, -1).GetAwaiter().GetResult())
-            using (var target = File.Create(localPath))
+            using (var target = new FileStream(localPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
             {
+                if (target.Length != unchangedFrom.Length || File.GetLastWriteTimeUtc(target.SafeFileHandle) != unchangedFrom.WriteUtc)
+                {
+                    return Replacement.ChangedMeanwhile;
+                }
+
+                target.SetLength(0);
                 source.CopyTo(target);
             }
 
             RememberSyncedState(localPath);
-            return true;
+            return Replacement.Done;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or HttpRequestException)
         {
             _log?.Invoke($"Server changed '{remotePath}', but the local file could not be replaced: {ex.Message}");
-            return false;
+            return Replacement.Failed;
         }
     }
 

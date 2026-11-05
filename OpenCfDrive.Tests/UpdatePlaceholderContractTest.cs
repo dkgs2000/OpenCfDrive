@@ -120,6 +120,255 @@ public class UpdatePlaceholderContractTest(ITestOutputHelper output)
         return (info.Length, info.LastWriteTimeUtc);
     }
 
+    /// <summary>
+    /// A conflict's last step: the server's version replaces the file only
+    /// if it still has the size and write time it had when the engine looked
+    /// at it (and kept it as a copy). A save made since is refused and stays;
+    /// an Explorer state shown meanwhile is no change; a file open in another
+    /// program is left as it is; a plain file made a placeholder first keeps
+    /// its size and write time, so it is replaced.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void UpdateFromRemote_UnchangedFrom_RefusesAFileSavedSince(bool plainFile)
+    {
+        var content = Encoding.UTF8.GetBytes("old-content");
+
+        RunInSyncRoot(() => content, (syncRoot, placeholders, fetches) =>
+        {
+            var path = Path.Combine(syncRoot, "file.txt");
+            if (plainFile)
+            {
+                // Saved by replacing it, as many programs do.
+                File.Delete(path);
+                File.WriteAllText(path, "old-content-edited");
+                Assert.False(placeholders.QueryState(path).IsPlaceholder);
+            }
+            else
+            {
+                Assert.Equal("old-content", File.ReadAllText(path));
+                File.AppendAllText(path, "-edited");
+            }
+
+            var looked = CloudPlaceholderService.LocalVersion(path)!.Value;
+            new ShellItemStateWriter().ApplyAsync(path, ItemState.WaitingToUpload, CancellationToken.None).GetAwaiter().GetResult();
+            if (plainFile)
+            {
+                Assert.True(placeholders.ConvertToPlaceholder(path, CloudPlaceholderService.BuildFileIdentity("file.txt"), markInSync: false));
+                Assert.Equal(looked, CloudPlaceholderService.LocalVersion(path));
+            }
+
+            content = Encoding.UTF8.GetBytes("new-content-from-server");
+            using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                var inUse = placeholders.UpdateFromRemote(path, content.Length, DateTimeOffset.UtcNow, discardLocalChanges: true, unchangedFrom: looked);
+                output.WriteLine($"open in another program -> {HResult.Describe(inUse)}");
+                Assert.False(CfApi.Succeeded(inUse), "A file open in another program was replaced.");
+            }
+
+            Assert.Equal("old-content-edited", File.ReadAllText(path));
+
+            File.AppendAllText(path, "-again");
+            var hr = placeholders.UpdateFromRemote(path, content.Length, DateTimeOffset.UtcNow, discardLocalChanges: true, unchangedFrom: looked);
+            output.WriteLine($"saved again since -> {HResult.Describe(hr)}");
+            Assert.Equal(CloudPlaceholderService.ChangedSinceLookedAt, hr);
+            Assert.Equal("old-content-edited-again", File.ReadAllText(path));
+
+            hr = placeholders.UpdateFromRemote(path, content.Length, DateTimeOffset.UtcNow, discardLocalChanges: true, unchangedFrom: CloudPlaceholderService.LocalVersion(path));
+            output.WriteLine($"unchanged since -> {HResult.Describe(hr)}");
+            Assert.True(CfApi.Succeeded(hr), $"UpdateFromRemote failed with {HResult.Describe(hr)}");
+            Assert.True(placeholders.QueryState(path).Partial, "The replaced file still has its local data.");
+            Assert.Equal("new-content-from-server", File.ReadAllText(path));
+        });
+    }
+
+    /// <summary>
+    /// What makes the check in the step that replaces a file sound (the
+    /// size and write time UpdateFromRemote compares): that step runs through
+    /// CfOpenFileWithOplock's exclusive handle, which shares nothing. The
+    /// platform gives none while another program has the file open (even one
+    /// sharing everything, which the plain write handle does not refuse), and
+    /// while it is held another program cannot open the file. So between the
+    /// check and the replace no one can write to it. Attribute lookups (as
+    /// Explorer makes) still work meanwhile, and the handle can be asked the
+    /// file's size and write time.
+    /// </summary>
+    [SkippableFact]
+    public void TheExclusiveHandle_IsNotGivenWhileTheFileIsOpen_AndKeepsOthersOut()
+    {
+        var content = Encoding.UTF8.GetBytes("old-content");
+
+        RunInSyncRoot(() => content, (syncRoot, placeholders, fetches) =>
+        {
+            var path = Path.Combine(syncRoot, "file.txt");
+            Assert.Equal("old-content", File.ReadAllText(path));
+            const CF_OPEN_FILE_FLAGS exclusive = CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_WRITE_ACCESS;
+
+            foreach (var share in new[] { FileShare.ReadWrite | FileShare.Delete, FileShare.Read })
+            {
+                using (new FileStream(path, FileMode.Open, FileAccess.Read, share))
+                {
+                    var refused = CfApi.CfOpenFileWithOplock(path, exclusive, out var given);
+                    output.WriteLine($"exclusive open while another program has it open ({share}) -> {HResult.Describe(refused)}");
+                    if (given != IntPtr.Zero)
+                    {
+                        CfApi.CfCloseHandle(given);
+                    }
+
+                    Assert.Equal(SharingViolation, refused);
+                }
+            }
+
+            var hr = CfApi.CfOpenFileWithOplock(path, exclusive, out var handle);
+            Assert.True(CfApi.Succeeded(hr), $"CfOpenFileWithOplock failed with {HResult.Describe(hr)}");
+            try
+            {
+                Assert.True(CfApi.CfReferenceProtectedHandle(handle), "The protected handle could not be referenced.");
+                Task<string> other;
+                try
+                {
+                    // An open that does not wait for the handle is refused; a
+                    // plain one (as programs make) waits until it is let go.
+                    var status = OpenWithoutWaiting(path, out var probe);
+                    if (probe != IntPtr.Zero)
+                    {
+                        NtClose(probe);
+                    }
+
+                    output.WriteLine($"an open that does not wait, while the handle is held -> 0x{status:X8}");
+                    Assert.Equal(StatusSharingViolation, status);
+                    // As File.ReadAllText opens: sharing reading only, which
+                    // a write handle that is still open would refuse.
+                    other = Task.Run(() =>
+                    {
+                        try
+                        {
+                            File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read).Dispose();
+                            return "opened";
+                        }
+                        catch (Exception ex)
+                        {
+                            return ex.Message;
+                        }
+                    });
+                    Assert.Equal(content.Length, new FileInfo(path).Length);
+
+                    var win32 = CfApi.CfGetWin32HandleFromProtectedHandle(handle);
+                    Assert.True(GetFileInformationByHandle(win32, out var info), $"The handle could not be asked the file's size and time: {Marshal.GetLastWin32Error()}");
+                    Assert.Equal(content.Length, ((long)info.FileSizeHigh << 32) | info.FileSizeLow);
+                }
+                finally
+                {
+                    CfApi.CfReleaseProtectedHandle(handle);
+                }
+
+                // Let go: the waiting open gets the file, and the platform
+                // closes the handle for it (its oplock is broken).
+                Assert.True(other.Wait(TimeSpan.FromSeconds(10)), "The open waiting for the handle did not finish once it was let go.");
+                Assert.Equal("opened", other.Result);
+                Assert.False(CfApi.CfReferenceProtectedHandle(handle), "The handle is still usable after another program opened the file.");
+            }
+            finally
+            {
+                CfApi.CfCloseHandle(handle);
+            }
+
+            Assert.Equal("old-content", File.ReadAllText(path));
+        });
+    }
+
+    private static readonly int SharingViolation = unchecked((int)0x80070020);
+    private const int StatusSharingViolation = unchecked((int)0xC0000043);
+
+    /// <summary>Opens the file for reading with FILE_COMPLETE_IF_OPLOCKED: at once, where a plain open waits for an oplock break.</summary>
+    private static int OpenWithoutWaiting(string path, out IntPtr handle)
+    {
+        var name = @"\??\" + path;
+        var buffer = Marshal.StringToHGlobalUni(name);
+        var unicode = Marshal.AllocHGlobal(Marshal.SizeOf<UNICODE_STRING>());
+        try
+        {
+            Marshal.StructureToPtr(new UNICODE_STRING { Length = (ushort)(name.Length * 2), MaximumLength = (ushort)(name.Length * 2), Buffer = buffer }, unicode, false);
+            var attributes = new OBJECT_ATTRIBUTES
+            {
+                Length = Marshal.SizeOf<OBJECT_ATTRIBUTES>(),
+                ObjectName = unicode,
+                Attributes = 0x40, // OBJ_CASE_INSENSITIVE
+            };
+            const uint access = 0x0001 | 0x0080 | 0x00100000;          // FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            const uint options = 0x0040 | 0x0020 | 0x0100;            // NON_DIRECTORY_FILE | SYNCHRONOUS_IO_NONALERT | COMPLETE_IF_OPLOCKED
+            return NtCreateFile(out handle, access, ref attributes, out _, IntPtr.Zero, 0, 7, 1, options, IntPtr.Zero, 0);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(unicode);
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UNICODE_STRING
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct OBJECT_ATTRIBUTES
+    {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_STATUS_BLOCK
+    {
+        public IntPtr Status;
+        public IntPtr Information;
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtCreateFile(
+        out IntPtr handle,
+        uint desiredAccess,
+        ref OBJECT_ATTRIBUTES objectAttributes,
+        out IO_STATUS_BLOCK ioStatus,
+        IntPtr allocationSize,
+        uint fileAttributes,
+        uint shareAccess,
+        uint createDisposition,
+        uint createOptions,
+        IntPtr eaBuffer,
+        uint eaLength);
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtClose(IntPtr handle);
+
+    // FILETIMEs are two DWORDs: 4-byte aligned.
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public long CreationTime;
+        public long LastAccessTime;
+        public long LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(IntPtr handle, out BY_HANDLE_FILE_INFORMATION info);
+
     [SkippableFact]
     public void UpdateFromRemote_OnAPartlyDownloadedFile_DownloadsNothingMore()
     {

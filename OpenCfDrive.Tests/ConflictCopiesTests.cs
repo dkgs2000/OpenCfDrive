@@ -41,6 +41,51 @@ public sealed class ConflictCopiesTests : IDisposable
         Assert.Equal(Path.Combine(_folder, "report (conflicted copy 2026-11-03 175504) (2).txt"), ConflictCopies.PathFor(file, At));
     }
 
+    /// <summary>
+    /// When the server's version could not be put in place after the copy
+    /// was made (the file was in use), the next try finds that copy and makes
+    /// no second one, also when it is not the first of the conflict names.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void KeptCopyOf_FindsTheCopyOfTheFileAsItIsNow(bool nameTakenBefore)
+    {
+        Directory.CreateDirectory(_folder);
+        var file = Path.Combine(_folder, "report.txt");
+        File.WriteAllText(file, "local edit");
+        File.SetLastWriteTime(file, At);
+        Assert.Null(ConflictCopies.KeptCopyOf(file));
+
+        if (nameTakenBefore)
+        {
+            // An earlier conflict in the same second, of another version.
+            File.WriteAllText(ConflictCopies.PathFor(file, At), "another version");
+        }
+
+        var copy = ConflictCopies.PathFor(file, At);
+        File.Copy(file, copy);
+
+        Assert.Equal(copy, ConflictCopies.KeptCopyOf(file));
+    }
+
+    /// <summary>A file edited again after its copy was made is another version: it gets a copy of its own.</summary>
+    [Fact]
+    public void KeptCopyOf_IgnoresACopyOfAnEarlierVersion()
+    {
+        Directory.CreateDirectory(_folder);
+        var file = Path.Combine(_folder, "report.txt");
+        File.WriteAllText(file, "first edit");
+        File.SetLastWriteTime(file, At);
+        File.Copy(file, ConflictCopies.PathFor(file, At));
+
+        File.WriteAllText(file, "later edit");   // the same size
+        File.SetLastWriteTime(file, At.AddMilliseconds(300));
+
+        Assert.Null(ConflictCopies.KeptCopyOf(file));
+        Assert.Equal(Path.Combine(_folder, "report (conflicted copy 2026-11-03 175504) (2).txt"), ConflictCopies.PathFor(file, At.AddMilliseconds(300)));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_folder))

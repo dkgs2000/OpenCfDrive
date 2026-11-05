@@ -1080,9 +1080,14 @@ function Get-E2EScenarios {
         # No sync run in between, so only the check before the upload can see
         # the server's change. The file is opened before the server changes
         # it, so saving looks up no name. Both versions are kept.
+        # The wait reads only the file's size, through its folder: a read of
+        # the file at the moment the client puts the server's version in
+        # place makes that fail ("in use by another process"), and in mock
+        # mode nothing tries it again.
         New-E2EScenario "C18" "the server changes a file that is open locally, then it is saved: both versions are kept" -Budget (Get-Budget @{ DownloadBytes = 29; Uploads = 1; Lookups = 3 } -HashesLocal) {
             Wait-Local "client" { Test-Local "client/conflict.txt" } "client\conflict.txt did not appear locally."
-            $stream = [System.IO.File]::Open((Get-LocalPath "client/conflict.txt"), 'Open', 'ReadWrite', 'ReadWrite')
+            $c18File = Get-LocalPath "client/conflict.txt"
+            $stream = [System.IO.File]::Open($c18File, 'Open', 'ReadWrite', 'ReadWrite')
             try {
                 Set-RemoteFile "client/conflict.txt" "conflict-server-v2"
                 $edit = [System.Text.Encoding]::UTF8.GetBytes("conflict-local-edit")
@@ -1092,9 +1097,14 @@ function Get-E2EScenarios {
                 $stream.Dispose()
             }
 
-            $won = Wait-ForCondition { try { (Read-Local "client/conflict.txt") -eq "conflict-server-v2" } catch { $false } } `
-                -TimeoutSeconds 30 -PollMilliseconds 500
+            # The copy is made first, then the server's version takes the name.
+            $c18Size = [System.Text.Encoding]::UTF8.GetByteCount("conflict-server-v2")
+            $won = Wait-ForAttributes $c18File {
+                (Get-Item -LiteralPath $c18File -Force).Length -eq $c18Size -and
+                @(Get-ChildItem -LiteralPath (Get-LocalPath "client") -Force -File | Where-Object { $_.Name -like "conflict (conflicted copy *)*" }).Count -eq 1
+            } -TimeoutSeconds 30 -NotifyFilter ([System.IO.NotifyFilters]'Attributes, Size, LastWrite')
             if (-not $won) { throw "client\conflict.txt did not take the server's version (it reads '$(Read-Local "client/conflict.txt")')." }
+            Assert-Local "client/conflict.txt" "conflict-server-v2"
             Assert-RemoteText "client/conflict.txt" "conflict-server-v2"
             $copy = Get-ConflictCopy "client" "conflict"
             Assert-Local $copy "conflict-local-edit"
