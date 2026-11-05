@@ -36,6 +36,14 @@ $script:E2ERcUser = "opencfdrive-e2e"
 $script:E2ERcPass = [guid]::NewGuid().ToString("N")
 $script:E2ERemoteName = "e2e"
 $script:E2ERemoteSpec = "e2e:"
+$script:E2EBackend = "webdav"
+$script:E2EServerHashes = $false
+$script:E2EServerKeepsEmptyFolders = $true
+$script:E2EServerSlowTimes = $false
+$script:E2ERemoteBase = ""
+$script:E2ETestFolder = ""
+$script:E2ERemoteUrlVariable = ""
+$script:E2EChunkerVariables = @{}
 $script:E2EBackendUrl = ""
 $script:E2ETempRoot = ""
 
@@ -351,12 +359,22 @@ function Get-RemoteFile([string]$Path) {
 }
 
 # True when a file or folder exists at the path.
+# A folder as the root rclone opens, with a trailing slash: rclone then
+# takes it for a folder. Without it the WebDAV backend asks for the path as a
+# file first, which some servers answer with a redirect to http:// that
+# rclone refuses.
+function Join-RemoteFolder([string]$Path) {
+    $spec = Join-RemoteSpec $Path
+    if ($spec.EndsWith(":") -or $spec.EndsWith("/")) { return $spec }
+    return "$spec/"
+}
+
 function Test-RemoteItem([string]$Path) {
     $path = $Path.Trim('/')
     $parent = if ($path.Contains('/')) { $path.Substring(0, $path.LastIndexOf('/')) } else { "" }
     $name = if ($path.Contains('/')) { $path.Substring($path.LastIndexOf('/') + 1) } else { $path }
     try {
-        $entries = Invoke-ServerRclone @("lsf", (Join-RemoteSpec $parent))
+        $entries = Invoke-ServerRclone @("lsf", (Join-RemoteFolder $parent))
     } catch {
         return $false
     }
@@ -368,11 +386,11 @@ function Remove-RemoteFile([string]$Path) {
 }
 
 function Remove-RemoteFolder([string]$Path) {
-    Invoke-ServerRclone @("purge", (Join-RemoteSpec $Path)) | Out-Null
+    Invoke-ServerRclone @("purge", (Join-RemoteFolder $Path)) | Out-Null
 }
 
 function New-RemoteFolder([string]$Path) {
-    Invoke-ServerRclone @("mkdir", (Join-RemoteSpec $Path)) | Out-Null
+    Invoke-ServerRclone @("mkdir", (Join-RemoteFolder $Path)) | Out-Null
 }
 
 function Move-RemoteFile([string]$From, [string]$To) {
@@ -380,18 +398,22 @@ function Move-RemoteFile([string]$From, [string]$To) {
 }
 
 function Move-RemoteFolder([string]$From, [string]$To) {
-    Invoke-ServerRclone @("move", (Join-RemoteSpec $From), (Join-RemoteSpec $To), "--delete-empty-src-dirs") | Out-Null
-    try { Invoke-ServerRclone @("rmdirs", (Join-RemoteSpec $From)) | Out-Null } catch { }
+    Invoke-ServerRclone @("move", (Join-RemoteFolder $From), (Join-RemoteFolder $To), "--delete-empty-src-dirs") | Out-Null
+    try { Invoke-ServerRclone @("rmdirs", (Join-RemoteFolder $From)) | Out-Null } catch { }
 }
 
 # Every path on the remote (files, and folders with a trailing '/').
 function Get-RemoteListing {
-    return @(Invoke-ServerRclone @("lsf", "-R", $script:E2ERemoteSpec) | ForEach-Object { "$_" } | Where-Object { $_ })
+    return @(Invoke-ServerRclone @("lsf", "-R", (Join-RemoteFolder "")) | ForEach-Object { "$_" } | Where-Object { $_ })
 }
 
 function Test-RcloneHealthy {
     try {
-        Invoke-Rc "operations/list" @{ fs = "$($script:E2ERemoteName):"; remote = "" } | Out-Null
+        # The drive's own folder: on a real server, nothing outside the run's.
+        # The remote's root as the fs and the folder on its own, as the client
+        # sends it.
+        $colon = $script:E2ERemoteSpec.IndexOf(":")
+        Invoke-Rc "operations/list" @{ fs = $script:E2ERemoteSpec.Substring(0, $colon + 1); remote = $script:E2ERemoteSpec.Substring($colon + 1).Trim('/') } | Out-Null
         return $true
     } catch {
         return $false
@@ -416,11 +438,94 @@ public static extern int NtResumeProcess(System.IntPtr processHandle);
 # through its own rclone and an rclone remote, as it would any server.
 function Start-E2EBackend {
     param(
-        [Parameter(Mandatory = $true)][ValidateSet("webdav", "s3")][string]$Backend,
+        [Parameter(Mandatory = $true)][ValidateSet("webdav", "s3", "remote")][string]$Backend,
         [Parameter(Mandatory = $true)][string]$RclonePath,
         [Parameter(Mandatory = $true)][string]$RcloneConf,
-        [Parameter(Mandatory = $true)][string]$RemoteName
+        [Parameter(Mandatory = $true)][string]$RemoteName,
+        [string]$Remote = "",
+        # -Backend remote: the drive is "remote:<test folder>" instead of the
+        # remote's root moved to the folder.
+        [switch]$RemoteAsPath,
+        # -Backend remote: through rclone's chunker, files above this size in pieces.
+        [string]$ChunkSize = ""
     )
+
+    $script:E2ERcloneExe = $RclonePath
+    $script:E2ERcloneConf = $RcloneConf
+
+    # What the server keeps, as the scenarios need to know it: rclone's own
+    # serve webdav keeps no hashes; S3 keeps MD5s, no empty folders, and
+    # costs a request per file time.
+    $script:E2EServerHashes = $Backend -eq "s3"
+    $script:E2EServerKeepsEmptyFolders = $Backend -ne "s3"
+    $script:E2EServerSlowTimes = $Backend -eq "s3"
+
+    if ($Backend -eq "remote") {
+        # A real server: nothing is started, and everything happens in a new
+        # folder of its own, which Stop-E2EBackend deletes again.
+        $base = $Remote.Trim()
+        if (-not $base.Contains(":")) { $base += ":" }
+        $name = $base.Substring(0, $base.IndexOf(":"))
+        $folder = "opencfdrive-e2e-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+        $inBase = if ($base.EndsWith(":")) { $folder } else { "$($base.Substring($base.IndexOf(':') + 1).Trim('/'))/$folder" }
+        $script:E2ERemoteBase = "${name}:"
+        $script:E2ETestFolder = $inBase
+        $script:E2ERemoteName = $name
+        Write-E2ELog "Testing against the real remote $base, in $folder (deleted at the end)"
+
+        # Made from the remote's root, naming the folder: some servers answer a
+        # folder path without a trailing slash with a redirect to http://,
+        # which rclone refuses (it would send the password in clear).
+        Invoke-ServerRclone @("rc", "--loopback", "operations/mkdir", "fs=$($script:E2ERemoteBase)", "remote=$inBase") | Out-Null
+
+        # The drive is that folder. A WebDAV remote's root is moved there
+        # (RCLONE_CONFIG_<NAME>_URL, for the rclones this run starts only), so
+        # the drive is the remote's root, as the user's own is; others get the
+        # folder as a path.
+        $type = Get-RcloneConfigValue $RcloneConf $name "type"
+        $url = Get-RcloneConfigValue $RcloneConf $name "url"
+        if ($RemoteAsPath) {
+            # A drive whose remote has a path, as a user may set one up.
+            $script:E2ERemoteSpec = "${name}:$inBase"
+            Write-E2ELog "The drive is the remote with a path: $($script:E2ERemoteSpec)"
+        } elseif ($type -eq "webdav" -and $url) {
+            $script:E2ERemoteUrlVariable = "RCLONE_CONFIG_$($name.ToUpperInvariant() -replace '[^A-Z0-9]', '_')_URL"
+            $escaped = @($inBase -split '/' | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
+            $rootUrl = $url.TrimEnd('/') + "/" + $escaped + "/"
+            Set-Item -Path "Env:\$($script:E2ERemoteUrlVariable)" -Value $rootUrl
+            $script:E2ERemoteSpec = "${name}:"
+        } else {
+            $script:E2ERemoteSpec = "${name}:$inBase"
+        }
+
+        # -ChunkSize: the drive goes through rclone's chunker over that, as a
+        # server whose proxy caps a request's size needs (Cloudflare: 100 MB).
+        # Files larger than the size are stored as pieces. The chunker remote
+        # exists only for this run's rclones (RCLONE_CONFIG_E2ECHUNKER_*); the
+        # scenarios' own server side goes through it too, as any other rclone
+        # client of that server has to.
+        if ($ChunkSize) {
+            $script:E2EChunkerVariables = @{
+                "RCLONE_CONFIG_E2ECHUNKER_TYPE" = "chunker"
+                "RCLONE_CONFIG_E2ECHUNKER_REMOTE" = $script:E2ERemoteSpec
+                "RCLONE_CONFIG_E2ECHUNKER_CHUNK_SIZE" = $ChunkSize
+                "RCLONE_CONFIG_E2ECHUNKER_HASH_TYPE" = "none"
+            }
+            foreach ($variable in $script:E2EChunkerVariables.GetEnumerator()) {
+                Set-Item -Path "Env:\$($variable.Key)" -Value $variable.Value
+            }
+            Write-E2ELog "Through rclone's chunker over $($script:E2ERemoteSpec): files above $ChunkSize are stored in pieces"
+            $script:E2ERemoteSpec = "e2echunker:"
+        }
+
+        $features = (Invoke-ServerRclone @("backend", "features", (Join-RemoteFolder ""))) -join "`n" | ConvertFrom-Json
+        $script:E2EServerHashes = @($features.Hashes).Count -gt 0
+        $script:E2EServerKeepsEmptyFolders = [bool]$features.Features.CanHaveEmptyDirectories
+        # As RemoteCapabilities.ListsWithoutTimes decides it.
+        $script:E2EServerSlowTimes = [bool]$features.Features.SlowModTime -and $script:E2EServerHashes
+        Write-E2ELog "Server: $($features.Name) ($($features.Root)); hashes: $(if ($script:E2EServerHashes) { @($features.Hashes) -join ', ' } else { 'none' }); empty folders: $script:E2EServerKeepsEmptyFolders; slow times: $script:E2EServerSlowTimes"
+        return
+    }
 
     $data = Join-Path $script:E2ETempRoot "server-data"
     New-Item -ItemType Directory -Path $data -Force | Out-Null
@@ -460,8 +565,6 @@ function Start-E2EBackend {
     $configExit = Invoke-Native -FilePath $RclonePath -Arguments ($configArgs + @("--config", $RcloneConf))
     if ($configExit -ne 0) { throw "rclone config create failed for $Backend (exit $configExit)" }
 
-    $script:E2ERcloneExe = $RclonePath
-    $script:E2ERcloneConf = $RcloneConf
     if ($Backend -eq "s3") {
         Invoke-ServerRclone @("mkdir", $script:E2ERemoteSpec) | Out-Null
     }
@@ -471,12 +574,46 @@ function Stop-E2EBackend {
     if ($null -ne $script:E2EBackendProcess -and -not $script:E2EBackendProcess.HasExited) {
         try { Stop-Process -Id $script:E2EBackendProcess.Id -Force -ErrorAction Stop } catch { }
     }
+
+    # A real server: only the run's own folder goes, named from the remote's
+    # own root (the drive's root override is dropped first).
+    if ($script:E2EBackend -eq "remote") {
+        foreach ($variable in @($script:E2EChunkerVariables.Keys)) {
+            Remove-Item -Path "Env:\$variable" -ErrorAction SilentlyContinue
+        }
+        $script:E2EChunkerVariables = @{}
+        if ($script:E2ERemoteUrlVariable) {
+            Remove-Item -Path "Env:\$($script:E2ERemoteUrlVariable)" -ErrorAction SilentlyContinue
+            $script:E2ERemoteUrlVariable = ""
+        }
+        if ($script:E2ETestFolder -match '(^|/)opencfdrive-e2e-\d{8}-\d{6}$') {
+            try {
+                Invoke-ServerRclone @("rc", "--loopback", "operations/purge", "fs=$($script:E2ERemoteBase)", "remote=$($script:E2ETestFolder)") | Out-Null
+                Write-E2ELog "Deleted the test folder $($script:E2ERemoteBase)$($script:E2ETestFolder) from the server"
+            } catch {
+                Write-E2ELog "Could not delete the test folder $($script:E2ERemoteBase)$($script:E2ETestFolder) from the server: $($_.Exception.Message)"
+            }
+            $script:E2ETestFolder = ""
+        }
+    }
+}
+
+# One value of a remote in an rclone config file, read as text (never the
+# whole section: it holds the remote's password).
+function Get-RcloneConfigValue([string]$Config, [string]$Remote, [string]$Key) {
+    $section = $null
+    foreach ($line in Get-Content -LiteralPath $Config) {
+        if ($line -match '^\s*\[(.+)\]\s*$') { $section = $Matches[1]; continue }
+        if ($section -eq $Remote -and $line -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*(.*?)\s*$')) { return $Matches[1] }
+    }
+    return ""
 }
 
 # Takes the server offline the way a lost network does: its process is
 # paused, so connections hang instead of being refused, while the client's
-# rclone keeps running.
+# rclone keeps running. Only a server this run started can be paused.
 function Suspend-E2EBackend {
+    if ($null -eq $script:E2EBackendProcess) { throw "A real server cannot be taken offline by the test." }
     [void][OpenCfDriveE2E.ProcessControl]::NtSuspendProcess($script:E2EBackendProcess.Handle)
 }
 
@@ -558,7 +695,12 @@ function Invoke-ServiceUnregister([string]$ServiceExe, [string]$SyncRoot) {
 function Invoke-OpenCfDriveE2E {
     param(
         [Parameter(Mandatory = $true)][ValidateSet("cloud", "mock")][string]$Mode,
-        [ValidateSet("webdav", "s3")][string]$Backend = "webdav",
+        [ValidateSet("webdav", "s3", "remote")][string]$Backend = "webdav",
+        # -Backend remote: the rclone remote to test against, and its config.
+        [string]$Remote = "",
+        [string]$RcloneConfig = "",
+        [switch]$RemoteAsPath,
+        [string]$ChunkSize = "",
         [string]$SyncRoot = "",
         [string]$RemoteName = "e2e",
         [int]$RcPort = 0,
@@ -667,7 +809,18 @@ function Invoke-OpenCfDriveE2E {
 
         # --- backend + rclone RC (--rc-serve) -----------------------------
         $rcloneConf = Join-Path $TempRoot "rclone.conf"
-        Start-E2EBackend -Backend $Backend -RclonePath $rclonePath -RcloneConf $rcloneConf -RemoteName $RemoteName
+        if ($Backend -eq "remote") {
+            # The user's own remote definition, used as it is (only read).
+            $rcloneConf = if ($RcloneConfig) { $RcloneConfig } else {
+                (Invoke-Native -FilePath $rclonePath -Arguments @("config", "file") -PassThruOutput).Output |
+                    Where-Object { $_ -match '\.conf\s*$' } | Select-Object -Last 1
+            }
+            $rcloneConf = "$rcloneConf".Trim()
+            if (-not $Remote -or -not (Test-Path -LiteralPath $rcloneConf)) {
+                throw "-Backend remote needs -Remote (for example 'myremote:') and an rclone config (found '$rcloneConf')."
+            }
+        }
+        Start-E2EBackend -Backend $Backend -RclonePath $rclonePath -RcloneConf $rcloneConf -RemoteName $RemoteName -Remote $Remote -RemoteAsPath:$RemoteAsPath -ChunkSize $ChunkSize
 
         # DEBUG logs every RC call the client makes; the scenario audit counts them.
         Write-E2ELog "Starting rclone RC on http://127.0.0.1:$script:E2ERcPort"

@@ -362,10 +362,6 @@ public sealed class RcloneRcClient : IDisposable
     }
 
     /// <summary>
-    /// Moves a whole directory (<c>sync/move</c>). Uses the server's own
-    /// directory move where it has one; otherwise rclone copies and deletes.
-    /// </summary>
-    /// <summary>
     /// What the remote keeps and what costs extra to read
     /// (<c>operations/fsinfo</c>): its hashes, how exact its times are, and
     /// whether it keeps a folder with nothing in it (bucket stores such as S3
@@ -428,11 +424,38 @@ public sealed class RcloneRcClient : IDisposable
         await PostAsync("operations/mkdir", new { fs, remote = remoteDirectory }, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Moves a whole directory (<c>sync/move</c>). Uses the server's own
+    /// directory move where it has one; otherwise rclone copies and deletes.
+    /// </summary>
     public async Task MoveDirectoryAsync(string srcFs, string dstFs, CancellationToken cancellationToken = default)
     {
         // Empty folders move too: a folder made here is on the server even
         // with nothing in it, and must stay there under its new name.
-        await PostAsync("sync/move", new { srcFs, dstFs, createEmptySrcDirs = true, deleteEmptySrcDirs = true }, cancellationToken).ConfigureAwait(false);
+        await PostAsync(
+            "sync/move",
+            new { srcFs = AsFolderRoot(srcFs), dstFs = AsFolderRoot(dstFs), createEmptySrcDirs = true, deleteEmptySrcDirs = true },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A folder named as the root of an fs, with a trailing slash, which tells
+    /// rclone it is a folder. Without it rclone opens the path by asking for it
+    /// as a file first (WebDAV: a PROPFIND without the slash), which a server
+    /// behind a TLS proxy can answer with a redirect to http://; rclone refuses
+    /// that ("would send credentials in cleartext"), and nothing at that path
+    /// worked. So requests send the remote's root as the fs and the path on its
+    /// own, wherever rclone allows it; where a folder must be the root (a
+    /// folder move, a remote's free space), it goes through this. A remote's
+    /// root ("remote:") and a local path are left as they are.
+    /// </summary>
+    public static string AsFolderRoot(string fs)
+    {
+        var value = fs.Trim();
+        var isLocalPath = (value.Length >= 3 && char.IsAsciiLetter(value[0]) && value[1] == ':' && value[2] is '\\' or '/') ||
+                          value.StartsWith(@"\\", StringComparison.Ordinal) ||
+                          !value.Contains(':');
+        return isLocalPath || value.EndsWith(':') || value.EndsWith('/') ? value : value + "/";
     }
 
     /// <summary>

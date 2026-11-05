@@ -218,19 +218,21 @@ function Get-ConflictCopy([string]$Folder, [string]$BaseName) {
     return $(if ($Folder) { "$Folder/$($copies[0].Name)" } else { $copies[0].Name })
 }
 
+# What the server keeps (set by Start-E2EBackend; on a real server, from
+# rclone's own report of its features).
 # Whether the server can hold a folder with nothing in it (S3 cannot: a
 # folder there is only a part of file names).
-function Test-ServerKeepsEmptyFolders { return $script:E2EBackend -ne "s3" }
+function Test-ServerKeepsEmptyFolders { return $script:E2EServerKeepsEmptyFolders }
 
 # S3 keeps an MD5 of every file; the WebDAV server keeps no hashes (rclone
 # reads them from WebDAV only on Nextcloud and ownCloud).
-function Test-ServerHasHashes { return $script:E2EBackend -eq "s3" }
+function Test-ServerHasHashes { return $script:E2EServerHashes }
 
 # On S3 each file's time costs a request of its own, so a folder listed
 # before is listed without times: a sync run looks up the time of each file
 # it finds new or changed (the listing with times paid one per file, changed
 # or not).
-function Test-ServerListsWithoutTimes { return $script:E2EBackend -eq "s3" }
+function Test-ServerListsWithoutTimes { return $script:E2EServerSlowTimes }
 
 # A budget for what differs by server. -TimeLookups: files a sync run finds
 # new or changed, each one lookup more on S3. -HashesLocal: a conflict, where
@@ -350,9 +352,12 @@ function New-E2EScenario {
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][scriptblock]$Run,
         [hashtable]$Budget = @{},
-        [switch]$CloudOnly
+        [switch]$CloudOnly,
+        # Takes the server offline (Suspend-E2EBackend): only a server the run
+        # started can be, so it is skipped against a real one.
+        [switch]$PausesServer
     )
-    [pscustomobject]@{ Id = $Id; Name = $Name; Run = $Run; Budget = $Budget; CloudOnly = [bool]$CloudOnly }
+    [pscustomobject]@{ Id = $Id; Name = $Name; Run = $Run; Budget = $Budget; CloudOnly = [bool]$CloudOnly; PausesServer = [bool]$PausesServer }
 }
 
 # --- activity audit --------------------------------------------------------------
@@ -562,7 +567,7 @@ function Get-E2EScenarios {
         New-E2EScenario "S14" "server adds 40 files at once" -Budget @{ DownloadBytes = 6 } -CloudOnly {
             $staging = New-StagingDirectory
             1..40 | ForEach-Object { [System.IO.File]::WriteAllText((Join-Path $staging "f$_.txt"), "s14-$_") }
-            Invoke-ServerRclone @("copy", $staging, (Join-RemoteSpec "s14-many")) | Out-Null
+            Invoke-ServerRclone @("copy", $staging, (Join-RemoteFolder "s14-many")) | Out-Null
             Remove-IfExists $staging
             Wait-Local "" { Test-Local "s14-many" } "s14-many did not appear locally."
             Wait-Local "s14-many" { @(Get-ChildItem -LiteralPath (Get-LocalPath "s14-many") -File).Count -eq 40 } "s14-many does not have 40 files locally."
@@ -639,7 +644,7 @@ function Get-E2EScenarios {
         # drive offline; from then on, as in Nextcloud and OneDrive, folders
         # show what is local at once. Using the drive checks the server again,
         # so back online opening it lists it.
-        New-E2EScenario "S18" "offline: an opened folder keeps what is local, an unopened one is empty, back online lists the server" -Budget @{ DownloadBytes = 9; Errors = 1 } -CloudOnly {
+        New-E2EScenario "S18" "offline: an opened folder keeps what is local, an unopened one is empty, back online lists the server" -Budget @{ DownloadBytes = 9; Errors = 1 } -CloudOnly -PausesServer {
             Set-RemoteFile "s18-seen/cached.txt" "seen"
             Set-RemoteFile "s18-unseen/later.txt" "later"
             Wait-Local "" { (Test-Local "s18-seen") -and (Test-Local "s18-unseen") } "s18-seen and s18-unseen did not appear locally."
@@ -848,7 +853,7 @@ function Get-E2EScenarios {
 
         # Offline, a folder listed before shows its local files at once and a
         # new file made there reaches the server once it answers.
-        New-E2EScenario "S31" "offline: a listed folder opens with its files and a new file made there is uploaded" -Budget @{ DownloadBytes = 3; Uploads = 1 } -CloudOnly {
+        New-E2EScenario "S31" "offline: a listed folder opens with its files and a new file made there is uploaded" -Budget @{ DownloadBytes = 3; Uploads = 1 } -CloudOnly -PausesServer {
             Set-RemoteFile "s31-dir/f.txt" "s31"
             Wait-Local "" { Test-Local "s31-dir" } "s31-dir did not appear locally."
             Wait-Local "s31-dir" { Test-Local "s31-dir/f.txt" } "s31-dir\f.txt did not appear locally."
@@ -895,7 +900,7 @@ function Get-E2EScenarios {
         # An offline edit is shown as "Waiting to upload" until it reaches the
         # server, then the state is cleared. Sync root state is a custom item
         # property the shell reports (Change 3).
-        New-E2EScenario "S33" "offline: an edit shows 'waiting to upload' until uploaded, then clears" -Budget @{ DownloadBytes = 3; Uploads = 1 } -CloudOnly {
+        New-E2EScenario "S33" "offline: an edit shows 'waiting to upload' until uploaded, then clears" -Budget @{ DownloadBytes = 3; Uploads = 1 } -CloudOnly -PausesServer {
             Set-RemoteFile "s33.txt" "s33"
             Wait-Local "" { Test-Local "s33.txt" } "s33.txt did not appear locally."
             Assert-Local "s33.txt" "s33"
@@ -1163,7 +1168,7 @@ function Get-E2EScenarios {
         # Offline the way a lost network is (see S18). A sync run finds the
         # server gone, then a delete and a rename made here are kept, in the
         # order made, and sent once it answers; nothing comes back meanwhile.
-        New-E2EScenario "C24" "offline: the client deletes and renames files; both reach the server once it answers" -Budget @{ ServerDeletes = 1; ServerRenames = 1; DownloadBytes = 14; Lookups = 1 } -CloudOnly {
+        New-E2EScenario "C24" "offline: the client deletes and renames files; both reach the server once it answers" -Budget @{ ServerDeletes = 1; ServerRenames = 1; DownloadBytes = 14; Lookups = 1 } -CloudOnly -PausesServer {
             Wait-Local "client" { (Test-Local "client/offline-delete.txt") -and (Test-Local "client/offline-rename.txt") } "The offline fixtures did not appear locally."
             Suspend-E2EBackend
             try {
@@ -1240,7 +1245,7 @@ function Get-E2EScenarios {
         }
         # Offline the way a lost network is (see S18): the edit waits, as in
         # Nextcloud and OneDrive, and is uploaded once the server answers.
-        New-E2EScenario "C30" "offline: the client edits a file in place; it is uploaded once the server answers" -Budget @{ DownloadBytes = 15; Uploads = 1; Lookups = 2 } -CloudOnly {
+        New-E2EScenario "C30" "offline: the client edits a file in place; it is uploaded once the server answers" -Budget @{ DownloadBytes = 15; Uploads = 1; Lookups = 2 } -CloudOnly -PausesServer {
             Assert-Local "client/offline-edit.txt" "offline-edit-v1"
             Suspend-E2EBackend
             try {
@@ -1279,6 +1284,30 @@ function Get-E2EScenarios {
             Sync-Remote
             Assert-Local "client-folder-listed-renamed/sub/v.txt" "v"
         }
+        # Explorer's New folder, left for a while before it is renamed: the
+        # sync run in between marks it to be listed from the server when next
+        # opened (it holds nothing local). The rename must still reach the
+        # server as a rename, not delete the folder there first.
+        New-E2EScenario "C32" "client creates a folder, a sync run passes, then it is renamed: the server has it under the new name" -Budget @{ ServerFolders = 1; ServerRenames = 1; ServerDeletes = 1 } -CloudOnly {
+            New-Item -ItemType Directory -Path (Get-LocalPath "c32-New folder") | Out-Null
+            if (Test-ServerKeepsEmptyFolders) {
+                Wait-Remote { Test-RemoteItem "c32-New folder" } "c32-New folder did not reach the server."
+            } else {
+                Wait-ServiceQuiet
+            }
+            Sync-Remote
+            Wait-ServiceQuiet
+            Rename-Item -LiteralPath (Get-LocalPath "c32-New folder") -NewName "c32-renamed"
+            if (Test-ServerKeepsEmptyFolders) {
+                Wait-Remote { Test-RemoteItem "c32-renamed" } "c32-renamed did not reach the server."
+                Assert-RemoteMissing "c32-New folder"
+            } else {
+                Wait-ServiceQuiet
+            }
+            Sync-Remote
+            if (-not (Test-Local "c32-renamed")) { throw "c32-renamed is gone locally after a sync run." }
+            if (Test-Local "c32-New folder") { throw "c32-New folder came back locally." }
+        }
     )
 }
 
@@ -1310,6 +1339,10 @@ function Invoke-E2EScenarios {
 
         if ($scenario.CloudOnly -and -not $IsCloud) {
             $results.Add([pscustomobject]@{ Id = $scenario.Id; Result = "SKIP"; Ms = 0; Name = $scenario.Name; Activity = ""; Detail = "mock mode does not list the server after startup" })
+            continue
+        }
+        if ($scenario.PausesServer -and $script:E2EBackend -eq "remote") {
+            $results.Add([pscustomobject]@{ Id = $scenario.Id; Result = "SKIP"; Ms = 0; Name = $scenario.Name; Activity = ""; Detail = "a real server cannot be taken offline by the test" })
             continue
         }
 

@@ -257,7 +257,8 @@ internal static class RcloneProbe
 
         try
         {
-            using var response = await PostAsync(access, baseUri, "operations/about", new { fs = remote }, SlowHttp);
+            // The remote's folder as a folder (see RcloneRcClient.AsFolderRoot).
+            using var response = await PostAsync(access, baseUri, "operations/about", new { fs = RcloneRcClient.AsFolderRoot(remote) }, SlowHttp);
             var about = await response.Content.ReadFromJsonAsync<JsonElement>();
             if (!response.IsSuccessStatusCode)
             {

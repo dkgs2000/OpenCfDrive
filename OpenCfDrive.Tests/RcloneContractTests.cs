@@ -106,6 +106,30 @@ public class RcloneContractTests
         Assert.Equal("alpha.txt", System.Text.Encoding.UTF8.GetString(buffer.ToArray()));
     }
 
+    /// <summary>
+    /// A drive whose remote has a path ("remote:folder") downloads through the
+    /// remote's root, the path in the URL: rclone never opens the folder
+    /// itself as a root, which some servers answer with a redirect it refuses.
+    /// </summary>
+    [SkippableFact]
+    public void RcServe_ARemoteWithAPath_ReadsThroughTheRemotesRoot()
+    {
+        Skip.IfNot(Prerequisites.RcloneEnvironmentAvailable, "rclone.exe unavailable.");
+
+        using var env = RcloneTestEnvironment.Start(new Dictionary<string, byte[]>
+        {
+            ["drive folder/sub/alpha.txt"] = "content-in-a-folder"u8.ToArray(),
+        });
+
+        using var serve = new RcloneServeClient(env.RcUrl, env.RemoteSpec + "drive folder/");
+        Assert.Equal($"{env.RcUrl}/[{env.RemoteSpec}]/drive%20folder/sub/alpha.txt", serve.BuildUri("sub/alpha.txt").AbsoluteUri);
+        using var stream = serve.OpenRangeAsync("sub/alpha.txt", 0, -1).GetAwaiter().GetResult();
+        using var buffer = new MemoryStream();
+        stream.CopyTo(buffer);
+
+        Assert.Equal("content-in-a-folder", System.Text.Encoding.UTF8.GetString(buffer.ToArray()));
+    }
+
     [SkippableFact]
     public void Hashes_ComeWithListingsAndLookups_AndALocalFileHashesTheSame()
     {

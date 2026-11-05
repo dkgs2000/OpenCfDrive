@@ -50,6 +50,33 @@ as it would any server.
 .\scripts\tests\E2E-Run.ps1 -Only "S0*,C11"  # only some scenarios
 ```
 
+### Against a real server
+
+`-Backend remote -Remote "myremote:"` runs the cloud scenarios against an
+rclone remote you already use, with your rclone config (`-RcloneConfig` picks
+another file). The config is only read. Nothing outside one new folder,
+`opencfdrive-e2e-<date>-<time>`, is touched, and that folder is deleted at
+the end:
+
+- The folder is made and deleted from the remote's root, naming it. Some
+  servers redirect a folder path without a trailing slash to `http://`, which
+  rclone refuses because it would send the password in clear.
+- For a WebDAV remote the folder becomes the remote's root for the rclones the
+  run starts (`RCLONE_CONFIG_<NAME>_URL`), so the drive is a remote's root, as a
+  user's usually is. Other remotes get the folder as a path. `-RemoteAsPath`
+  gives a WebDAV remote the folder as a path too (`myremote:opencfdrive-e2e-…`),
+  for a drive set up on a remote with a path.
+- What the server keeps (hashes, empty folders, file times) is read from
+  `rclone backend features` instead of assumed.
+- The scenarios that take the server offline (S18, S31, S33, C24, C30) are
+  skipped: only a server the run started can be paused.
+
+While it runs, a drive of yours on that remote shows the folder too.
+
+```powershell
+.\scripts\tests\E2E-Run.ps1 -Backend remote -Remote "myremote:"
+```
+
 ## What every run does
 
 1. Builds the solution, then starts a disposable server process and a private
@@ -137,7 +164,7 @@ Explorer does, and expects the local side to match:
 Mock mode skips these. It's a test stand-in over a plain folder, with no way
 to know when a folder is opened, so it copies the server once at startup.
 
-**Client side (`C01`–`C31`, both modes unless noted).** A local action in the
+**Client side (`C01`–`C32`, both modes unless noted).** A local action in the
 drive, after which the server is expected to match:
 
 - add a file; in an existing folder; in new nested folders
@@ -162,7 +189,9 @@ drive, after which the server is expected to match:
 - append to a downloaded file that ends on a page boundary: the edit is
   uploaded
 - create an empty folder; create one and rename it right away (Explorer's New
-  folder: only the final name reaches the server); move a folder with files
+  folder: only the final name reaches the server); create one, let a sync run
+  pass (which marks it to be listed when next opened), then rename it (cloud
+  mode): the server has it under the new name; move a folder with files
   and a subfolder in from outside the drive. On S3, which keeps no empty
   folders, an empty folder stays here and is never taken for deleted
 - folders and files with Arabic names, and a rename

@@ -29,6 +29,9 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem _installUpdate;
     private readonly ToolStripMenuItem _exit;
     private readonly System.Windows.Forms.Timer _timer = new();
+    private readonly ProblemNotifier _problems = new();
+    private readonly WindowsNotifications _notifications = WindowsNotifications.Create();
+    private string? _stateTold;
     private MainForm? _window;
     private Action? _balloonClicked;
     private UpdateStage _updateStage;
@@ -179,6 +182,39 @@ internal sealed class TrayApp : ApplicationContext
         var text = $"OpenCfDrive: {headline}";
         _tray.Text = text.Length <= 127 ? text : text[..127];
         _window?.ShowSnapshot(snapshot);
+        NotifyProblems(snapshot);
+    }
+
+    /// <summary>
+    /// Tells the user about every failure: the drive itself in trouble or
+    /// offline (once per new state), and each file or folder that could not
+    /// be synced (see <see cref="ProblemNotifier"/>). Clicking opens the
+    /// window, whose activity list has the details.
+    /// </summary>
+    private void NotifyProblems(DriveSnapshot snapshot)
+    {
+        if (_exiting)
+        {
+            return;
+        }
+
+        var (health, headline, detail) = snapshot.Summary;
+        var troubled = health == Health.Problem || snapshot.Status?.State == ServiceState.Offline;
+        if (!troubled)
+        {
+            _stateTold = null;
+        }
+        else if (headline != _stateTold)
+        {
+            _stateTold = headline;
+            ShowBalloon($"OpenCfDrive: {headline}", detail, ToolTipIcon.Warning, () => ShowWindow());
+            return;
+        }
+
+        if (_problems.Next(snapshot.Status) is { } notice)
+        {
+            ShowBalloon(notice.Title, notice.Text, ToolTipIcon.Warning, () => ShowWindow());
+        }
     }
 
     private void UpdateMenu()
@@ -485,10 +521,24 @@ internal sealed class TrayApp : ApplicationContext
         }
     }
 
-    /// <summary>A notification; clicking it runs <paramref name="clicked"/>, or opens the window.</summary>
+    /// <summary>
+    /// A Windows notification (kept in the notification centre); clicking it
+    /// runs <paramref name="clicked"/>, or opens the window. Where Windows
+    /// refuses one, the tray icon's balloon.
+    /// </summary>
     private void ShowBalloon(string title, string text, ToolTipIcon icon, Action? clicked = null)
     {
+        var onClick = clicked ?? (() => ShowWindow(settings: !(Monitor.Latest?.Settings.HasRemote ?? false)));
+        if (_notifications.Show(title, text, () => _ui.Post(_ => onClick(), null)))
+        {
+            return;
+        }
+
         _balloonClicked = clicked;
+
+        // What Windows takes: 63 characters of title, 255 of text.
+        title = title.Length <= 63 ? title : title[..62] + "…";
+        text = string.IsNullOrWhiteSpace(text) ? " " : text.Length <= 255 ? text : text[..254] + "…";
         _tray.ShowBalloonTip(10_000, title, text, icon);
     }
 

@@ -270,6 +270,15 @@ The invariants below spell out how.
   use stays at one chunk whatever the file size. A failed download is reported
   for the bytes that did not arrive. A zero-length failure is rejected, and the
   reading program would then wait for the platform's 60 s timeout.
+- **Progress is reported as bytes arrive** (`CfReportProviderProgress2`, every
+  256 KB or 250 ms, none after the last transfer, which Windows refuses). As
+  Nextcloud reports it, the numbers are of the whole file: total is its size,
+  completed is how far into it the download is. A program that reads a big
+  file a piece at a time otherwise showed "0 of a small range" for each piece.
+  The report is aimed at the requesting program's session, or this process's
+  when the program runs in session 0 (Windows Installer reading a package).
+  The callback log line names that session. Reporting also resets the
+  callback's 60 s timeout.
 - **After an upload, one lookup.** The store keeps the server's own size and
   time, which most remotes stamp themselves, so the client reads them back with
   `operations/stat` on that one file, not a listing of its folder.
@@ -468,6 +477,29 @@ move exist on only some remotes, so they aren't used either.
   another process". Opening it again works. While a server change is put in
   place, an open waits for those milliseconds instead (mock mode: it is
   refused).
+- **Only a remote's root is opened as an fs.** rclone opens a path given as
+  the root of an fs by asking for it as a file first (WebDAV: a PROPFIND
+  without a trailing slash). A server behind a TLS proxy can answer that with
+  a redirect to `http://`, and rclone refuses it ("would send credentials in
+  cleartext"). On such a server nothing at that path worked: a drive whose
+  remote has a path (`remote:folder`) at all, and every folder rename
+  elsewhere. So every request sends the remote's root (`remote:`) as the fs
+  and the path on its own: listings, lookups, uploads, deletes and moves, and
+  downloads (`/[remote:]/folder/file`). Where a folder must be the root (a
+  folder move, `sync/move`; a remote's free space, `operations/about`), it is
+  named with a trailing slash (`RcloneRcClient.AsFolderRoot`), which tells
+  rclone it is a folder. A local path is left as it is.
+- On a plain WebDAV server each file is uploaded in one request (rclone
+  uploads in chunks only to Nextcloud and ownCloud), so a proxy's request
+  limit caps the file size: Cloudflare's free plan refuses more than 100 MB
+  with 413. The upload fails and the user is told.
+- Every failed step (an upload, rename, delete, download, listing, or a server
+  change that could not be put in place) is raised as
+  `CloudSyncEngine.ProblemReported`. The service logs it as a warning and
+  counts it in its status (`ProblemsReported`, `RecentProblems`). The app
+  shows a Windows notification for each new one (`ProblemNotifier`): several
+  at once in one, the same problem again after 30 minutes. It also notifies
+  when the drive goes offline or its state turns into a problem.
 
 ## Why .NET and Explorer sometimes disagree on placeholder state
 

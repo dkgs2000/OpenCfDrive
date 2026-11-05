@@ -7,13 +7,17 @@ namespace OpenCfDrive.Core.Services;
 /// Reads object bytes from the rclone daemon's <c>--rc-serve</c> HTTP server.
 /// Verified against rclone v1.75.2: the URL shape is
 /// <c>http://host:port/[remote:path]/relative/file</c> and byte ranges are
-/// honoured with HTTP 206 + Content-Range.
+/// honoured with HTTP 206 + Content-Range. Only the remote's root goes in the
+/// brackets; a path the remote has (<c>remote:folder</c>) goes in the URL's
+/// path, as every other request sends it (see RcloneRcClient.AsFolderRoot for
+/// why a folder is never opened as a root without a trailing slash).
 /// </summary>
 public sealed class RcloneServeClient : IDisposable
 {
     private readonly HttpClient _httpClient;
     private readonly string _baseUrl;
-    private readonly string _remotePrefix;
+    private readonly string _remoteRoot;
+    private readonly string[] _basePath;
     private long _bytesFetched;
 
     public RcloneServeClient(string rcUrl, string remote)
@@ -24,7 +28,9 @@ public sealed class RcloneServeClient : IDisposable
     public RcloneServeClient(RcloneEndpoint endpoint, string remote)
     {
         _baseUrl = endpoint.BaseUrl;
-        _remotePrefix = remote.TrimEnd('/');
+        var (root, basePath) = RcloneRcClient.SplitRemote(remote);
+        _remoteRoot = root;
+        _basePath = basePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
         _httpClient = endpoint.CreateHttpClient(TimeSpan.FromMinutes(30));
     }
 
@@ -33,12 +39,11 @@ public sealed class RcloneServeClient : IDisposable
 
     public Uri BuildUri(string remoteRelativePath)
     {
-        var segments = remoteRelativePath
-            .Replace('\\', '/')
-            .Split('/', StringSplitOptions.RemoveEmptyEntries)
+        var segments = _basePath
+            .Concat(remoteRelativePath.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries))
             .Select(Uri.EscapeDataString);
 
-        return new Uri($"{_baseUrl}/[{_remotePrefix}]/{string.Join('/', segments)}");
+        return new Uri($"{_baseUrl}/[{_remoteRoot}]/{string.Join('/', segments)}");
     }
 
     /// <summary>
