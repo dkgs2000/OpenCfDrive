@@ -79,6 +79,7 @@ public class DownloadContractTest(ITestOutputHelper output)
         Drive? drive = null;
         (bool File, bool Folder)? during = null;
         var ended = new ConcurrentQueue<(string Path, bool StillDownloading)>();
+        using var endings = new SemaphoreSlim(0);
         using var server = new OneByteServer(
             () =>
             {
@@ -89,12 +90,25 @@ public class DownloadContractTest(ITestOutputHelper output)
         drive = new Drive(output, server, prepareDownload: null);
         using (drive)
         {
-            drive.Connection.DownloadEnded += path => ended.Enqueue((path, drive.Connection.IsHydrating(path)));
+            drive.Connection.DownloadEnded += path =>
+            {
+                ended.Enqueue((path, drive.Connection.IsHydrating(path)));
+                endings.Release();
+            };
 
             var read = drive.Read("a.txt");
 
+            // The reader has its bytes as soon as the last of them reach
+            // Windows, which can be before the callback gets to end the
+            // download: wait for each download's own end (one per request
+            // to the server, all made before the reader finished).
+            Assert.NotEmpty(server.Requests);
+            foreach (var _ in server.Requests)
+            {
+                Assert.True(endings.Wait(TimeSpan.FromSeconds(30)), "A download's end was never announced.");
+            }
+
             Assert.Equal((true, true), during);
-            Assert.NotEmpty(ended);
             Assert.All(ended, end => Assert.Equal((drive.PathOf("a.txt"), false), end));
             Assert.False(drive.Connection.IsHydrating(drive.PathOf("a.txt")));
             Assert.Equal(fails ? "" : "z", read.Trim());
