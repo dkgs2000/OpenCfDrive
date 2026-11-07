@@ -208,6 +208,37 @@ function Sync-Remote([int]$TimeoutSeconds = 120) {
     }
 }
 
+# Watches the cloud service the way the app does for its notification area
+# icon: the service's "watch" answer is a line at once and one at every change
+# (its state and what it is doing: sending, downloading, waiting offline,
+# failed). Returns the first that meets $Condition (given the line, parsed),
+# waiting on the service's lines themselves; throws $What, with the last line,
+# if none does within $TimeoutSeconds.
+function Wait-ServicePulse([scriptblock]$Condition, [string]$What, [int]$TimeoutSeconds = 30) {
+    $pipeName = [System.IO.Path]::GetFileNameWithoutExtension((Get-StateDbPath $script:E2ESyncRoot))
+    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", $pipeName, [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
+    $last = "nothing"
+    try {
+        $pipe.Connect(10000)
+        $writer = New-Object System.IO.StreamWriter($pipe)
+        $writer.AutoFlush = $true
+        $writer.WriteLine("watch")
+        $reader = New-Object System.IO.StreamReader($pipe)
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while ($true) {
+            $remaining = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds)
+            $line = $reader.ReadLineAsync()
+            if (-not $line.Wait($remaining)) { throw "$What (the service last said: $last)" }
+            if ($null -eq $line.Result) { throw "$What (the service ended its watch; it last said: $last)" }
+            $last = $line.Result
+            $pulse = $last | ConvertFrom-Json
+            if (& $Condition $pulse) { return $pulse }
+        }
+    } finally {
+        $pipe.Dispose()
+    }
+}
+
 function Read-LogText([string]$Path) {
     if (-not (Test-Path $Path)) { return "" }
     try { return (Get-Content -Path $Path -Raw -ErrorAction SilentlyContinue) } catch { return "" }

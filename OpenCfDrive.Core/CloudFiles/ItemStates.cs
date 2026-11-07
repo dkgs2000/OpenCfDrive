@@ -7,7 +7,8 @@ namespace OpenCfDrive.Core.CloudFiles;
 /// One state Explorer shows for a file: the text of the custom state column and
 /// the stock icon shown in the Status column.
 /// </summary>
-internal sealed record ItemState(string Value, string IconResource)
+/// <param name="Failure">A sync step failed for the file.</param>
+internal sealed record ItemState(string Value, string IconResource, bool Failure = false)
 {
     public static ItemState WaitingToUpload { get; } =
         new("Waiting to upload", StockIcon("shell32.dll", 238));
@@ -16,7 +17,7 @@ internal sealed record ItemState(string Value, string IconResource)
         new("Conflict copy", StockIcon("imageres.dll", 79));
 
     public static ItemState CouldNotSync(string reason) =>
-        new(reason, StockIcon("imageres.dll", 89));
+        new(reason, StockIcon("imageres.dll", 89), Failure: true);
 
     /// <summary>A Windows icon, in the "path,index" form the shell takes.</summary>
     private static string StockIcon(string module, int index) =>
@@ -38,6 +39,8 @@ internal interface IItemStateWriter
 /// A conflict copy is told by its name (<see cref="ConflictCopies"/>) and is
 /// shown as one until it is renamed or deleted, across restarts too. A state
 /// that cannot be applied is logged once per path; it never fails a sync step.
+/// The files marked as not synced are counted too, for the app's icon, in
+/// mock mode as well (where nothing is shown).
 /// </summary>
 public sealed class ItemStates : IDisposable
 {
@@ -48,6 +51,7 @@ public sealed class ItemStates : IDisposable
     private readonly object _gate = new();
     private readonly Dictionary<string, ItemState?> _pending = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _reportedFailures = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _failing = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _signal = new(0);
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _worker;
@@ -90,8 +94,43 @@ public sealed class ItemStates : IDisposable
 
     private static bool IsConflictCopy(string localPath) => ConflictCopies.IsConflictCopy(Path.GetFileName(localPath));
 
+    /// <summary>Raised when a file is marked as not synced, or no longer is.</summary>
+    public event Action? FailingChanged;
+
+    /// <summary>
+    /// The files marked as not synced that are still there: one deleted or
+    /// renamed since is no longer counted (a rename is a change, sent anew).
+    /// </summary>
+    public int Failing
+    {
+        get
+        {
+            lock (_gate)
+            {
+                _failing.RemoveWhere(path => !File.Exists(path) && !Directory.Exists(path));
+                return _failing.Count;
+            }
+        }
+    }
+
     private void Set(string localPath, ItemState? state)
     {
+        if (_disposed || string.IsNullOrEmpty(localPath))
+        {
+            return;
+        }
+
+        bool changed;
+        lock (_gate)
+        {
+            changed = state is { Failure: true } ? _failing.Add(localPath) : _failing.Remove(localPath);
+        }
+
+        if (changed)
+        {
+            FailingChanged?.Invoke();
+        }
+
         if (!Wanted(localPath))
         {
             return;

@@ -41,8 +41,8 @@
   never crawls the whole drive. Only folders with files on this PC are checked
   in the background. Your server doesn't need to send change notifications.
 - **Easy to run.** The installer needs no admin rights and includes .NET. An
-  icon in the notification area shows what is syncing, and the app updates
-  itself.
+  icon in the notification area shows whether the drive is up to date,
+  syncing or offline, and the app updates itself.
 
 ## Install
 

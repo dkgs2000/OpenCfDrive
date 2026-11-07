@@ -28,7 +28,7 @@ Cloud Files driver (built into Windows)
       ▼
 OpenCfDrive.Service ──── HTTP ────► rclone rcd ────► your remote
       │        ▲
-      │        └──── named pipe: status, stop, sync ──── OpenCfDrive.exe (the app)
+      │        └──── named pipe: status, stop, sync, watch ──── OpenCfDrive.exe (the app)
       ▼
 SQLite state in %LOCALAPPDATA%\OpenCfDrive\state
 ```
@@ -40,7 +40,8 @@ SQLite state in %LOCALAPPDATA%\OpenCfDrive\state
   unless the user runs one.
 - **`OpenCfDrive.App`** is the notification area app. It edits the settings,
   starts and stops the service, shows its status over a named pipe, and
-  updates itself.
+  updates itself. Its icon shows the drive's state, which the service sends
+  over the same pipe as it changes (see [The notification area icon](#the-notification-area-icon)).
 - **`OpenCfDrive.Core`** holds everything shared: the interop, the sync
   engine, the rclone clients, the store and the settings.
 
@@ -500,6 +501,47 @@ move exist on only some remotes, so they aren't used either.
   shows a Windows notification for each new one (`ProblemNotifier`): several
   at once in one, the same problem again after 30 minutes. It also notifies
   when the drive goes offline or its state turns into a problem.
+
+## The notification area icon
+
+The icon shows the drive's state the way OneDrive's and Nextcloud's do: the
+plain icon when everything is synced, otherwise a badge in its corner
+(`TrayIcons`, drawn at the size Windows asks for). `DriveIndicators.Of`
+decides which one:
+
+| State | When | Badge |
+|---|---|---|
+| Up to date | connected, nothing being sent or downloaded | none |
+| Syncing | starting, sending local changes, or downloading | blue arrow |
+| Warning | files whose last sync failed are still there | amber "!" |
+| Problem | a settings, rclone or service problem: nothing syncs | red cross |
+| Offline | the server can't be reached | grey icon, line through |
+| Paused | the service isn't running | grey icon, pause sign |
+| Not set up | no remote chosen | grey icon |
+
+The engine counts what it is doing (`CloudSyncEngine.Activity`, a
+`SyncActivity`):
+
+- the steps of the current plan of local changes not yet done;
+- the downloads under way (`SyncRootConnection.ActiveDownloads`);
+- the changes the last plan kept while offline;
+- the files marked as not synced, which `ItemStates` keeps with Explorer's
+  state. A file stops counting once it syncs, changes again, or is gone.
+
+It raises `ActivityChanged` at each change.
+
+A change lasting a second would be missed by the app's 15 s status refresh, so
+the app doesn't wait for one:
+
+- It opens a `watch` request on the pipe while the service runs. The service
+  answers with a `ServicePulse` at once and another at each change: its state,
+  this activity and its problem count.
+- Pulses are numbered, and so are full statuses (`Revision`). The app keeps
+  whichever of the two is newer (`ServiceStatus.With`).
+- A pulse with a new state or a new problem makes the app read the full
+  status, which notifies the user.
+- When the service ends, the watch ends with it. The app then looks at once,
+  and watches the next service.
 
 ## Why .NET and Explorer sometimes disagree on placeholder state
 

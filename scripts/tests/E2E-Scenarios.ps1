@@ -921,6 +921,10 @@ function Get-E2EScenarios {
                     (Read-LogText $script:E2EServiceLog) -match "Explorer state for .*\\s33\.txt': Waiting to upload\."
                 } -TimeoutSeconds 30 -PollMilliseconds 200
                 if (-not $marked) { throw "s33.txt is not marked 'waiting to upload' while its edit is offline." }
+
+                # The app's icon shows it too: offline, with the edit waiting.
+                Wait-ServicePulse { param($pulse) $pulse.State -eq "Offline" -and $pulse.Activity.Waiting -ge 1 } `
+                    "The service does not report itself offline with s33.txt's edit waiting." | Out-Null
             } finally {
                 Resume-E2EBackend
             }
@@ -931,6 +935,8 @@ function Get-E2EScenarios {
             if (-not $cleared) { throw "s33.txt is still 'waiting to upload' after its edit was uploaded." }
             Wait-Remote { (Get-RemoteFile "s33.txt") -eq "s33-edited" } "The offline edit did not reach the server."
             Assert-Local "s33.txt" "s33-edited"
+            Wait-ServicePulse { param($pulse) $pulse.State -eq "Syncing" -and $pulse.Activity.Waiting -eq 0 } `
+                "The service still reports s33.txt's edit as waiting after it was uploaded." | Out-Null
         }
 
         # A conflict copy is marked "Conflict copy" in the shell. The server's
@@ -1307,6 +1313,25 @@ function Get-E2EScenarios {
             Sync-Remote
             if (-not (Test-Local "c32-renamed")) { throw "c32-renamed is gone locally after a sync run." }
             if (Test-Local "c32-New folder") { throw "c32-New folder came back locally." }
+        }
+        # The app's notification area icon follows what the service tells it
+        # as it happens ("watch" on its control pipe): syncing while a change
+        # is on its way, up to date once it is there. The server is paused
+        # while the file is sent, so the upload is caught under way.
+        New-E2EScenario "C33" "while a new file is sent the service reports it as sending, then nothing left to do" -Budget @{ Uploads = 1; Lookups = 2 } -CloudOnly -PausesServer {
+            Suspend-E2EBackend
+            try {
+                Write-Local "c33.txt" "c33"
+                Wait-ServicePulse { param($pulse) $pulse.State -eq "Syncing" -and $pulse.Activity.Sending -ge 1 } `
+                    "The service did not report c33.txt as being sent." | Out-Null
+            } finally {
+                Resume-E2EBackend
+            }
+            Assert-RemoteText "c33.txt" "c33"
+            Wait-ServicePulse {
+                param($pulse)
+                $pulse.State -eq "Syncing" -and $pulse.Activity.Sending -eq 0 -and $pulse.Activity.Waiting -eq 0 -and $pulse.Activity.Downloading -eq 0
+            } "The service still reports activity after c33.txt reached the server." | Out-Null
         }
     )
 }

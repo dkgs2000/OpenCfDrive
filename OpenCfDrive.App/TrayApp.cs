@@ -31,10 +31,14 @@ internal sealed class TrayApp : ApplicationContext
     private readonly System.Windows.Forms.Timer _timer = new();
     private readonly ProblemNotifier _problems = new();
     private readonly WindowsNotifications _notifications = WindowsNotifications.Create();
+    private readonly TrayIcons _icons = new(SystemInformation.SmallIconSize);
+    private readonly CancellationTokenSource _closing = new();
+    private readonly UpdateNotifier _updateNotices;
     private string? _stateTold;
+    private DriveIndicator? _indicatorShown;
     private MainForm? _window;
     private Action? _balloonClicked;
-    private UpdateStage _updateStage;
+    private bool _watching;
     private bool _busy;
     private bool _exiting;
 
@@ -97,10 +101,11 @@ internal sealed class TrayApp : ApplicationContext
             unavailable: SignInStartup.IsInstalledCopy
                 ? null
                 : $"Only the installed copy updates itself; this one runs from {Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory)}.");
-        _updateStage = Updates.Status.Stage;
+        _updateNotices = new UpdateNotifier(Updates.Status.Stage);
         Updates.Changed += status => _ui.Post(_ => OnUpdateChanged(status), null);
 
         Monitor.Updated += OnUpdated;
+        Monitor.Pulsed += ShowOnTray;
         _timer.Interval = (int)HiddenRefresh.TotalMilliseconds;
         _timer.Tick += async (_, _) => await RefreshAsync();
         _timer.Start();
@@ -178,11 +183,94 @@ internal sealed class TrayApp : ApplicationContext
 
     private void OnUpdated(DriveSnapshot snapshot)
     {
-        var (_, headline, _) = snapshot.Summary;
-        var text = $"OpenCfDrive: {headline}";
-        _tray.Text = text.Length <= 127 ? text : text[..127];
+        ShowOnTray(snapshot);
         _window?.ShowSnapshot(snapshot);
         NotifyProblems(snapshot);
+        Watch(snapshot);
+    }
+
+    /// <summary>
+    /// The icon for the drive's state (see <see cref="TrayIcons"/>), and a
+    /// tooltip with the headline and, while it syncs, is offline or has
+    /// files it could not sync, what it is doing.
+    /// </summary>
+    private void ShowOnTray(DriveSnapshot snapshot)
+    {
+        var indicator = snapshot.Indicator;
+        if (indicator != _indicatorShown)
+        {
+            _tray.Icon = _icons.For(indicator);
+            _indicatorShown = indicator;
+        }
+
+        var (_, headline, _) = snapshot.Summary;
+        var text = $"OpenCfDrive: {headline}";
+        if (indicator is DriveIndicator.Syncing or DriveIndicator.Offline or DriveIndicator.Warning &&
+            snapshot.Status?.Activity?.Describe() is { Length: > 0 } doing)
+        {
+            text += "\n" + doing;
+        }
+
+        // Windows takes 127 characters.
+        _tray.Text = text.Length <= 127 ? text : text[..126] + "…";
+    }
+
+    /// <summary>
+    /// While the service runs, it tells the app each change as it happens
+    /// (see <see cref="ServiceControl.WatchAsync"/>), so the icon shows
+    /// syncing when it starts and stops, not at the next refresh. Once the
+    /// service ends, the app looks again at once, and watches the next one;
+    /// one that does not answer is tried again at the next refresh.
+    /// </summary>
+    private void Watch(DriveSnapshot snapshot)
+    {
+        if (_watching || _exiting || snapshot.Status is null)
+        {
+            return;
+        }
+
+        _watching = true;
+        _ = WatchAsync(snapshot.Settings.SyncRoot.Value);
+    }
+
+    private async Task WatchAsync(string syncRoot)
+    {
+        bool heard;
+        try
+        {
+            heard = await ServiceControl.WatchAsync(
+                syncRoot, pulse => _ui.Post(_ => OnPulse(pulse), null), TimeSpan.FromSeconds(2), _closing.Token);
+        }
+        finally
+        {
+            _watching = false;
+        }
+
+        if (heard && !_exiting)
+        {
+            await RefreshAsync();
+        }
+    }
+
+    /// <summary>
+    /// A change the service told: the icon follows at once. A new state, or
+    /// a new sync problem, also reads the whole status, which says more
+    /// (and notifies the user).
+    /// </summary>
+    private void OnPulse(ServicePulse pulse)
+    {
+        if (_exiting)
+        {
+            return;
+        }
+
+        var before = Monitor.Latest?.Status;
+        Monitor.Apply(pulse);
+        if (before is not null && before.ProcessId == pulse.ProcessId &&
+            (pulse.State != before.State || pulse.ProblemsReported != before.ProblemsReported))
+        {
+            _ = RefreshAsync();
+        }
     }
 
     /// <summary>
@@ -244,21 +332,29 @@ internal sealed class TrayApp : ApplicationContext
 
         _window?.ShowUpdate(status);
 
-        // Said once when a download becomes ready, and again at each start
-        // while it waits (as Nextcloud does).
-        if (status.Stage == UpdateStage.Ready && _updateStage != UpdateStage.Ready && status.Available is { } version)
+        // A download ready to install, or a version out that could not be
+        // downloaded (see UpdateNotifier for when each is said).
+        if (_updateNotices.Next(status) is { } notice)
         {
             ShowBalloon(
-                $"OpenCfDrive {GitHubReleases.Format(version)} is ready",
-                "Click here to restart OpenCfDrive and install it.",
+                notice.Title,
+                notice.Text,
                 ToolTipIcon.Info,
-                async () => await InstallUpdateAsync(ask: true));
+                notice.Install
+                    ? async () => await InstallUpdateAsync(ask: true)
+                    : notice.Page is { } page ? () => OpenPage(page) : null);
         }
+    }
 
-        // Checking briefly leaves Ready during a check that finds the same download.
-        if (status.Stage is not UpdateStage.Checking)
+    private void OpenPage(string page)
+    {
+        try
         {
-            _updateStage = status.Stage;
+            Process.Start(new ProcessStartInfo(page) { UseShellExecute = true })?.Dispose();
+        }
+        catch (System.ComponentModel.Win32Exception ex)
+        {
+            ShowProblem($"{page} could not be opened: {ex.Message}");
         }
     }
 
@@ -578,11 +674,13 @@ internal sealed class TrayApp : ApplicationContext
         }
 
         _exiting = true;
+        _closing.Cancel();
         _timer.Stop();
         Updates.Dispose();
         _window?.CloseForExit();
         _tray.Visible = false;
         _tray.Dispose();
+        _icons.Dispose();
         _menu.Dispose();
         ExitThread();
     }

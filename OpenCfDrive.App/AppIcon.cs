@@ -9,7 +9,8 @@ internal static class AppIcon
     /// <summary>For Alt+Tab and the window's header.</summary>
     public static Icon Large { get; } = Load(SystemInformation.IconSize);
 
-    private static Icon Load(Size size)
+    /// <summary>The icon at <paramref name="size"/>, or the nearest size it has.</summary>
+    public static Icon Load(Size size)
     {
         using var stream = typeof(AppIcon).Assembly.GetManifestResourceStream("OpenCfDrive.ico")!;
         return new Icon(stream, size);
