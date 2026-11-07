@@ -56,19 +56,41 @@ internal sealed record DriveSnapshot(
             var (health, headline, detail) = Status.State switch
             {
                 ServiceState.Starting => (Health.Busy, "Starting", Status.Detail),
-                ServiceState.Offline => (Health.Busy, "Offline", Status.Detail),
+                ServiceState.Offline => (Health.Busy, "Offline", $"{Status.Detail} {Status.Activity?.Describe()}".TrimEnd()),
                 ServiceState.Unavailable => (Health.Problem, "Cloud Files unavailable", Status.Detail),
                 ServiceState.Failed when ownRclone?.State == "NotFound" => (Health.Problem, "rclone not found", Status.Detail),
                 ServiceState.Failed => (Health.Problem, "Problem", Status.Detail),
                 _ when ownRclone is { State: not "Running" } => (Health.Problem, "rclone stopped", ownRclone.Detail),
                 _ when ownRclone is null && Rclone is { Usable: false } => (Health.Problem, "rclone unreachable", Rclone.Problem ?? ""),
-                _ => (Health.Good, "Running", Status.Detail),
+                _ => Connected(Status),
             };
 
             return RunsWithOtherSettings
                 ? (health, headline, $"{detail} Restart it to use the saved settings.")
                 : (health, headline, detail);
         }
+    }
+
+    /// <summary>What the notification area icon shows.</summary>
+    public DriveIndicator Indicator =>
+        DriveIndicators.Of(Summary.Health == Health.Problem, Running, Settings.HasRemote, Status);
+
+    /// <summary>A connected drive: syncing, up to date, or with files that could not be synced.</summary>
+    private static (Health Health, string Headline, string Detail) Connected(ServiceStatus status)
+    {
+        if (status.Activity is not { } activity)
+        {
+            return (Health.Good, "Running", status.Detail); // a service from before activity was reported
+        }
+
+        if (activity.Busy)
+        {
+            return (Health.Good, "Syncing", activity.Describe());
+        }
+
+        return activity.Failing > 0
+            ? (Health.Busy, activity.Failing == 1 ? "1 file not synced" : $"{activity.Failing:N0} files not synced", activity.Describe())
+            : (Health.Good, "Up to date", status.Detail);
     }
 
     /// <summary>The service started before the settings in effect now were saved.</summary>
@@ -80,12 +102,17 @@ internal sealed record DriveSnapshot(
          (!Settings.ManageRclone && !string.Equals(Status.RcUrl, Settings.RcUrl.Value, StringComparison.OrdinalIgnoreCase)));
 }
 
-/// <summary>Reads the settings, the service's status and rclone's, whenever asked.</summary>
+/// <summary>
+/// Reads the settings, the service's status and rclone's, whenever asked,
+/// and takes in what a watched service says between those reads.
+/// </summary>
 internal sealed class DriveMonitor
 {
     private static readonly TimeSpan ProgramCheckInterval = TimeSpan.FromSeconds(30);
 
+    private ServicePulse? _pulse;
     private bool _refreshing;
+    private (TimeSpan Rclone, TimeSpan Remote)? _again;
     private bool _describing;
     private DateTime _rcloneCheckedAt;
     private DateTime _remoteDescribedAt;
@@ -95,12 +122,34 @@ internal sealed class DriveMonitor
     /// <summary>Raised on the thread that refreshed (the UI thread).</summary>
     public event Action<DriveSnapshot>? Updated;
 
+    /// <summary>
+    /// Raised by <see cref="Apply"/> when a pulse changed <see cref="Latest"/>:
+    /// only its state and activity, so it may come often.
+    /// </summary>
+    public event Action<DriveSnapshot>? Pulsed;
+
+    /// <summary>
+    /// What the watched service said since the last read: kept in
+    /// <see cref="Latest"/> unless a newer read already has it.
+    /// </summary>
+    public void Apply(ServicePulse pulse)
+    {
+        _pulse = pulse;
+        if (Latest is { Status: { } status } latest && status.With(pulse) is var merged && !ReferenceEquals(merged, status))
+        {
+            Latest = latest with { Status = merged };
+            Pulsed?.Invoke(Latest);
+        }
+    }
+
     /// <param name="rcloneMaxAge">How old rclone's last answer may be before it is asked again.</param>
     /// <param name="remoteMaxAge">How old the remote's description (and space) may be.</param>
     public async Task RefreshAsync(TimeSpan rcloneMaxAge, TimeSpan remoteMaxAge)
     {
         if (_refreshing)
         {
+            // Asked again meanwhile: once more when this one is done.
+            _again = (rcloneMaxAge, remoteMaxAge);
             return;
         }
 
@@ -122,7 +171,7 @@ internal sealed class DriveMonitor
             var settings = DriveSettingsFile.Resolve(saved);
             var running = ServiceControl.IsRunning(settings.SyncRoot.Value);
             var status = running
-                ? await ServiceControl.GetStatusAsync(settings.SyncRoot.Value, TimeSpan.FromSeconds(2))
+                ? (await ServiceControl.GetStatusAsync(settings.SyncRoot.Value, TimeSpan.FromSeconds(2)))?.With(_pulse)
                 : null;
 
             // Asking the rclone program means running it a few times; the
@@ -154,6 +203,12 @@ internal sealed class DriveMonitor
         finally
         {
             _refreshing = false;
+        }
+
+        if (_again is { } again)
+        {
+            _again = null;
+            await RefreshAsync(again.Rclone, again.Remote);
         }
     }
 

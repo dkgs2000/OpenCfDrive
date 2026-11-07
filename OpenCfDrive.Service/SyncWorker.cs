@@ -24,6 +24,10 @@ public sealed class SyncWorker(
     private volatile ServiceState _state = ServiceState.Starting;
     private volatile string _detail = "Registering and connecting the drive.";
 
+    // The number of the last change a pulse shows; a watching app keeps
+    // whichever of a pulse and a status is newer.
+    private long _revision = 1;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         DriveSettings saved;
@@ -91,7 +95,8 @@ public sealed class SyncWorker(
             BuildStatus,
             lifetime.StopApplication,
             message => logger.LogInformation("{Message}", message),
-            syncNow: () => _engine?.SyncNowAsync() ?? Task.CompletedTask);
+            syncNow: () => _engine?.SyncNowAsync() ?? Task.CompletedTask,
+            pulse: BuildPulse);
         _control.Start();
 
         var endpoint = await ConnectRcloneAsync(settings, stoppingToken).ConfigureAwait(false);
@@ -109,7 +114,11 @@ public sealed class SyncWorker(
         {
             logger.LogWarning("{Message}", message);
             _problems.Report(message);
+            Changed();
         };
+
+        // Sending, downloading, offline: the app's icon shows it as it happens.
+        _engine.ActivityChanged += Changed;
 
         try
         {
@@ -129,20 +138,20 @@ public sealed class SyncWorker(
             {
                 _engine.StartWatcher();
                 _engine.StartBackgroundSync();
-                (_state, _detail) = status.Registered && status.Connected
+                SetState(status.Registered && status.Connected
                     ? (ServiceState.Syncing, "The drive is registered with Explorer and connected.")
-                    : (ServiceState.Failed, "The drive could not be registered or connected; see the log.");
+                    : (ServiceState.Failed, "The drive could not be registered or connected; see the log."));
             }
             else
             {
                 logger.LogError("Cloud Files is not available ({Reason}); nothing is synced.", status.CapabilityReason);
-                (_state, _detail) = (ServiceState.Unavailable, status.CapabilityReason);
+                SetState((ServiceState.Unavailable, status.CapabilityReason));
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogError(ex, "Sync engine initialisation failed");
-            (_state, _detail) = (ServiceState.Failed, ex.Message);
+            SetState((ServiceState.Failed, ex.Message));
         }
 
         await WaitUntilStoppedAsync(stoppingToken).ConfigureAwait(false);
@@ -181,13 +190,13 @@ public sealed class SyncWorker(
                 : $"rclone was not found at '{settings.RclonePath}'.";
             logger.LogError("{Why}", why);
             _rcloneStatus = new RcloneStatus(true, "", settings.RclonePath, null, null, null, "NotFound", why, null);
-            (_state, _detail) = (ServiceState.Failed, why);
+            SetState((ServiceState.Failed, why));
             return null;
         }
 
         _rcloneStatus = new RcloneStatus(
             true, "", program.Path, program.Source.ToString(), null, null, "Starting", "Starting rclone.", RcloneLogPath);
-        _detail = "Starting rclone.";
+        SetState((_state, "Starting rclone."));
         try
         {
             _daemon = await RcloneDaemon.StartAsync(
@@ -196,7 +205,7 @@ public sealed class SyncWorker(
                 RcloneLogPath,
                 message => logger.LogInformation("{Message}", message),
                 stoppingToken).ConfigureAwait(false);
-            _detail = "Registering and connecting the drive.";
+            SetState((_state, "Registering and connecting the drive."));
             return _daemon.Endpoint;
         }
         catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
@@ -204,7 +213,7 @@ public sealed class SyncWorker(
             var why = $"rclone could not be started: {ex.Message}";
             logger.LogError("{Why}", why);
             _rcloneStatus = _rcloneStatus with { State = "Failed", Detail = why };
-            (_state, _detail) = (ServiceState.Failed, why);
+            SetState((ServiceState.Failed, why));
             return null;
         }
     }
@@ -223,8 +232,38 @@ public sealed class SyncWorker(
                 daemon.LogPath)
             : _rcloneStatus;
 
+    private void SetState((ServiceState State, string Detail) state)
+    {
+        (_state, _detail) = state;
+        Changed();
+    }
+
+    /// <summary>Something a pulse shows has changed: it is numbered, and sent to a watching app.</summary>
+    private void Changed()
+    {
+        Interlocked.Increment(ref _revision);
+        _control?.NotifyChanged();
+    }
+
+    /// <summary>The state to report: a connected drive whose server cannot be reached is offline.</summary>
+    private (ServiceState State, string Detail) StateNow() =>
+        _state == ServiceState.Syncing && _engine is { IsOnline: false } engine
+            ? (ServiceState.Offline,
+               $"The server cannot be reached ({engine.OfflineReason}). Folders show what is on this PC, and changes " +
+               "are sent once it answers; it is checked again when the network changes, when the drive is used, and every minute or so.")
+            : (_state, _detail);
+
+    private ServicePulse BuildPulse()
+    {
+        // The number first: what is read after it is at least that new.
+        var revision = Interlocked.Read(ref _revision);
+        var (state, detail) = StateNow();
+        return new ServicePulse(Environment.ProcessId, revision, state, detail, _engine?.Activity ?? SyncActivity.None, _problems.Count);
+    }
+
     private ServiceStatus BuildStatus()
     {
+        var revision = Interlocked.Read(ref _revision);
         var settings = _settings!;
         var items = 0;
         try
@@ -237,11 +276,7 @@ public sealed class SyncWorker(
         }
 
         var initialized = _initialized;
-        var (state, detail) = _state == ServiceState.Syncing && _engine is { IsOnline: false } engine
-            ? (ServiceState.Offline,
-               $"The server cannot be reached ({engine.OfflineReason}). Folders show what is on this PC, and changes " +
-               "are sent once it answers; it is checked again when the network changes, when the drive is used, and every minute or so.")
-            : (_state, _detail);
+        var (state, detail) = StateNow();
         return new ServiceStatus(
             Environment.ProcessId,
             _startedAt,
@@ -259,7 +294,9 @@ public sealed class SyncWorker(
             activity.Recent(100),
             RcloneNow(),
             _problems.Count,
-            _problems.Recent());
+            _problems.Recent(),
+            _engine?.Activity ?? SyncActivity.None,
+            revision);
     }
 
     private static string Version =>

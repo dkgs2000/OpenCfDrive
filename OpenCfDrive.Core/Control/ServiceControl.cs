@@ -7,8 +7,9 @@ namespace OpenCfDrive.Core.Control;
 
 /// <summary>
 /// How the app reaches a running service: a named pipe per drive that only
-/// the same user can open. A request is one line ("status" or "stop"), the
-/// answer one line of JSON.
+/// the same user can open. A request is one line ("status", "stop", "sync"),
+/// the answer one line of JSON; "watch" is answered with a line at every
+/// change, as long as the connection stays open.
 /// </summary>
 public static class ServiceControl
 {
@@ -17,6 +18,9 @@ public static class ServiceControl
 
     /// <summary>Look at the server now; answered once that sync run has finished.</summary>
     public const string SyncRequest = "sync";
+
+    /// <summary>A <see cref="ServicePulse"/> line now and at every change, until either side leaves.</summary>
+    public const string WatchRequest = "watch";
 
     internal static readonly JsonSerializerOptions Json = new()
     {
@@ -81,6 +85,62 @@ public static class ServiceControl
     public static async Task<bool> RequestStopAsync(
         string syncRoot, TimeSpan timeout, CancellationToken cancellationToken = default) =>
         await SendAsync(PipeName(syncRoot), StopRequest, timeout, cancellationToken).ConfigureAwait(false) is not null;
+
+    /// <summary>
+    /// Watches the service: <paramref name="pulse"/> gets what it says at
+    /// once, then each change, on the thread that read it. Returns once the
+    /// service stops or is gone, or <paramref name="cancellationToken"/> is
+    /// cancelled; true if any pulse came, false if none answered, or one too
+    /// old to know the request.
+    /// </summary>
+    public static async Task<bool> WatchAsync(
+        string syncRoot, Action<ServicePulse> pulse, TimeSpan connectTimeout, CancellationToken cancellationToken = default)
+    {
+        var any = false;
+        try
+        {
+            await using var pipe = new NamedPipeClientStream(
+                ".", PipeName(syncRoot), PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+            using (var connecting = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+            {
+                connecting.CancelAfter(connectTimeout);
+                await pipe.ConnectAsync(connecting.Token).ConfigureAwait(false);
+            }
+
+            await using var writer = new StreamWriter(pipe, leaveOpen: true) { AutoFlush = true };
+            await writer.WriteLineAsync(WatchRequest.AsMemory(), cancellationToken).ConfigureAwait(false);
+
+            using var reader = new StreamReader(pipe, leaveOpen: true);
+            while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+            {
+                ServicePulse? next;
+                try
+                {
+                    next = JsonSerializer.Deserialize<ServicePulse>(line, Json);
+                }
+                catch (JsonException)
+                {
+                    next = null;
+                }
+
+                // A service that does not know the request answers with an
+                // error, which has no revision.
+                if (next is not { Revision: > 0 })
+                {
+                    break;
+                }
+
+                any = true;
+                pulse(next);
+            }
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or IOException or TimeoutException or UnauthorizedAccessException)
+        {
+            // Gone, or never there.
+        }
+
+        return any;
+    }
 
     internal static async Task<string?> SendAsync(
         string pipeName, string request, TimeSpan timeout, CancellationToken cancellationToken)

@@ -1,11 +1,12 @@
+using System.Threading.Channels;
 using OpenCfDrive.Core.Control;
 
 namespace OpenCfDrive.Tests;
 
 /// <summary>
 /// The pipe between the app and the running service: status comes back
-/// whole, a stop request reaches the service, and nothing answering means
-/// "not running" rather than a hang.
+/// whole, a stop request reaches the service, a watching app is told each
+/// change, and nothing answering means "not running" rather than a hang.
 /// </summary>
 public sealed class ServiceControlTests
 {
@@ -25,7 +26,12 @@ public sealed class ServiceControlTests
         ItemsTracked: 17,
         BytesDownloaded: 1234,
         LogPath: @"C:\logs\OpenCfDrive.log",
-        RecentActivity: [new ActivityEntry(new DateTimeOffset(2026, 11, 2, 10, 1, 0, TimeSpan.Zero), "Information", "Uploaded 'a.txt'")]);
+        RecentActivity: [new ActivityEntry(new DateTimeOffset(2026, 11, 2, 10, 1, 0, TimeSpan.Zero), "Information", "Uploaded 'a.txt'")],
+        Activity: new SyncActivity(Sending: 2, Downloading: 1, Failing: 1),
+        Revision: 7);
+
+    private static ServicePulse Pulse(long revision, SyncActivity? activity = null) =>
+        new(4242, revision, ServiceState.Syncing, "Connected.", activity ?? SyncActivity.None, ProblemsReported: 0);
 
     private static string UniqueRoot() => Path.Combine(Path.GetTempPath(), "opencfdrive-control", Guid.NewGuid().ToString("N"));
 
@@ -108,5 +114,60 @@ public sealed class ServiceControlTests
         }
 
         Assert.False(ServiceControl.IsRunning(root));
+    }
+
+    [Fact]
+    public async Task Watch_GetsAPulseAtOnce_ThenOneAtEachChange()
+    {
+        var root = UniqueRoot();
+        var current = Pulse(1);
+        await using var server = new ServiceControlServer(
+            ServiceControl.PipeName(root), () => SampleStatus(root), () => { }, pulse: () => Volatile.Read(ref current));
+        server.Start();
+
+        var received = Channel.CreateUnbounded<ServicePulse>();
+        using var leave = new CancellationTokenSource();
+        var watching = ServiceControl.WatchAsync(root, pulse => received.Writer.TryWrite(pulse), Timeout, leave.Token);
+
+        Assert.Equal(Pulse(1), await received.Reader.ReadAsync().AsTask().WaitAsync(Timeout));
+
+        Volatile.Write(ref current, Pulse(2, new SyncActivity(Sending: 3)));
+        server.NotifyChanged();
+        Assert.Equal(Pulse(2, new SyncActivity(Sending: 3)), await received.Reader.ReadAsync().AsTask().WaitAsync(Timeout));
+
+        // The app leaving ends the watch on its side; it heard the service.
+        leave.Cancel();
+        Assert.True(await watching.WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task Watch_Ends_WhenTheServiceStops()
+    {
+        var root = UniqueRoot();
+        var server = new ServiceControlServer(ServiceControl.PipeName(root), () => SampleStatus(root), () => { }, pulse: () => Pulse(1));
+        server.Start();
+        var heard = new TaskCompletionSource();
+        var watching = ServiceControl.WatchAsync(root, _ => heard.TrySetResult(), Timeout);
+        await heard.Task.WaitAsync(Timeout);
+
+        await server.DisposeAsync();
+
+        Assert.True(await watching.WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task Watch_OfAServiceThatDoesNotKnowIt_EndsAtOnce()
+    {
+        var root = UniqueRoot();
+        await using var server = new ServiceControlServer(ServiceControl.PipeName(root), () => SampleStatus(root), () => { });
+        server.Start();
+
+        Assert.False(await ServiceControl.WatchAsync(root, _ => Assert.Fail("An error is no pulse."), Timeout).WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task Watch_WithoutAService_ReturnsAtOnce()
+    {
+        Assert.False(await ServiceControl.WatchAsync(UniqueRoot(), _ => { }, TimeSpan.FromMilliseconds(300)).WaitAsync(Timeout));
     }
 }

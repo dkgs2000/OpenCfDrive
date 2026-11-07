@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using OpenCfDrive.Core.Control;
 using OpenCfDrive.Core.Interop;
 using OpenCfDrive.Core.Models;
 using OpenCfDrive.Core.Services;
@@ -223,6 +224,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         // Plain files in mock mode are outside a sync root, where the shell
         // has no state column to fill.
         _itemStates = new ItemStates(log, enabled: !forceSimulation);
+        _itemStates.FailingChanged += OnActivityChanged;
 
         // The metadata DB and its SQLite side files are engine state, never
         // user data. If they live inside the sync root they must not be
@@ -247,6 +249,48 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     /// handler it goes to the log like any other line.
     /// </summary>
     public event Action<string>? ProblemReported;
+
+    /// <summary>
+    /// Raised, on any thread, when <see cref="Activity"/> or
+    /// <see cref="IsOnline"/> may have changed. Handlers must not block.
+    /// </summary>
+    public event Action? ActivityChanged;
+
+    /// <summary>What the drive is doing now: what it sends, downloads, keeps offline, and what failed.</summary>
+    public SyncActivity Activity => new(
+        Sending: Math.Max(0, Volatile.Read(ref _sending)),
+        Downloading: _connection?.ActiveDownloads ?? 0,
+        Waiting: Volatile.Read(ref _waiting),
+        Failing: _itemStates.Failing);
+
+    // The steps of the run's plan not yet done, and the changes the last
+    // plan kept while offline.
+    private int _sending;
+    private int _waiting;
+
+    private void OnActivityChanged() => ActivityChanged?.Invoke();
+
+    private void SetSending(int steps)
+    {
+        if (Interlocked.Exchange(ref _sending, steps) != steps)
+        {
+            OnActivityChanged();
+        }
+    }
+
+    private void AddSending(int steps)
+    {
+        Interlocked.Add(ref _sending, steps);
+        OnActivityChanged();
+    }
+
+    private void SetWaiting(int changes)
+    {
+        if (Interlocked.Exchange(ref _waiting, changes) != changes)
+        {
+            OnActivityChanged();
+        }
+    }
 
     private void ReportProblem(string message)
     {
@@ -340,6 +384,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 // everything kept for the server goes first.
                 _server.Changed += online =>
                 {
+                    OnActivityChanged();
                     if (online)
                     {
                         _ = _scheduler?.SyncNowAsync();
@@ -361,11 +406,13 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 // What a listing found changed on the server is applied by
                 // the next run, after its local changes.
                 _connection.DirectoryListed += _ => _scheduler.RequestLocalRun();
+                _connection.DownloadStarted += _ => OnActivityChanged();
 
                 // A change that waited for a download can go now, whether it
                 // was sent or failed.
                 _connection.DownloadEnded += _ =>
                 {
+                    OnActivityChanged();
                     if (!_changes.IsEmpty)
                     {
                         _scheduler.RequestLocalRun();
@@ -881,6 +928,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     {
         if (_changes.IsEmpty)
         {
+            SetWaiting(0);
             return;
         }
 
@@ -904,6 +952,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             _server.CheckNow();
             return;
         }
+
+        SetWaiting(0);
 
         // "Waiting to upload" is shown where the plan has something to send,
         // not for every file event: most of those are the client's own writes,
@@ -933,10 +983,12 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             if (Directory.Exists(localPath))
             {
                 folders.Enqueue(new PlannedItem(localPath, []));
+                AddSending(1);
             }
             else if (File.Exists(localPath) && !uploads.Any(u => LocalChanges.Same(u.LocalPath, localPath)))
             {
                 uploads.Add(new PlannedItem(localPath, []));
+                AddSending(1);
             }
         }
 
@@ -948,6 +1000,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 $"{plan.Folders.Count} new folder(s), {plan.Uploads.Count} upload(s).");
         }
 
+        SetSending(steps);
         try
         {
             foreach (var move in plan.Moves)
@@ -1019,6 +1072,10 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             _server.Failed(ex.Message);
             ReportKeptOffline(LocalChangePlanner.Plan(_changes.Pending(), this, DateTimeOffset.UtcNow));
         }
+        finally
+        {
+            SetSending(0);
+        }
     }
 
     /// <summary>
@@ -1046,6 +1103,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
 
         _changes.Complete(from);
+        AddSending(-1);
     }
 
     /// <summary>The local paths a plan step touched (a rename has both names).</summary>
@@ -1090,9 +1148,12 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
     }
 
-    /// <summary>Says once per change what waits for the server, as before.</summary>
+    /// <summary>Says once per change what waits for the server, as before, and counts it.</summary>
     private void ReportKeptOffline(LocalChangePlan plan)
     {
+        SetWaiting(plan.Moves.Count + plan.Deletes.Count + plan.Folders.Count +
+                   plan.Uploads.Count(u => HasUnsyncedLocalChanges(u.LocalPath)));
+
         bool First(IReadOnlyList<LocalChange> from)
         {
             lock (_reportedOffline)

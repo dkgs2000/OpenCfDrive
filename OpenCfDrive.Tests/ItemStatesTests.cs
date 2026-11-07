@@ -169,4 +169,44 @@ public class ItemStatesTests
             return Task.CompletedTask;
         }
     }
+
+    [Fact]
+    public void FilesThatCouldNotSync_AreCounted_UntilTheySyncOrAreGone()
+    {
+        var folder = Directory.CreateTempSubdirectory("opencfdrive-failing").FullName;
+        try
+        {
+            var a = Path.Combine(folder, "a.txt");
+            var b = Path.Combine(folder, "b.txt");
+            File.WriteAllText(a, "a");
+            File.WriteAllText(b, "b");
+
+            // Counted in mock mode too, where Explorer shows nothing.
+            using var states = new ItemStates(new RecordingWriter(), enabled: false);
+            var told = 0;
+            states.FailingChanged += () => told++;
+
+            states.CouldNotSync(a, "refused");
+            states.CouldNotSync(b, "refused");
+            states.CouldNotSync(b, "refused again");
+            Assert.Equal(2, states.Failing);
+            Assert.Equal(2, told);
+
+            states.Clear(a); // it reached the server
+            Assert.Equal(1, states.Failing);
+            Assert.Equal(3, told);
+
+            File.Delete(b);
+            Assert.Equal(0, states.Failing);
+
+            // Changed again, it is sent anew: not failing while it waits.
+            states.CouldNotSync(a, "refused");
+            states.WaitingToUpload(a);
+            Assert.Equal(0, states.Failing);
+        }
+        finally
+        {
+            Directory.Delete(folder, recursive: true);
+        }
+    }
 }

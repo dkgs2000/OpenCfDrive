@@ -103,6 +103,20 @@ the password encrypted for your Windows user.
 The app lives in the notification area, behind the arrow next to the clock.
 Drag its icon onto the taskbar to keep it in view.
 
+The icon shows how the drive is doing, as OneDrive's does. Point at it to see
+the state and what it's doing, for example "Sending 3 changes and downloading
+1 file."
+
+| Icon | Means |
+|---|---|
+| The plain icon | Up to date: connected, with nothing to send or download. |
+| A blue arrow | Syncing: starting, sending your changes, or downloading. |
+| An amber "!" | Some files couldn't be synced. Explorer marks them **Couldn't sync**, and Recent activity says why. |
+| A red cross | Nothing syncs: a problem with the settings, rclone or the sync service. |
+| Grey, with a line through | Offline: the server can't be reached. Your changes wait for it. |
+| Grey, with a pause sign | The sync service isn't running. |
+| Grey | Not set up yet: choose your remote in Settings. |
+
 - **Click the icon** to open the app.
 - **The icon's menu** opens the drive folder, starts, stops or restarts
   syncing, and shows the log.
@@ -230,9 +244,13 @@ The installed app updates itself from this project's GitHub releases:
    `%LOCALAPPDATA%\OpenCfDrive\updates`, and is checked against the size and
    SHA-256 that GitHub lists for it.
 3. Once it's ready, the app tells you with a notification, on the Status tab and
-   in the icon's menu.
+   in the icon's menu. It tells you again each time it starts until you
+   install it.
 4. **Restart and update** stops syncing, installs the update with a progress
    bar, and reopens the app, which starts syncing again.
+
+If a new version is out but can't be downloaded, a notification says so once
+for that version. Click it to open the release page and install it from there.
 
 If an update fails to install, the app offers it again with the installer's log
 (`updates\install.log`).

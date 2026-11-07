@@ -164,7 +164,7 @@ Explorer does, and expects the local side to match:
 Mock mode skips these. It's a test stand-in over a plain folder, with no way
 to know when a folder is opened, so it copies the server once at startup.
 
-**Client side (`C01`–`C32`, both modes unless noted).** A local action in the
+**Client side (`C01`–`C33`, both modes unless noted).** A local action in the
 drive, after which the server is expected to match:
 
 - add a file; in an existing folder; in new nested folders
@@ -209,6 +209,11 @@ drive, after which the server is expected to match:
   that only came from the server never gets one
 - Free up space on a file with an unsynced edit (cloud mode): it's uploaded
   first, then freed, and opens whole again
+- what the app's icon shows (cloud mode), read the way the app reads it: the
+  service's `watch` answer on its control pipe, a line at every change. While
+  a new file is sent (the server paused mid-upload) the service reports it
+  as sending, and once it's on the server, nothing left to do. Offline, an
+  edit is reported as waiting for the server (S33)
 
 **No needless work.** Every scenario also declares the most it may cost:
 uploads, bytes downloaded, server renames, deletes and lookups. The harness

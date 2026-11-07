@@ -161,6 +161,12 @@ public sealed class SyncRootConnection : IDisposable
     /// </summary>
     public event Action<string>? DownloadEnded;
 
+    /// <summary>Raised with the file's full local path when a download of it starts.</summary>
+    public event Action<string>? DownloadStarted;
+
+    /// <summary>The files being downloaded now.</summary>
+    public int ActiveDownloads => _hydratingPaths.Count;
+
     /// <summary>
     /// Raised on the callback thread after a directory was listed from the
     /// remote and the platform received its new entries. Handlers must not
@@ -295,6 +301,7 @@ public sealed class SyncRootConnection : IDisposable
             // (NormalizedPath has no drive letter).
             var guardKey = string.IsNullOrEmpty(normalizedPath) ? remotePath : ToLocalPath(normalizedPath);
             _hydratingPaths.AddOrUpdate(guardKey, 1, (_, active) => active + 1);
+            DownloadStarted?.Invoke(guardKey);
 
             try
             {
