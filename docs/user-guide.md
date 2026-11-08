@@ -71,7 +71,7 @@ If you're using the copy OpenCfDrive downloaded, run that one instead:
 
 ### 3. Choose it in OpenCfDrive
 
-OpenCfDrive opens after it's installed. In the **Settings** tab, choose the
+OpenCfDrive opens after it's installed. On the **Settings** page, choose the
 remote from the list, which comes from rclone's config. A path inside the
 remote works too, as in `myremote:backup`. If you added a remote after opening
 the app, press **Refresh list**.
@@ -131,19 +131,39 @@ the state and what it's doing, for example "Sending 3 changes and downloading
   that keeps failing isn't announced again for 30 minutes. Click the
   notification to open the app, whose Recent activity has the details.
 
-The **Status** tab shows:
+The window has three pages, listed on its left. The drive's state icon and
+remote sit at the top of the list. The window opens as big as its pages need
+on the screen where you clicked the icon. You can make it smaller: text wraps
+and pages scroll.
 
+**Status** shows:
+
+- **How the drive is doing,** with the icon's picture, a sentence on what
+  it's doing, and buttons to open the drive folder and to start, stop or
+  restart syncing. Before a remote is chosen, or when rclone can't be found,
+  a button takes you to Settings. An update ready to install shows above it.
+- **Drive:** the folder, the remote, what kind of storage it is and where it
+  points (for example `s3 (AWS), region eu-west-1` or
+  `crypt over gdrive:secret`), and the space used and free, if the server
+  reports it. It never shows passwords, keys or tokens.
+- **Recent activity:** uploads, downloads, deletes and warnings, newest first.
+  Point at a line to read all of it.
+
+**Settings** holds the settings below. Changes take effect when you press
+**Save**; **Discard changes** puts back what's saved.
+
+**About** shows:
+
+- **The version,** whether it's up to date, and the buttons to check for
+  updates and install one.
 - **Sync service:** whether it's running and since when, its version, whether
   the drive is registered with Explorer and connected, how many items it
   tracks, and how much it has downloaded.
 - **rclone:** who runs it, which `rclone.exe` and version, where it listens,
   whether it's running (or being restarted, and why), and whether the chosen
   remote is in rclone's config.
-- **Remote:** what kind of storage it is and where it points, for example
-  `s3 (AWS), region eu-west-1` or `crypt over gdrive:secret`. It never shows
-  passwords, keys or tokens. You also see the free space, if the server
-  reports it.
-- **Recent activity:** uploads, downloads, deletes and warnings.
+- **Logs and settings:** where the service's log, rclone's log and the
+  settings file are, with buttons to open them.
 
 ## Settings
 
@@ -239,12 +259,12 @@ The installed app updates itself from this project's GitHub releases:
 
 1. It checks for a new release 3 seconds after it starts, then every 10 hours,
    unless **Check for new versions** is off. **Check for updates** on the
-   Status tab checks right away.
+   About page checks right away.
 2. A new version downloads in the background into
    `%LOCALAPPDATA%\OpenCfDrive\updates`, and is checked against the size and
    SHA-256 that GitHub lists for it.
-3. Once it's ready, the app tells you with a notification, on the Status tab and
-   in the icon's menu. It tells you again each time it starts until you
+3. Once it's ready, the app tells you with a notification, at the top of the
+   Status page, on the About page and in the icon's menu. It tells you again each time it starts until you
    install it.
 4. **Restart and update** stops syncing, installs the update with a progress
    bar, and reopens the app, which starts syncing again.

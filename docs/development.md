@@ -209,7 +209,7 @@ was built from, the way Nextcloud's desktop client does on Windows
 
 - It asks GitHub for the latest release (not drafts or pre-releases) 3 s after
   it starts and then every 10 hours, unless `CheckForUpdates` is off. **Check
-  for updates** on the Status tab asks at once either way.
+  for updates** on the About page asks at once either way.
 - A newer version's setup (`OpenCfDrive-<version>-x64-setup.exe`) downloads in
   the background into `%LOCALAPPDATA%\OpenCfDrive\updates` and must match the
   size and SHA-256 that GitHub lists for it. The updater uses the setup rather

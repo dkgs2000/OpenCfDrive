@@ -20,6 +20,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The window's layout tests build it with a stand-in for the app. -->
+    <InternalsVisibleTo Include="OpenCfDrive.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\OpenCfDrive.Core\OpenCfDrive.Core.csproj" />
     <EmbeddedResource Include="..\assets\opencfdrive.ico" LogicalName="OpenCfDrive.ico" />
   </ItemGroup>

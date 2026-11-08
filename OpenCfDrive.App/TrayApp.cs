@@ -12,7 +12,7 @@ namespace OpenCfDrive.App;
 /// The icon in the notification area (behind the arrow next to the clock,
 /// unless the user pins it to the taskbar), its menu, and the window it opens.
 /// </summary>
-internal sealed class TrayApp : ApplicationContext
+internal sealed class TrayApp : ApplicationContext, IDriveApp
 {
     private static readonly TimeSpan VisibleRefresh = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan HiddenRefresh = TimeSpan.FromSeconds(15);
@@ -118,6 +118,14 @@ internal sealed class TrayApp : ApplicationContext
     public Updater Updates { get; }
 
     public bool Busy => _busy;
+
+    public DriveSnapshot? Latest => Monitor.Latest;
+
+    public Version CurrentVersion => Updates.Current;
+
+    public UpdateStatus UpdateStatus => Updates.Status;
+
+    public Task CheckForUpdatesAsync() => Updates.CheckNowAsync();
 
     private async Task StartupAsync(bool showWindow)
     {
@@ -342,19 +350,19 @@ internal sealed class TrayApp : ApplicationContext
                 ToolTipIcon.Info,
                 notice.Install
                     ? async () => await InstallUpdateAsync(ask: true)
-                    : notice.Page is { } page ? () => OpenPage(page) : null);
+                    : notice.Page is { } page ? () => Open(page) : null);
         }
     }
 
-    private void OpenPage(string page)
+    public void Open(string target)
     {
         try
         {
-            Process.Start(new ProcessStartInfo(page) { UseShellExecute = true })?.Dispose();
+            Process.Start(new ProcessStartInfo(target) { UseShellExecute = true })?.Dispose();
         }
         catch (System.ComponentModel.Win32Exception ex)
         {
-            ShowProblem($"{page} could not be opened: {ex.Message}");
+            ShowProblem($"{target} could not be opened: {ex.Message}");
         }
     }
 
@@ -414,6 +422,9 @@ internal sealed class TrayApp : ApplicationContext
             _window.VisibleChanged += async (_, _) => await RefreshAsync(probeRclone: _window.Visible);
         }
 
+        // The first time, where the icon was clicked.
+        _window.PlaceOn(Screen.FromPoint(Cursor.Position));
+
         if (Monitor.Latest is { } latest)
         {
             _window.ShowSnapshot(latest);
@@ -422,7 +433,7 @@ internal sealed class TrayApp : ApplicationContext
         _window.ShowUpdate(Updates.Status);
         if (settings)
         {
-            _window.ShowSettingsTab();
+            _window.ShowSettingsPage();
         }
 
         _window.Show();
@@ -556,11 +567,15 @@ internal sealed class TrayApp : ApplicationContext
         }, report: false);
     }
 
-    /// <summary>The log of the rclone the service runs.</summary>
+    /// <summary>The log of the rclone the service runs: where it writes, or where it would.</summary>
+    public static string RcloneLogPath(DriveSnapshot? snapshot) =>
+        snapshot?.Status?.Rclone?.LogPath is { Length: > 0 } log
+            ? log
+            : Path.Combine(Path.GetDirectoryName(SyncStatePaths.StateRoot)!, "logs", "rclone.log");
+
     public void OpenRcloneLog()
     {
-        var log = Monitor.Latest?.Status?.Rclone?.LogPath
-                  ?? Path.Combine(Path.GetDirectoryName(SyncStatePaths.StateRoot)!, "logs", "rclone.log");
+        var log = RcloneLogPath(Monitor.Latest);
         if (File.Exists(log))
         {
             Process.Start(new ProcessStartInfo(log) { UseShellExecute = true })?.Dispose();

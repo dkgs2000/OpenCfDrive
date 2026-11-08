@@ -20,11 +20,22 @@ dotnet test .\OpenCfDrive.slnx
 ```
 
 `OpenCfDrive.Tests` covers the interop layout, the SQLite store, settings, the
-sync scheduler, conflict copies, the updater, and contract tests against the
-real Cloud Files API and a real rclone. The tests find `rclone.exe` next to the
+sync scheduler, conflict copies, the updater, the app's window, and contract
+tests against the real Cloud Files API and a real rclone. The tests find `rclone.exe` next to the
 build output or in a parent folder (the repository root, for instance), else on
 `PATH`. A test that needs rclone or the Cloud Files API is skipped, with the
 reason, when it's missing.
+
+`MainFormLayoutTests` opens the app's window, unseen, for each state the drive
+can be in (not set up, up to date, syncing, offline, rclone missing, your own
+`rclone rcd`, an update ready, long names). It does so on each screen scale the
+PC has, with normal and larger text, at the size the window opens at and at
+its smallest. On every page it checks that no text is cut off, every button
+fits its words, nothing overlaps or sticks out, inputs keep room to type, cards
+have no empty rows, and the activity list keeps some lines. It also checks that
+the spacing follows the screen's scale. To look at the pages yourself, set
+`OPENCFDRIVE_UI_PICTURES` to a folder before `dotnet test`. The tests then save
+a picture of each page there.
 
 ## End-to-end tests
 

@@ -6,6 +6,8 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <NoWarn>$(NoWarn);CS8618</NoWarn>
+    <!-- For the app's window (MainFormLayoutTests). -->
+    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
   <ItemGroup>
@@ -24,6 +26,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\OpenCfDrive.Core\OpenCfDrive.Core.csproj" />
+    <ProjectReference Include="..\OpenCfDrive.App\OpenCfDrive.App.csproj" />
   </ItemGroup>
 
 </Project>

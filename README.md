@@ -61,9 +61,9 @@ You need **64-bit Windows 10 (version 2004 or later) or Windows 11**.
    rclone config
    ```
 
-   Don't have rclone? Press **Download rclone from rclone.org** in
-   OpenCfDrive's Settings tab instead.
-3. **Pick the remote.** In OpenCfDrive's **Settings** tab, choose your remote,
+   Don't have rclone? Press **Download rclone from rclone.org** on
+   OpenCfDrive's Settings page instead.
+3. **Pick the remote.** On OpenCfDrive's **Settings** page, choose your remote,
    for example `myremote:` or `myremote:backup`, and press **Save**.
 
 Your drive is now in Explorer as **OpenCfDrive**, at `%USERPROFILE%\OpenCfDrive`.
