@@ -29,6 +29,20 @@ public sealed class ConflictCopiesTests : IDisposable
     public void Name_UsesA24HourClock() =>
         Assert.Equal("a (conflicted copy 2026-11-03 090807).txt", ConflictCopies.Name("a.txt", new DateTime(2026, 11, 3, 9, 8, 7)));
 
+    /// <summary>
+    /// A file that conflicts again and again keeps its name instead of
+    /// stacking a tag per round: stacked tags grew past Windows' name and
+    /// path limits (255/260 chars), after which the copy could not be made.
+    /// </summary>
+    [Fact]
+    public void Name_StripsTheTagsEarlierConflictsLeft()
+    {
+        var stacked = "report (conflicted copy 2026-10-01 101010) (conflicted copy 2026-10-02 111111).txt";
+        Assert.Equal("report (conflicted copy 2026-11-03 175504).txt", ConflictCopies.Name(stacked, At));
+        Assert.Equal("report.txt", ConflictCopies.Strip(stacked));
+        Assert.Equal("report.txt", ConflictCopies.Strip("report.txt"));
+    }
+
     [Fact]
     public void PathFor_TwoConflictsInTheSameSecond_GetTheirOwnNames()
     {

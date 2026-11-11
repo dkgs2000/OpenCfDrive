@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace OpenCfDrive.Core.CloudFiles;
 
 /// <summary>
@@ -5,7 +7,7 @@ namespace OpenCfDrive.Core.CloudFiles;
 /// desktop client makes them (Utility::makeConflictFileName in
 /// src/common/utility.cpp): "report (conflicted copy 2026-11-03 175500).txt".
 /// </summary>
-public static class ConflictCopies
+public static partial class ConflictCopies
 {
     public const string Marker = " (conflicted copy ";
 
@@ -13,17 +15,28 @@ public static class ConflictCopies
     /// The conflict copy's name for <paramref name="fileName"/>: the tag goes
     /// before the extension, or at the end when there is none (".hidden",
     /// "Makefile"). The time is the local copy's modification time, local.
+    /// Tags the name carries from earlier conflicts are dropped first: a file
+    /// that conflicts again and again would stack them until its name passes
+    /// the limits a path has on Windows (255 chars a name, 260 a path), after
+    /// which every step that needs a new name fails.
     /// </summary>
     public static string Name(string fileName, DateTime modifiedLocal)
     {
-        var dot = fileName.LastIndexOf('.');
+        var bare = Strip(fileName);
+        var dot = bare.LastIndexOf('.');
         if (dot <= 0)
         {
-            dot = fileName.Length;
+            dot = bare.Length;
         }
 
-        return fileName.Insert(dot, $"{Marker}{modifiedLocal.ToString("yyyy-MM-dd HHmmss", System.Globalization.CultureInfo.InvariantCulture)})");
+        return bare.Insert(dot, $"{Marker}{modifiedLocal.ToString("yyyy-MM-dd HHmmss", System.Globalization.CultureInfo.InvariantCulture)})");
     }
+
+    /// <summary>The name without the conflict tags it carries, if any.</summary>
+    public static string Strip(string fileName) => Tag().Replace(fileName, string.Empty);
+
+    [GeneratedRegex(@" \(conflicted copy \d{4}-\d{2}-\d{2} \d{6}\)")]
+    private static partial Regex Tag();
 
     /// <summary>
     /// A free path for the conflict copy of <paramref name="localPath"/>: its
