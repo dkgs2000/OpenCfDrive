@@ -29,6 +29,65 @@ public sealed class ConflictCopiesTests : IDisposable
     public void Name_UsesA24HourClock() =>
         Assert.Equal("a (conflicted copy 2026-11-03 090807).txt", ConflictCopies.Name("a.txt", new DateTime(2026, 11, 3, 9, 8, 7)));
 
+    /// <summary>
+    /// A name too long to take the tag is cut at its end to make room: the
+    /// copy's name is as long as Windows allows, with the tag and extension.
+    /// </summary>
+    [Fact]
+    public void Name_CutsALongNameToFitTheTag()
+    {
+        var copy = ConflictCopies.Name(new string('a', 245) + ".docx", At);
+
+        Assert.Equal(new string('a', 214) + " (conflicted copy 2026-11-03 175504).docx", copy);
+        Assert.Equal(ConflictCopies.MaxNameLength, copy.Length);
+    }
+
+    /// <summary>An emoji is two UTF-16 units; a cut between them would leave half of one.</summary>
+    [Fact]
+    public void Name_NeverCutsACharacterInHalf()
+    {
+        var emoji = "\U0001F600";
+        var copy = ConflictCopies.Name(string.Concat(Enumerable.Repeat(emoji, 120)) + ".txt", At);
+
+        Assert.Equal(string.Concat(Enumerable.Repeat(emoji, 107)) + " (conflicted copy 2026-11-03 175504).txt", copy);
+    }
+
+    /// <summary>An "extension" too long to leave room for anything else is cut with the rest.</summary>
+    [Fact]
+    public void Name_AnExtensionThatLeavesNoRoomIsCutToo()
+    {
+        var copy = ConflictCopies.Name("a." + new string('x', 240), At);
+
+        Assert.Equal("a." + new string('x', 217) + " (conflicted copy 2026-11-03 175504)", copy);
+        Assert.Equal(ConflictCopies.MaxNameLength, copy.Length);
+    }
+
+    /// <summary>
+    /// A file with a name as long as Windows allows still gets its copies:
+    /// a second one in the same second too, and the next try finds each.
+    /// </summary>
+    [Fact]
+    public void PathFor_AFileWithAVeryLongNameGetsItsCopies()
+    {
+        Directory.CreateDirectory(_folder);
+        var file = Path.Combine(_folder, new string('r', 250) + ".txt");
+        File.WriteAllText(file, "first edit");
+        File.SetLastWriteTime(file, At);
+
+        var first = ConflictCopies.PathFor(file, At);
+        File.Copy(file, first);
+        Assert.Equal(first, ConflictCopies.KeptCopyOf(file));
+
+        File.WriteAllText(file, "later edit");   // the same size
+        File.SetLastWriteTime(file, At.AddMilliseconds(300));
+        var second = ConflictCopies.PathFor(file, At.AddMilliseconds(300));
+        File.Copy(file, second);
+
+        Assert.EndsWith(" (conflicted copy 2026-11-03 175504) (2).txt", second);
+        Assert.Equal(ConflictCopies.MaxNameLength, Path.GetFileName(second).Length);
+        Assert.Equal(second, ConflictCopies.KeptCopyOf(file));
+    }
+
     [Fact]
     public void PathFor_TwoConflictsInTheSameSecond_GetTheirOwnNames()
     {

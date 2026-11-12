@@ -236,7 +236,7 @@ copy changed in the meantime. In that case:
 
 | On the server | Here | What happens |
 | --- | --- | --- |
-| changed | edited, not sent yet | Both are kept. The server's version keeps the name. Your version is saved as `name (conflicted copy 2026-11-03 175504).ext`, using the time of your edit, and that copy is uploaded too. If the remote keeps content hashes and both sides now hold the same content, it's not a conflict: the file is simply in sync. |
+| changed | edited, not sent yet | Both are kept. The server's version keeps the name. Your version is saved as `name (conflicted copy 2026-11-03 175504).ext`, using the time of your edit, and that copy is uploaded too. A name too long for Windows to take the tag is shortened at its end to make room. If the remote keeps content hashes and both sides now hold the same content, it's not a conflict: the file is simply in sync. |
 | deleted | edited, not sent yet | Your file is kept and uploaded again. |
 | folder deleted | files inside edited, not sent yet | Those files and their folders are kept and uploaded again. Everything else in the folder is removed. |
 | changed | deleted | Your delete isn't sent, and the server's version comes back. |

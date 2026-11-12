@@ -9,20 +9,50 @@ public static class ConflictCopies
 {
     public const string Marker = " (conflicted copy ";
 
+    /// <summary>The longest file name Windows allows, in characters.</summary>
+    public const int MaxNameLength = 255;
+
     /// <summary>
     /// The conflict copy's name for <paramref name="fileName"/>: the tag goes
     /// before the extension, or at the end when there is none (".hidden",
     /// "Makefile"). The time is the local copy's modification time, local.
+    /// A name too long to take the tag is cut at its end to make room
+    /// (Nextcloud doesn't, and its copy then can't be made at all).
     /// </summary>
-    public static string Name(string fileName, DateTime modifiedLocal)
+    public static string Name(string fileName, DateTime modifiedLocal) => Name(fileName, modifiedLocal, 1);
+
+    /// <summary>The <paramref name="n"/>th conflict name: " (2)", " (3)"... after the tag.</summary>
+    private static string Name(string fileName, DateTime modifiedLocal, int n)
     {
+        var tag = $"{Marker}{modifiedLocal.ToString("yyyy-MM-dd HHmmss", System.Globalization.CultureInfo.InvariantCulture)})";
+        if (n > 1)
+        {
+            tag += $" ({n})";
+        }
+
         var dot = fileName.LastIndexOf('.');
         if (dot <= 0)
         {
             dot = fileName.Length;
         }
 
-        return fileName.Insert(dot, $"{Marker}{modifiedLocal.ToString("yyyy-MM-dd HHmmss", System.Globalization.CultureInfo.InvariantCulture)})");
+        var stem = fileName[..dot];
+        var extension = fileName[dot..];
+        var room = MaxNameLength - tag.Length - extension.Length;
+        if (room < 1)
+        {
+            // An "extension" that leaves no room is cut like the rest.
+            (stem, extension, room) = (fileName, "", MaxNameLength - tag.Length);
+        }
+
+        if (stem.Length > room)
+        {
+            // Never half a character: a cut inside a surrogate pair takes it whole.
+            var cut = char.IsHighSurrogate(stem[room - 1]) ? room - 1 : room;
+            stem = stem[..cut];
+        }
+
+        return stem + tag + extension;
     }
 
     /// <summary>
@@ -74,12 +104,10 @@ public static class ConflictCopies
     private static IEnumerable<string> Candidates(string localPath, DateTime modifiedLocal)
     {
         var directory = Path.GetDirectoryName(localPath)!;
-        var name = Name(Path.GetFileName(localPath), modifiedLocal);
-        yield return Path.Combine(directory, name);
-        var dot = name.LastIndexOf(')') + 1;
-        for (var n = 2; ; n++)
+        var fileName = Path.GetFileName(localPath);
+        for (var n = 1; ; n++)
         {
-            yield return Path.Combine(directory, name.Insert(dot, $" ({n})"));
+            yield return Path.Combine(directory, Name(fileName, modifiedLocal, n));
         }
     }
 

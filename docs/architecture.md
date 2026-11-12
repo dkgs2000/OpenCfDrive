@@ -348,7 +348,10 @@ server's copy is no longer the one this client last saw.
 
 The conflict copy's name is built the way Nextcloud's
 `Utility::makeConflictFileName` builds it: the tag goes before the extension,
-or at the end of a name without one (`.hidden`, `Makefile`).
+or at the end of a name without one (`.hidden`, `Makefile`). A name too long
+to take the tag within Windows' 255-character limit is cut at its end to make
+room (`ConflictCopies.Name`). Nextcloud doesn't do this, so its copy then
+can't be made at all.
 
 The client notices a conflict in two places:
 
