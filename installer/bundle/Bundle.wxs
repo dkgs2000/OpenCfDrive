@@ -8,7 +8,7 @@
           IconSourceFile="$(var.RepoRoot)assets\opencfdrive.ico">
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
-                                              LicenseUrl="https://unlicense.org/"
+                                              LicenseUrl="https://github.com/dkgs2000/OpenCfDrive/blob/main/LICENSE"
                                               LogoFile="$(var.RepoRoot)assets\logo-64.png" />
     </BootstrapperApplication>
 

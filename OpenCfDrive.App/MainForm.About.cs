@@ -84,7 +84,7 @@ internal sealed partial class MainForm
         }
 
         var legal = Theme.Hint(
-            "OpenCfDrive is public domain software, released under the Unlicense, and comes with no warranty. " +
+            "OpenCfDrive is released under the MIT License and comes with no warranty. " +
             "It works with rclone but isn't part of it.");
         legal.Margin = new Padding(2, 14, 0, 0);
 

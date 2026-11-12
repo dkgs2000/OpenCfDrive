@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/dkgs2000/OpenCfDrive/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/dkgs2000/OpenCfDrive"></a>
   <a href="https://github.com/dkgs2000/OpenCfDrive/actions/workflows/test.yml"><img alt="Tests" src="https://github.com/dkgs2000/OpenCfDrive/actions/workflows/test.yml/badge.svg"></a>
-  <a href="LICENSE"><img alt="License: Unlicense" src="https://img.shields.io/badge/license-Unlicense-blue"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
 </p>
 
 ---
@@ -118,7 +118,7 @@ For tests, the project layout and how releases are made, see the
 
 ## License
 
-OpenCfDrive is public domain software, released under [the Unlicense](LICENSE).
+OpenCfDrive is released under [the MIT License](LICENSE).
 It comes with no warranty. It reads, writes and deletes files on your computer
 and on your remote, so keep backups of anything you can't lose.
 
