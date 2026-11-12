@@ -1,0 +1,41 @@
+# Dependabot version updates: at most one grouped pull request a week per
+# ecosystem, plus one for each major NuGet update. A release has to be a week
+# old before it's proposed: compromised packages are usually found and pulled
+# within days.
+version: 2
+updates:
+  - package-ecosystem: nuget
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      nuget:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # These follow the .NET version the projects target (net10.0), and move
+      # to a new major together with it.
+      - dependency-name: "Microsoft.Data.Sqlite"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "Microsoft.Extensions.*"
+        update-types: ["version-update:semver-major"]
+      # WiX is updated by hand. The SDK's version is in each .wixproj's Sdk
+      # attribute and has to match WixToolset.Bal.wixext, and only the release
+      # workflow builds the installers, so a pull request's CI wouldn't catch
+      # a broken update.
+      - dependency-name: "WixToolset.*"
+
+  - package-ecosystem: github-actions
+    # The workflows, and the composite action in .github/actions.
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
