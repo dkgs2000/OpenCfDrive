@@ -1,6 +1,6 @@
-# Dependabot version updates: at most one grouped pull request a week per
-# ecosystem, plus one for each major NuGet update. A release has to be a week
-# old before it's proposed: compromised packages are usually found and pulled
+# Dependabot version updates: at most one pull request a week per ecosystem,
+# with every update in it, major ones included. A release has to be a week old
+# before it's proposed: compromised packages are usually found and pulled
 # within days.
 version: 2
 updates:
@@ -13,7 +13,6 @@ updates:
     groups:
       nuget:
         patterns: ["*"]
-        update-types: [minor, patch]
     ignore:
       # These follow the .NET version the projects target (net10.0), and move
       # to a new major together with it.
