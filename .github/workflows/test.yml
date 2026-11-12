@@ -15,9 +15,12 @@ on:
 permissions:
   contents: read
 
+# Every push to main is tested to the end, in a group of its own (one group
+# for all of them would cancel a waiting run when the next push comes). On a
+# pull request, a new push cancels the run for the one before.
 concurrency:
-  group: test-${{ github.ref }}
-  cancel-in-progress: true
+  group: test-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'latest' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unit:
