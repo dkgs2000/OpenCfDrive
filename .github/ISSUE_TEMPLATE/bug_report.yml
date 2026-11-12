@@ -1,0 +1,58 @@
+name: Bug report
+description: Something doesn't sync or doesn't work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Most sync problems depend on the server, so the server details matter most.
+
+        For a security problem, please don't use this form: report it privately from the **Security** tab.
+  - type: input
+    id: opencfdrive-version
+    attributes:
+      label: OpenCfDrive version
+      description: Shown at the top of the app's About page.
+      placeholder: "0.4.0"
+    validations:
+      required: true
+  - type: input
+    id: rclone-version
+    attributes:
+      label: rclone version
+      description: Shown on the app's About page, under rclone.
+      placeholder: "v1.75.2"
+    validations:
+      required: true
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 25H2"
+  - type: textarea
+    id: server
+    attributes:
+      label: Server
+      description: |
+        - The server software and its version (for example Nextcloud, `rclone serve webdav`, MinIO, or a cloud service). For `rclone serve`, the full command line.
+        - The storage behind it, if any.
+        - Anything between OpenCfDrive and the server: a reverse proxy, a CDN, a load balancer.
+        - The rclone remote's type (webdav, s3...) and options such as `vendor` or `provider`.
+
+        Leave out passwords, keys and tokens.
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what happened, and what you expected. Steps that make it happen again help most.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        The lines of the sync service log around the problem, from `%LOCALAPPDATA%\OpenCfDrive\logs\OpenCfDrive.log`. Remove any names you don't want public.
+      render: text

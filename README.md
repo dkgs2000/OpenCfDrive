@@ -115,6 +115,7 @@ For tests, the project layout and how releases are made, see the
 | [Development](docs/development.md) | Building and running from source, configuration, project layout, installers, CI and releases |
 | [Testing](docs/testing.md) | Unit, contract and end-to-end tests, and the scenario matrix |
 | [Architecture](docs/architecture.md) | How the drive works on the Cloud Files API, and the rules the code relies on |
+| [Contributing](CONTRIBUTING.md) | Reporting bugs and security problems, what a pull request needs, and the rules every change keeps |
 
 ## License
 
