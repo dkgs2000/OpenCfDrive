@@ -219,17 +219,25 @@ public sealed class CloudPlaceholderService
             return -1;
         }
 
-        // A file that is not fully on disk has no local data to protect, and
-        // a write-access open would download all of it just to drop it. No
-        // handle can hold it meanwhile, so it is checked just before.
+        // A file that is not fully on disk (online-only, or a download that
+        // broke off) is replaced through a handle without data access: a
+        // Cloud Files handle to it, exclusive or not, downloads all of it
+        // first just to drop it.
         if (QueryState(localPath).Partial)
         {
-            if (unchangedFrom is { } before && LocalVersion(localPath) != before)
+            Func<IntPtr, int> replace = handle => UpdateFromRemote(handle, size, modifiedUtc, discardLocalChanges);
+            if (unchangedFrom is not { } before)
             {
-                return ChangedSinceLookedAt;
+                return WithMetadataHandle(localPath, replace);
             }
 
-            return WithMetadataHandle(localPath, handle => UpdateFromRemote(handle, size, modifiedUtc, discardLocalChanges));
+            // Such a file can hold local writes too: a program can write to it
+            // without reading the rest. So it is checked and replaced while a
+            // handle that shares nothing holds it, as a file fully on disk is
+            // (pinned by UpdateFromRemote_UnchangedFrom_RefusesAFileNotFullyOnDiskWhileOpenInAnotherProgram).
+            return WithSoleHandle(
+                localPath,
+                held => LocalVersion(held) == before ? WithMetadataHandle(localPath, replace) : ChangedSinceLookedAt);
         }
 
         if (unchangedFrom is not { } expected)
@@ -370,6 +378,44 @@ public sealed class CloudPlaceholderService
             localPath,
             WRITE_DAC,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            IntPtr.Zero);
+
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return Marshal.GetHRForLastWin32Error();
+        }
+
+        try
+        {
+            return action(handle);
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="action"/> while a handle that shares nothing and
+    /// has no data access holds the file, so nothing is downloaded. It is
+    /// refused while another program has the file open, and while it is held
+    /// another program's open is refused (it does not wait, as for
+    /// <see cref="WithWin32Handle"/>'s exclusive handle: that one comes from
+    /// CfOpenFileWithOplock, which downloads the file). DELETE access is what
+    /// makes the platform check sharing at all: a handle with attribute or
+    /// WRITE_DAC access only, such as <see cref="WithMetadataHandle"/>'s, is
+    /// given whoever has the file open, and is still given while this one is
+    /// held.
+    /// </summary>
+    private static int WithSoleHandle(string localPath, Func<IntPtr, int> action)
+    {
+        var handle = CreateFileW(
+            localPath,
+            DELETE | FILE_READ_ATTRIBUTES,
+            0,
             IntPtr.Zero,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
@@ -769,6 +815,7 @@ public sealed class CloudPlaceholderService
     private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
     private const uint FILE_READ_ATTRIBUTES = 0x00000080;
     private const uint WRITE_DAC = 0x00040000;
+    private const uint DELETE = 0x00010000;
     private const uint FILE_SHARE_READ = 0x00000001;
     private const uint FILE_SHARE_WRITE = 0x00000002;
     private const uint FILE_SHARE_DELETE = 0x00000004;

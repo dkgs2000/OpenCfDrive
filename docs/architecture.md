@@ -261,11 +261,22 @@ The invariants below spell out how.
   protected handle that `CfUpdatePlaceholder` and friends reject with `E_HANDLE`.
   `CloudPlaceholderService.WithWin32Handle` references it and passes
   `CfGetWin32HandleFromProtectedHandle` instead.
-- **Metadata-only updates use a handle without data access.** Opening a
-  placeholder that is not fully on disk with write access makes the platform
-  download all of it first. So a new identity, `MARK_IN_SYNC`, and a server
-  change to a file that is not fully local go through a `WRITE_DAC`-only handle
+- **Metadata-only updates use a handle without data access.** A Cloud Files
+  handle (`CfOpenFileWithOplock`) to a placeholder that is not fully on disk,
+  exclusive or not, with write access or not, makes the platform download all
+  of it first. So a new identity, `MARK_IN_SYNC`, and a server change to a file
+  that is not fully local go through a `WRITE_DAC`-only handle
   (`WithMetadataHandle`), and nothing is downloaded.
+- **A file not fully on disk is held too before a server change replaces it.**
+  It can hold local writes: a program can write to an online-only or partly
+  downloaded file without reading the rest, and nothing is downloaded. The
+  `WRITE_DAC`-only handle keeps no one out, so the file is first held by a plain
+  handle that shares nothing and has `DELETE` access (`WithSoleHandle`), which
+  is what makes Windows check sharing at all. It is refused while another
+  program has the file open, as for a file fully on disk, and the next sync
+  tries again. While it is held, another program's open is refused rather
+  than made to wait (only the Cloud Files handle makes it wait). Nextcloud's
+  handle for these updates has no access at all, so it keeps no one out.
 - **Downloads are streamed in 4 MB chunks.** A `FETCH_DATA` range is handed
   over in several `TRANSFER_DATA` calls (each on a 4 KB boundary), so memory
   use stays at one chunk whatever the file size. A failed download is reported
