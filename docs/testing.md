@@ -28,6 +28,15 @@ build output or in a parent folder (the repository root, for instance), else on
 `PATH`. A test that needs rclone or the Cloud Files API is skipped, with the
 reason, when it's missing.
 
+The contract tests register throwaway drives under
+`%TEMP%\opencfdrive-<test>\<id>` and remove them at the end. A test run that
+crashed leaves its drives registered, and Windows now and then keeps one it was
+asked to remove. So before any test runs, the test assembly removes the drives
+earlier runs left (`LeftoverTestDrives`): only in those folders, and only
+once the folder is gone or untouched for an hour, so a test run going on
+beside it keeps its own. The end-to-end suite's drives and your own are never
+touched.
+
 `MainFormLayoutTests` opens the app's window, unseen, for each state the drive
 can be in (not set up, up to date, syncing, offline, rclone missing, your own
 `rclone rcd`, an update ready, long names). It does so on each screen scale the

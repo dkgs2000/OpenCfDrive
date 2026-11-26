@@ -326,6 +326,11 @@ The invariants below spell out how.
   - Unregistering goes by that id: `GetSyncRootInformationForFolder` throws and
     `GetCurrentSyncRoots` does not list these roots. Registration state is read
     from `HKLM\...\Explorer\SyncRootManager\<id>`.
+  - The shell's `Unregister` now and then returns, or throws "Element not
+    found", while the entry stays: about one in fifty times with several roots
+    registered and removed side by side. So the registrar checks the entry is
+    gone and asks again, up to three times, and says so in its message if it
+    stays.
   - Unregistering must leave an ordinary folder. Neither `CfUnregisterSyncRoot`
     nor the shell's `Unregister` reliably removes placeholders that only exist
     on the server, and orphaned ones can no longer be opened or even deleted
