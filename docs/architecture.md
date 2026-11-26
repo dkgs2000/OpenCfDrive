@@ -268,8 +268,11 @@ The invariants below spell out how.
   that is not fully local go through a `WRITE_DAC`-only handle
   (`WithMetadataHandle`), and nothing is downloaded.
 - **A file not fully on disk is held too before a server change replaces it.**
-  It can hold local writes: a program can write to an online-only or partly
-  downloaded file without reading the rest, and nothing is downloaded. The
+  It holds nothing local: a program's write to it makes Windows download all
+  of it first (see "A read returns once the whole file is downloaded" below).
+  But a program that has it open
+  can have a write waiting for that download, which could land between the
+  check and the replace. The
   `WRITE_DAC`-only handle keeps no one out, so the file is first held by a plain
   handle that shares nothing and has `DELETE` access (`WithSoleHandle`), which
   is what makes Windows check sharing at all. It is refused while another
@@ -300,6 +303,10 @@ The invariants below spell out how.
   on-access scanner (Defender's) that downloads a file when a program opens it
   hid this on a PC; CI runners have it off. Pinned by
   `UpdatePlaceholderContractTest.ARead_ReturnsOnlyOnceTheWholeFileIsHere`.
+  The same goes for writes: a program's write to a file that is not fully on
+  disk makes Windows download all of it first, so such a file holds nothing
+  local (`AWrite_ToAFileNotFullyOnDisk_DownloadsAllOfItFirst`). With
+  `PARTIAL` the write went in with nothing downloaded.
 - **After an upload, one lookup.** The store keeps the server's own size and
   time, which most remotes stamp themselves, so the client reads them back with
   `operations/stat` on that one file, not a listing of its folder.

@@ -231,10 +231,14 @@ public sealed class CloudPlaceholderService
                 return WithMetadataHandle(localPath, replace);
             }
 
-            // Such a file can hold local writes too: a program can write to it
-            // without reading the rest. So it is checked and replaced while a
-            // handle that shares nothing holds it, as a file fully on disk is
-            // (pinned by UpdateFromRemote_UnchangedFrom_RefusesAFileNotFullyOnDiskWhileOpenInAnotherProgram).
+            // Such a file holds nothing local: a program's write makes the
+            // platform download all of it first (FULL hydration, pinned by
+            // AWrite_ToAFileNotFullyOnDisk_DownloadsAllOfItFirst). But a
+            // program that has it open can have a write waiting for that
+            // download, which could land between the check and the replace.
+            // So it is checked and replaced while a handle that shares nothing
+            // holds it, as a file fully on disk is (pinned by
+            // UpdateFromRemote_UnchangedFrom_RefusesAFileNotFullyOnDiskWhileOpenInAnotherProgram).
             return WithSoleHandle(
                 localPath,
                 held => LocalVersion(held) == before ? WithMetadataHandle(localPath, replace) : ChangedSinceLookedAt);
