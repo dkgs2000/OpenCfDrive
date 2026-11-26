@@ -130,7 +130,7 @@ public sealed class SyncRootRegistrar
             IconResource = $"{Environment.ProcessPath ?? "%SystemRoot%\\system32\\imageres.dll"},0",
             // Same policies as the CfRegisterSyncRoot fallback below; see the
             // comments there for why each one is set this way.
-            HydrationPolicy = StorageProviderHydrationPolicy.Partial,
+            HydrationPolicy = StorageProviderHydrationPolicy.Full,
             HydrationPolicyModifier = StorageProviderHydrationPolicyModifier.None,
             PopulationPolicy = StorageProviderPopulationPolicy.Full,
             InSyncPolicy = StorageProviderInSyncPolicy.FileLastWriteTime,
@@ -222,16 +222,24 @@ public sealed class SyncRootRegistrar
             var policies = new CF_SYNC_POLICIES
             {
                 StructSize = (uint)Marshal.SizeOf<CF_SYNC_POLICIES>(),
-                // Partial hydration hydrates on demand (including byte ranges),
-                // and the platform persists what the provider transfers. The
-                // STREAMING_ALLOWED modifier must NOT be set here: it makes the
-                // platform treat hydrated bytes as streamed, discard them when
-                // the handle closes, and keep RECALL_ON_DATA_ACCESS set - which
-                // breaks subsequent reads and every write with
+                // FULL, as Nextcloud (cfapiwrapper.cpp) and OneDrive register:
+                // a program's read returns only once the whole file is on disk
+                // and the platform has finished downloading it. PARTIAL (which
+                // Microsoft documents as not supported, and which runs as
+                // PROGRESSIVE, the default for programs) let a read through as
+                // soon as its bytes arrived and finished a moment later; a
+                // write in between could lose the downloaded bytes, so the
+                // file read back as zeros followed by what was written (pinned
+                // by UpdatePlaceholderContractTest). The platform still
+                // persists what the provider transfers. The STREAMING_ALLOWED
+                // modifier must NOT be set here: it makes the platform treat
+                // hydrated bytes as streamed, discard them when the handle
+                // closes, and keep RECALL_ON_DATA_ACCESS set - which breaks
+                // subsequent reads and every write with
                 // ERROR_CLOUD_FILE_REQUEST_TIMEOUT.
                 Hydration = new CF_HYDRATION_POLICY
                 {
-                    Primary = (ushort)CF_HYDRATION_POLICY_PRIMARY.CF_HYDRATION_POLICY_PARTIAL,
+                    Primary = (ushort)CF_HYDRATION_POLICY_PRIMARY.CF_HYDRATION_POLICY_FULL,
                     Modifier = (ushort)CF_HYDRATION_POLICY_MODIFIER.CF_HYDRATION_POLICY_MODIFIER_NONE,
                 },
                 // FULL: before a directory enumeration completes, the platform
