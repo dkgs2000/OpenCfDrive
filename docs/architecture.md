@@ -280,6 +280,15 @@ The invariants below spell out how.
   when the program runs in session 0 (Windows Installer reading a package).
   The callback log line names that session. Reporting also resets the
   callback's 60 s timeout.
+- **A read returns once the whole file is downloaded** (hydration policy
+  `FULL`, as Nextcloud and OneDrive register). With `PARTIAL`, which Microsoft
+  documents as not supported and which Windows runs as `PROGRESSIVE`, a read
+  was let through as soon as its bytes arrived and Windows finished the
+  download a moment later. A program's write in between could lose the
+  downloaded bytes: the file read back as zeros, then what was written. An
+  on-access scanner (Defender's) that downloads a file when a program opens it
+  hid this on a PC; CI runners have it off. Pinned by
+  `UpdatePlaceholderContractTest.ARead_ReturnsOnlyOnceTheWholeFileIsHere`.
 - **After an upload, one lookup.** The store keeps the server's own size and
   time, which most remotes stamp themselves, so the client reads them back with
   `operations/stat` on that one file, not a listing of its folder.

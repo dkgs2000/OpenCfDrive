@@ -53,6 +53,75 @@ public class UpdatePlaceholderContractTest(ITestOutputHelper output)
         });
     }
 
+    /// <summary>
+    /// A read returns only once the whole file is here: on disk, and no
+    /// longer marked to be downloaded (RECALL_ON_DATA_ACCESS). The drive
+    /// registers FULL hydration, as Nextcloud and OneDrive do. With PARTIAL
+    /// (which Windows runs as PROGRESSIVE) the read was let through as soon
+    /// as its bytes arrived and the download finished a moment later, and a
+    /// write in between could lose the downloaded bytes: the file then read
+    /// back as zeros followed by what was written (seen on CI in the read and
+    /// append above, and in UpdateFromRemote_UnchangedFrom_RefusesAFileSavedSince).
+    /// So that the read itself is what downloads the file, nothing else may
+    /// download it first: an on-access scanner (Defender's, on a PC; CI
+    /// runners have it off) downloads a file when a program opens it for
+    /// reading, and after a write handle to it closes. So the read is through
+    /// a handle opened while the file was still on disk (as a program that
+    /// keeps a file open reads it again), and the file is freed up meanwhile
+    /// through a handle without data access.
+    /// </summary>
+    [SkippableFact]
+    public void ARead_ReturnsOnlyOnceTheWholeFileIsHere()
+    {
+        var content = Encoding.UTF8.GetBytes("old-content");
+
+        RunInSyncRoot(() => content, (syncRoot, placeholders, fetches) =>
+        {
+            var path = Path.Combine(syncRoot, "file.txt");
+            Assert.Equal("old-content", File.ReadAllText(path));
+
+            // One read call, checked at once: a second read (at the end of
+            // the file) gave the platform time to finish.
+            using var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufferSize: 0);
+            var hr = FreeUpWithoutDataAccess(path);
+            Assert.True(CfApi.Succeeded(hr), $"Freeing up space failed with {HResult.Describe(hr)}");
+            Assert.False(CloudPlaceholderService.HasLocalData(path), "Freeing up space left the file on disk.");
+
+            var before = fetches();
+            var buffer = new byte[64];
+            var read = reader.Read(buffer);
+            var finished = CloudPlaceholderService.HasLocalData(path);
+
+            Assert.Equal("old-content", Encoding.UTF8.GetString(buffer, 0, read));
+            Assert.Equal(before + 1, fetches());
+            Assert.True(finished, "The read returned before the platform finished downloading the file.");
+            Assert.False(placeholders.QueryState(path).Partial, "The file is not all on disk after a read of all of it.");
+        });
+    }
+
+    /// <summary>Frees up a file's space through a handle that has no data access (WRITE_DAC), which a scanner does not look at.</summary>
+    private static int FreeUpWithoutDataAccess(string path)
+    {
+        const uint writeDac = 0x00040000;
+        const uint shareAll = 7;
+        const uint openExisting = 3;
+        const uint backupSemantics = 0x02000000;
+        using var handle = CreateFileW(path, writeDac, shareAll, IntPtr.Zero, openExisting, backupSemantics, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            return Marshal.GetHRForLastWin32Error();
+        }
+
+        return CfApi.CfUpdatePlaceholder(
+            handle.DangerousGetHandle(), IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero, 0,
+            CF_UPDATE_FLAGS.CF_UPDATE_FLAG_DEHYDRATE, out _, IntPtr.Zero);
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(
+        string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes,
+        uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
     [SkippableFact]
     public void UpdateFromRemote_DiscardingLocalChanges_ReplacesAnEditedFile()
     {
