@@ -10,6 +10,9 @@
 #
 #   -Backend webdav|s3   which server to run (default webdav)
 #   -Only "C0*"          run only these scenarios
+#   -Coverage            measure which of the service's code the run executes:
+#                        coverage.cobertura.xml in the temp root (see
+#                        docs/testing.md)
 
 param(
     [ValidateSet("webdav", "s3")][string]$Backend = "webdav",
@@ -18,7 +21,8 @@ param(
     [string]$RemoteName = "e2e",
     [int]$RcPort = 0,
     [string]$TempRoot = "",
-    [string]$SummaryLog = ""
+    [string]$SummaryLog = "",
+    [switch]$Coverage
 )
 
 Set-StrictMode -Version Latest
@@ -34,7 +38,8 @@ Invoke-OpenCfDriveE2E `
     -RemoteName $RemoteName `
     -RcPort $RcPort `
     -TempRoot $TempRoot `
-    -SummaryLog $SummaryLog
+    -SummaryLog $SummaryLog `
+    -Coverage:$Coverage
 
 # A failure throws above. Otherwise succeed explicitly, whatever exit code the
 # last native command left in $LASTEXITCODE (see E2E-Run.ps1).

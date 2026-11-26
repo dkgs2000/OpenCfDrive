@@ -23,6 +23,9 @@
 #                        Scenarios that take the server offline are skipped.
 #   -Only "S0*,C11"      run only these scenarios
 #   -SyncRoot / -KeepRegistration   mount elsewhere / leave the mount in place
+#   -Coverage            measure which of the service's code the run executes:
+#                        coverage.cobertura.xml in the temp root (see
+#                        docs/testing.md)
 
 param(
     [ValidateSet("webdav", "s3", "remote")][string]$Backend = "webdav",
@@ -36,7 +39,8 @@ param(
     [int]$RcPort = 0,
     [string]$TempRoot = "",
     [string]$SummaryLog = "",
-    [switch]$KeepRegistration
+    [switch]$KeepRegistration,
+    [switch]$Coverage
 )
 
 Set-StrictMode -Version Latest
@@ -224,7 +228,8 @@ Invoke-OpenCfDriveE2E `
     -TempRoot $TempRoot `
     -SummaryLog $SummaryLog `
     -MountCheck $mountCheck `
-    -KeepRegistration:$KeepRegistration
+    -KeepRegistration:$KeepRegistration `
+    -Coverage:$Coverage
 
 # A failure throws above. Otherwise succeed explicitly: the last native
 # command (the final unregister, with nothing left to clear) leaves a non-zero

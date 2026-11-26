@@ -234,7 +234,9 @@ Two GitHub Actions workflows run on Windows runners:
 - **Test** (`.github/workflows/test.yml`) runs on every push to `main`, every
   pull request, and by hand. It runs the unit and contract tests, and the E2E
   suite in all four combinations (cloud and mock mode, WebDAV and S3), with the
-  servers as local processes. Each job keeps its logs as an artifact. Every
+  servers as local processes. Each job keeps its logs and its code coverage
+  report as an artifact, and a last job shows the coverage of all of them
+  together on the run's page ([Testing](testing.md#code-coverage)). Every
   push to `main` is tested to the end, even when another push follows it, so
   each change there has a run of its own. On a pull request, a new push
   cancels the run for the one before.
@@ -246,8 +248,8 @@ Two GitHub Actions workflows run on Windows runners:
 `.github/actions/setup` installs the .NET SDK and a pinned rclone release for
 both.
 
-Dependabot (`.github/dependabot.yml`) checks the NuGet packages and the
-actions every week, and proposes each kind's updates in one pull request, once
+Dependabot (`.github/dependabot.yml`) checks the NuGet packages (the .NET tool
+in `.config/dotnet-tools.json` with them) and the actions every week, and proposes each kind's updates in one pull request, once
 a release is a week old. WiX and the rclone that CI tests against are updated
 by hand.
 

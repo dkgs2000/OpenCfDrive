@@ -41,7 +41,8 @@ jobs:
         if: always() && hashFiles('TestResults/**/coverage.cobertura.xml') != ''
         shell: powershell
         run: |
-          $summary = .\scripts\tests\Coverage-Summary.ps1 -Path TestResults
+          $summary = .\scripts\tests\Coverage-Summary.ps1 -Path TestResults -Title "Code coverage: unit and contract tests" `
+            -Note 'The Code coverage job adds the end-to-end suite.'
           $summary
           [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ($summary -join "`n") + "`n")
 
@@ -70,6 +71,8 @@ jobs:
         shell: powershell
         run: fltmc filters
 
+      # With code coverage of the service (dotnet-coverage, see
+      # docs/testing.md). The report is kept with the logs.
       - name: Run
         shell: powershell
         env:
@@ -77,7 +80,7 @@ jobs:
           BACKEND: ${{ matrix.backend }}
         run: |
           $script = if ($env:MODE -eq "cloud") { "E2E-Run.ps1" } else { "E2E-Run-Mock.ps1" }
-          & ".\scripts\tests\$script" -Backend $env:BACKEND -TempRoot (Join-Path $env:RUNNER_TEMP "opencfdrive-e2e")
+          & ".\scripts\tests\$script" -Backend $env:BACKEND -TempRoot (Join-Path $env:RUNNER_TEMP "opencfdrive-e2e") -Coverage
 
       - name: Keep the logs
         if: always()
@@ -87,3 +90,30 @@ jobs:
           path: |
             ${{ runner.temp }}/opencfdrive-e2e/*.log
             ${{ runner.temp }}/opencfdrive-e2e/*.err
+            ${{ runner.temp }}/opencfdrive-e2e/coverage.cobertura.xml
+
+  # The unit and end-to-end coverage together on the run's summary page, to
+  # find the code no test runs. Also after a failed job, with the reports the
+  # jobs kept. It only reports: no minimum fails the build.
+  coverage:
+    name: Code coverage
+    needs: [unit, e2e]
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      # The test jobs' checkout path, so the reports' file paths match.
+      - uses: actions/checkout@v7
+
+      # Every artifact of this run, each in a folder of its name.
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Sum up the coverage
+        shell: powershell
+        run: |
+          $summary = .\scripts\tests\Coverage-Summary.ps1 -Title "Code coverage: all tests" `
+            -Path "Unit=artifacts\unit-test-results", "E2E=artifacts\e2e-*"
+          $summary
+          [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ($summary -join "`n") + "`n")
