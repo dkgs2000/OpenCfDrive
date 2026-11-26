@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Code coverage of the end-to-end suite (E2E-Run.ps1 and E2E-Run-Mock.ps1 with
+  -Coverage), measured by Microsoft's dotnet-coverage, the tool pinned in
+  .config\dotnet-tools.json. The scripts instrument the service's own DLLs on
+  disk and run a collector beside it (see E2E-Common.ps1). How to read the
+  report is in docs/testing.md.
+-->
+<Configuration>
+  <CodeCoverage>
+    <!-- Only the DLLs the scripts instrument on disk: the service runs as a
+         plain process, with no profiler attached. -->
+    <EnableStaticManagedInstrumentation>True</EnableStaticManagedInstrumentation>
+    <EnableDynamicManagedInstrumentation>False</EnableDynamicManagedInstrumentation>
+    <!-- Code from source generators (GeneratedRegex, LibraryImport), as in
+         coverage.runsettings. -->
+    <Attributes>
+      <Exclude>
+        <Attribute>^System\.CodeDom\.Compiler\.GeneratedCodeAttribute$</Attribute>
+      </Exclude>
+    </Attributes>
+  </CodeCoverage>
+</Configuration>

@@ -6,13 +6,14 @@ the .NET SDK and rclone, on a developer machine or on CI. None of them needs an
 elevated shell.
 
 - [Unit and contract tests](#unit-and-contract-tests)
-  - [Code coverage](#code-coverage)
 - [End-to-end tests](#end-to-end-tests)
 - [What every run does](#what-every-run-does)
 - [Backend-agnostic by construction](#backend-agnostic-by-construction)
 - [Scenario matrix](#scenario-matrix)
 - [Cloud-only mount checks](#cloud-only-mount-checks)
 - [Where runs keep their files](#where-runs-keep-their-files)
+- [Code coverage](#code-coverage)
+  - [How the end-to-end suite is measured](#how-the-end-to-end-suite-is-measured)
 
 ## Unit and contract tests
 
@@ -37,24 +38,6 @@ have no empty rows, and the activity list keeps some lines. It also checks that
 the spacing follows the screen's scale. To look at the pages yourself, set
 `OPENCFDRIVE_UI_PICTURES` to a folder before `dotnet test`. The tests then save
 a picture of each page there.
-
-### Code coverage
-
-CI measures which lines the unit and contract tests run, with coverlet
-(`coverage.runsettings`), and shows a summary on the test run's page: line and
-branch coverage per assembly, and the files with the most lines no test runs.
-The report itself (`coverage.cobertura.xml`) is in the run's
-`unit-test-results` artifact. To measure it yourself:
-
-```powershell
-dotnet test .\OpenCfDrive.slnx --settings coverage.runsettings
-.\scripts\tests\Coverage-Summary.ps1
-```
-
-Coverage is there to find code that no test runs, and there's no minimum to
-reach. It counts only `dotnet test`: most of the sync engine
-(`CloudSyncEngine`) is tested by the end-to-end suite, which this doesn't
-measure.
 
 ## End-to-end tests
 
@@ -282,9 +265,78 @@ The sync root defaults to `%TEMP%\opencfdrive-e2e[-mock][-s3]\drive` and is
 removed at the end, so the tests never touch your own folders. Pass `-SyncRoot`
 to mount somewhere else, or `-KeepRegistration` to leave the mount in place.
 
-Artifacts (the service log, rclone log and summary) stay in that `%TEMP%`
-folder. The harness only stops rclone processes it started itself, matched by
+Artifacts (the service log, rclone log and summary, and with `-Coverage` the
+coverage report) stay in that `%TEMP%` folder. The harness only stops rclone processes it started itself, matched by
 that folder, never another rclone running on the machine.
 
 On CI, the Test workflow runs the suite in all four combinations and keeps each
 job's logs as an artifact (see [Development](development.md#ci-and-releases)).
+
+## Code coverage
+
+Coverage is there to find code that no test runs. There's no minimum to reach,
+and no percentage fails CI. CI measures it for both kinds of tests:
+
+- **Unit and contract tests:** coverlet (`coverage.runsettings`) counts lines
+  and branches. The job sums them up on the run's page and keeps the report
+  (`coverage.cobertura.xml`) in its `unit-test-results` artifact.
+- **End-to-end suite:** Microsoft's `dotnet-coverage` counts the lines of the
+  service each of the four jobs runs. Each job keeps its report in its
+  `e2e-<mode>-<backend>-logs` artifact.
+
+The **Code coverage** job runs after the others and combines their reports on
+the run's page. For each assembly it shows the lines the unit tests run, the
+lines the end-to-end suite runs, and the lines either runs. Below that come the
+files with the most lines no test runs. A line counts as run if any report ran
+it, so the numbers stay true after a job fails: that job's lines just don't
+count, and the summary names it.
+
+To measure it yourself:
+
+```powershell
+dotnet test .\OpenCfDrive.slnx --settings coverage.runsettings
+.\scripts\tests\Coverage-Summary.ps1
+.\scripts\tests\E2E-Run-Mock.ps1 -Coverage    # or E2E-Run.ps1 -Coverage
+```
+
+An end-to-end run with `-Coverage` prints its own summary at the end and
+leaves its report in its temp folder (`%TEMP%\opencfdrive-e2e-mock` above). To
+combine reports, name a group for each with `Name=`. Each group gets a column,
+and folders give their newest report:
+
+```powershell
+.\scripts\tests\Coverage-Summary.ps1 -Path "Unit=OpenCfDrive.Tests\TestResults", "E2E=$env:TEMP\opencfdrive-e2e*"
+```
+
+The two tools count the same lines, but for about twenty that only Microsoft's
+tool counts: the initial values of auto-properties
+(`{ get; init; } = string.Empty;`) and a few lines of lambdas. Microsoft's
+reports have no branches, so the combined summary shows lines only.
+
+### How the end-to-end suite is measured
+
+The scripts start the service as a process of its own, more than once a run,
+and always end it by killing it, as Uninstall does. A tool that writes what a
+process ran when the process exits, as coverlet does, would get nothing. With
+`-Coverage` the scripts:
+
+1. Get `dotnet-coverage` with `dotnet tool restore`. Its version is pinned in
+   `.config\dotnet-tools.json`, which Dependabot updates like the NuGet
+   packages.
+2. After the build, instrument `OpenCfDrive.Core.dll` and the service's own
+   DLL in its `bin` folder (`dotnet-coverage instrument`), after copying the
+   originals aside. The settings are in `scripts\tests\E2E-Coverage.xml`.
+3. Start a collector in the background (`dotnet-coverage collect
+   --server-mode`). Instrumented code writes what it runs straight into memory
+   it shares with the collector, so a killed process loses nothing. Every
+   service process of the run counts, including the restart and the
+   `--unregister` calls.
+4. At the end, have the collector write `coverage.cobertura.xml`
+   (`dotnet-coverage shutdown`), then put the original DLLs back. If a run is
+   stopped before that, the next build puts them back. Instrumented DLLs still
+   work without a collector, but the service then waits about 10 s at start.
+
+Measuring adds a few seconds to a run: instrumenting and starting the collector
+take about 3 s, and the scenarios run as fast as without it. The scripts turn
+off the tool's usage data (`DOTNET_COVERAGE_TELEMETRY_OPTOUT`). The tool's own
+logs are the `coverage-*.log` files in the temp folder.

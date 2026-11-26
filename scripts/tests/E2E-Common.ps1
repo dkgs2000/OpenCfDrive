@@ -170,15 +170,17 @@ function Remove-IfExists([string]$PathToDelete) {
 
 # Stops what a previous (possibly interrupted) run left behind, and nothing
 # else: the service only when it runs from this checkout's bin folders (never
-# an installed copy, which drives a real folder), and rclone
+# an installed copy, which drives a real folder), rclone
 # only when it uses the harness's own config under %TEMP%\opencfdrive-e2e*
-# (never an rclone GUI or a user's own mount).
+# (never an rclone GUI or a user's own mount), and a coverage collector only
+# when it is one of the harness's sessions (opencfdrive-coverage-*).
 function Stop-StaleProcesses {
     $binRoot = $script:E2ERoot.TrimEnd('\') + '\'
     $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         ($_.Name -in @("OpenCfDrive.Service.exe", "OpenCfDrive.MockService.exe") -and
          "$($_.ExecutablePath)" -like "$binRoot*\bin\*") -or
-        ($_.Name -eq "rclone.exe" -and "$($_.CommandLine)" -like "*opencfdrive-e2e*")
+        ($_.Name -eq "rclone.exe" -and "$($_.CommandLine)" -like "*opencfdrive-e2e*") -or
+        ($_.Name -eq "dotnet.exe" -and "$($_.CommandLine)" -like "*dotnet-coverage*opencfdrive-coverage-*")
     }
     foreach ($process in @($processes)) {
         try { Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop } catch { }
@@ -721,6 +723,110 @@ function Invoke-ServiceUnregister([string]$ServiceExe, [string]$SyncRoot) {
     }
 }
 
+# --- code coverage (-Coverage) --------------------------------------------
+# Which of the service's code a run executes, measured with Microsoft's
+# dotnet-coverage (pinned in .config\dotnet-tools.json, set up in
+# E2E-Coverage.xml). The service's own DLLs are instrumented on disk and a
+# collector runs in the background for the whole run. Instrumented code writes
+# its hits straight into memory it shares with the collector, so they are kept
+# although the service is always killed, never asked to exit: a tool that
+# writes them as the process exits (coverlet) would lose them. Every service
+# process of the run counts, the restart and the unregister calls too. At the
+# end the collector writes coverage.cobertura.xml to the temp root, and the
+# plain DLLs are put back (an interrupted run leaves that to the next build).
+
+$script:E2ECoverage = $null
+
+# Runs `dotnet <arguments>` in the repository, where the tool manifest is, with
+# the output in coverage-<name>.log and .err in the temp root. Not through
+# Invoke-Native: the collector that `collect --background` leaves running gets
+# the output handles, and PowerShell would wait for them to close.
+function Invoke-CoverageTool([string[]]$Arguments, [string]$Name) {
+    $log = Join-Path $script:E2ETempRoot "coverage-$Name.log"
+    $err = Join-Path $script:E2ETempRoot "coverage-$Name.err"
+    $process = Start-Process -FilePath $script:E2EDotnet -ArgumentList $Arguments -WorkingDirectory $script:E2ERoot `
+        -NoNewWindow -PassThru -RedirectStandardOutput $log -RedirectStandardError $err
+    $null = $process.Handle  # without it, Windows PowerShell loses the exit code
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) {
+        throw "dotnet $($Arguments -join ' ') failed (exit $($process.ExitCode)): $(Read-LogText $log) $(Read-LogText $err)"
+    }
+}
+
+function Start-E2ECoverage {
+    param(
+        [Parameter(Mandatory = $true)][string]$BinFolder,
+        [Parameter(Mandatory = $true)][string[]]$Assemblies,
+        [Parameter(Mandatory = $true)][string]$Session
+    )
+
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    # The tool sends usage data unless told not to, and prints a banner.
+    $env:DOTNET_COVERAGE_TELEMETRY_OPTOUT = "1"
+    $env:DOTNET_COVERAGE_NOLOGO = "1"
+    $quote = { param([string]$Text) '"' + $Text + '"' }
+    $settings = & $quote (Join-Path $script:E2ERoot "scripts\tests\E2E-Coverage.xml")
+    $originals = Join-Path $script:E2ETempRoot "coverage-original"
+    New-Item -ItemType Directory -Path $originals -Force | Out-Null
+    $script:E2ECoverage = [pscustomobject]@{
+        Session   = $Session
+        Report    = Join-Path $script:E2ETempRoot "coverage.cobertura.xml"
+        BinFolder = $BinFolder
+        Originals = $originals
+        Started   = $false
+    }
+
+    Invoke-CoverageTool @("tool", "restore") "restore"
+    foreach ($assembly in $Assemblies) {
+        $path = Join-Path $BinFolder $assembly
+        Copy-Item -LiteralPath $path -Destination $originals
+        Invoke-CoverageTool @("tool", "run", "dotnet-coverage", "instrument", (& $quote $path),
+            "--session-id", $Session, "--settings", $settings) "instrument-$([System.IO.Path]::GetFileNameWithoutExtension($assembly))"
+    }
+    Invoke-CoverageTool @("tool", "run", "dotnet-coverage", "collect", "--server-mode", "--background",
+        "--session-id", $Session, "--settings", $settings,
+        "--output", (& $quote $script:E2ECoverage.Report), "--output-format", "cobertura",
+        "--log-file", (& $quote (Join-Path $script:E2ETempRoot "coverage-collector.log")), "--log-level", "Info") "collect"
+    $script:E2ECoverage.Started = $true
+    Write-E2ELog "Code coverage: $($Assemblies -join ', ') instrumented, collector '$Session' running ($($clock.ElapsedMilliseconds) ms)"
+}
+
+# Once every service process has ended: the collector writes the report, and
+# the plain DLLs go back. Never throws: the run's own result is what counts.
+function Stop-E2ECoverage {
+    $coverage = $script:E2ECoverage
+    if ($null -eq $coverage) { return }
+    $script:E2ECoverage = $null
+
+    if ($coverage.Started) {
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            Invoke-CoverageTool @("tool", "run", "dotnet-coverage", "shutdown", $coverage.Session) "shutdown"
+        } catch {
+            Write-E2ELog "Stopping the coverage collector failed: $($_.Exception.Message)"
+        }
+        if (Test-Path -LiteralPath $coverage.Report) {
+            Write-E2ELog "Coverage report: $($coverage.Report) ($($clock.ElapsedMilliseconds) ms)"
+            try {
+                & (Join-Path $script:E2ERoot "scripts\tests\Coverage-Summary.ps1") -Path $coverage.Report `
+                    -Title "Code coverage of this run" -Top 10 | ForEach-Object { Write-Host $_ }
+            } catch {
+                Write-E2ELog "Summing up the coverage failed: $($_.Exception.Message)"
+            }
+        } else {
+            Write-E2ELog "No coverage report was written; see the coverage-*.log files in the temp root."
+        }
+    }
+
+    foreach ($original in @(Get-ChildItem -LiteralPath $coverage.Originals -File -ErrorAction SilentlyContinue)) {
+        try {
+            Copy-Item -LiteralPath $original.FullName -Destination $coverage.BinFolder -Force -ErrorAction Stop
+        } catch {
+            Write-E2ELog "Could not put back the plain $($original.Name), the next build will: $($_.Exception.Message)"
+        }
+    }
+}
+
 # --- the single end-to-end flow ------------------------------------------
 
 function Invoke-OpenCfDriveE2E {
@@ -739,7 +845,9 @@ function Invoke-OpenCfDriveE2E {
         [string]$SummaryLog = "",
         [scriptblock]$MountCheck = $null,
         [string]$Only = "",
-        [switch]$KeepRegistration
+        [switch]$KeepRegistration,
+        # Measure which of the service's code the run executes (see Start-E2ECoverage).
+        [switch]$Coverage
     )
 
     $isCloud = $Mode -eq "cloud"
@@ -799,6 +907,7 @@ function Invoke-OpenCfDriveE2E {
         Write-E2ELog "Building solution"
         $dotnet = (Get-Command dotnet -ErrorAction SilentlyContinue).Source
         if (-not $dotnet) { $dotnet = Join-Path $env:ProgramFiles "dotnet\dotnet.exe" }
+        $script:E2EDotnet = $dotnet
         $build = Invoke-Native -FilePath $dotnet `
             -Arguments @("build", (Join-Path $script:E2ERoot "OpenCfDrive.slnx"), "-nologo", "-v:m") `
             -PassThruOutput
@@ -830,6 +939,15 @@ function Invoke-OpenCfDriveE2E {
 
         $script:E2ESummaryLog = $SummaryLog
         "OpenCfDrive $Mode/$Backend E2E summary" | Set-Content -Path $SummaryLog -Encoding UTF8
+
+        # --- code coverage (-Coverage) ---------------------------------------
+        # From here on every start of the service runs instrumented code. The
+        # tool keeps its files in %TEMP%\<session> and clears that folder, so
+        # the session's name is never one of the run's folders.
+        if ($Coverage) {
+            Start-E2ECoverage -BinFolder (Split-Path -Parent $serviceExe) `
+                -Assemblies @("OpenCfDrive.Core.dll", "$serviceDir.dll") -Session "opencfdrive-coverage-$Mode-$Backend"
+        }
 
         # --- state reset ---------------------------------------------------
         # Engine state lives outside the sync root and is reset so every run
@@ -1095,6 +1213,10 @@ function Invoke-OpenCfDriveE2E {
         if ($isCloud -and -not $KeepRegistration -and (Test-Path $serviceExe)) {
             Invoke-ServiceUnregister -ServiceExe $serviceExe -SyncRoot $SyncRoot
         }
+
+        # The DLLs go back only once the service has let go of them.
+        if ($null -ne $proc) { [void]$proc.WaitForExit(10000) }
+        Stop-E2ECoverage
 
         if ($null -ne $rcloneRc -and -not $rcloneRc.HasExited) {
             try {
