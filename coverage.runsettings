@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Code coverage for the unit and contract tests, measured by coverlet (the
+  coverlet.collector package in OpenCfDrive.Tests). Given to dotnet test as
+  its settings file, it writes TestResults\<id>\coverage.cobertura.xml. The
+  command, and how to read the report, are in docs/testing.md.
+-->
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat code coverage">
+        <Configuration>
+          <Format>cobertura</Format>
+          <!-- The project's own assemblies (the app's is plain OpenCfDrive),
+               not the libraries they use. The test assembly itself is left
+               out by default. -->
+          <Include>[OpenCfDrive]*,[OpenCfDrive.*]*</Include>
+          <!-- Code from source generators (GeneratedRegex, LibraryImport). -->
+          <ExcludeByAttribute>GeneratedCodeAttribute</ExcludeByAttribute>
+          <SkipAutoProps>true</SkipAutoProps>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>

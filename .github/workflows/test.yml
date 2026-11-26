@@ -31,9 +31,19 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
 
+      # With code coverage (coverage.runsettings), summed up on the run's
+      # summary page. The report itself is kept with the results.
       - name: Test
         shell: powershell
-        run: dotnet test OpenCfDrive.slnx --logger trx --results-directory TestResults
+        run: dotnet test OpenCfDrive.slnx --settings coverage.runsettings --logger trx --results-directory TestResults
+
+      - name: Sum up the coverage
+        if: always() && hashFiles('TestResults/**/coverage.cobertura.xml') != ''
+        shell: powershell
+        run: |
+          $summary = .\scripts\tests\Coverage-Summary.ps1 -Path TestResults
+          $summary
+          [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ($summary -join "`n") + "`n")
 
       - name: Keep the results
         if: always()

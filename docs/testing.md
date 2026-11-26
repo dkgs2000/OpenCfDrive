@@ -6,6 +6,7 @@ the .NET SDK and rclone, on a developer machine or on CI. None of them needs an
 elevated shell.
 
 - [Unit and contract tests](#unit-and-contract-tests)
+  - [Code coverage](#code-coverage)
 - [End-to-end tests](#end-to-end-tests)
 - [What every run does](#what-every-run-does)
 - [Backend-agnostic by construction](#backend-agnostic-by-construction)
@@ -36,6 +37,24 @@ have no empty rows, and the activity list keeps some lines. It also checks that
 the spacing follows the screen's scale. To look at the pages yourself, set
 `OPENCFDRIVE_UI_PICTURES` to a folder before `dotnet test`. The tests then save
 a picture of each page there.
+
+### Code coverage
+
+CI measures which lines the unit and contract tests run, with coverlet
+(`coverage.runsettings`), and shows a summary on the test run's page: line and
+branch coverage per assembly, and the files with the most lines no test runs.
+The report itself (`coverage.cobertura.xml`) is in the run's
+`unit-test-results` artifact. To measure it yourself:
+
+```powershell
+dotnet test .\OpenCfDrive.slnx --settings coverage.runsettings
+.\scripts\tests\Coverage-Summary.ps1
+```
+
+Coverage is there to find code that no test runs, and there's no minimum to
+reach. It counts only `dotnet test`: most of the sync engine
+(`CloudSyncEngine`) is tested by the end-to-end suite, which this doesn't
+measure.
 
 ## End-to-end tests
 
