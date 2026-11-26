@@ -112,11 +112,13 @@ $mountCheck = {
 
     # The hydrated bytes must be kept: if the placeholder is still marked for
     # recall afterwards, every later read and any write will hit cfapi timeouts.
-    # Windows lets the read through as soon as its bytes arrive and clears the
-    # mark a moment later (on CI the read has returned first), so wait for it.
-    if (-not (Wait-ForAttributes $beta { -not (& $isDehydrated $beta) })) {
+    # And the read returns only once Windows has finished the download (FULL
+    # hydration, see SyncRootRegistrar), so the mark is already gone: a write
+    # right after a read must not race the download's last step, which could
+    # lose the downloaded bytes.
+    if (& $isDehydrated $beta) {
         $after = (Get-Item -LiteralPath $beta -Force).Attributes
-        throw "beta.txt is still dehydrated after a successful read (attributes: $after); hydration is not persisting."
+        throw "beta.txt is still marked to be downloaded right after a read returned it (attributes: $after); the read was let through before the download finished, or hydration is not persisting."
     }
     Write-E2ELog "MOUNT: beta.txt is locally available (attributes: $((Get-Item -LiteralPath $beta -Force).Attributes))"
 
