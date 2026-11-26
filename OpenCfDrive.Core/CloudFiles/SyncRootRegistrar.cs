@@ -323,19 +323,7 @@ public sealed class SyncRootRegistrar
         var hr = CfApi.CfUnregisterSyncRoot(syncRootPath);
         var wasRegistered = CfApi.Succeeded(hr) || shellRegistered;
 
-        var shellRemoved = false;
-        if (shellRegistered)
-        {
-            try
-            {
-                StorageProviderSyncRootManager.Unregister(shellId);
-                shellRemoved = true;
-            }
-            catch (Exception)
-            {
-                shellRemoved = !IsShellRegistered(shellId);
-            }
-        }
+        var shellRemoved = shellRegistered && UnregisterFromShell(shellId);
 
         var cleaned = 0;
         if (Directory.Exists(syncRootPath) && ContainsPlaceholders(syncRootPath) &&
@@ -354,8 +342,47 @@ public sealed class SyncRootRegistrar
             message += $" Removed {cleaned} online-only placeholder(s) left in the folder.";
         }
 
+        if (shellRegistered && !shellRemoved)
+        {
+            message += $" Its Explorer entry ('{shellId}') could not be removed.";
+        }
+
         return new RegistrationResult(success, hr, message, ShellIntegrated: shellRemoved);
     }
+
+    /// <summary>
+    /// Removes a drive's Explorer entry and makes sure it is gone.
+    /// StorageProviderSyncRootManager.Unregister now and then returns, or
+    /// throws "Element not found", while the entry stays: about one in fifty
+    /// times with several drives registered and removed side by side (the
+    /// contract tests). Asked again, it removes it.
+    /// </summary>
+    public static bool UnregisterFromShell(string shellId) =>
+        UnregisterFromShell(shellId, StorageProviderSyncRootManager.Unregister, IsShellRegistered);
+
+    internal static bool UnregisterFromShell(string shellId, Action<string> unregister, Func<string, bool> isRegistered)
+    {
+        for (var attempt = 1; attempt <= ShellUnregisterAttempts; attempt++)
+        {
+            try
+            {
+                unregister(shellId);
+            }
+            catch (Exception)
+            {
+                // Whether it is gone is what counts, checked below.
+            }
+
+            if (!isRegistered(shellId))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private const int ShellUnregisterAttempts = 3;
 
     private const System.IO.FileAttributes RecallOnDataAccessAttribute = (System.IO.FileAttributes)0x00400000;
 

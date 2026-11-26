@@ -402,6 +402,62 @@ public class UpdatePlaceholderContractTest(ITestOutputHelper output)
         });
     }
 
+    /// <summary>
+    /// A file that is not fully on disk (online-only, or a download that broke
+    /// off) can hold local writes too: a program can write to it without
+    /// reading the rest, and nothing is downloaded. Replacing it is refused
+    /// while another program has it open, as for a file that is fully on
+    /// disk, and it downloads nothing either way.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void UpdateFromRemote_UnchangedFrom_RefusesAFileNotFullyOnDiskWhileOpenInAnotherProgram(bool brokenOff)
+    {
+        var content = new byte[1024 * 1024];
+        Random.Shared.NextBytes(content);
+        var limit = long.MaxValue;
+
+        RunInSyncRoot(() => content, deliverAtMost: () => limit, test: (syncRoot, placeholders, fetches) =>
+        {
+            var path = Path.Combine(syncRoot, "file.txt");
+            if (brokenOff)
+            {
+                limit = 64 * 1024;
+                Assert.ThrowsAny<IOException>(() => File.ReadAllBytes(path));
+                limit = long.MaxValue;
+            }
+
+            var edit = Encoding.UTF8.GetBytes("-edited");
+            var before = fetches();
+            using (var program = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+            {
+                program.Seek(0, SeekOrigin.End);
+                program.Write(edit);
+                program.Flush();
+                Assert.True(placeholders.QueryState(path).Partial, "Writing to the file downloaded all of it.");
+                var looked = CloudPlaceholderService.LocalVersion(path)!.Value;
+
+                var inUse = placeholders.UpdateFromRemote(path, content.Length, DateTimeOffset.UtcNow, discardLocalChanges: true, unchangedFrom: looked);
+                output.WriteLine($"open in another program -> {HResult.Describe(inUse)}");
+                Assert.Equal(SharingViolation, inUse);
+                Assert.Equal(looked, CloudPlaceholderService.LocalVersion(path));
+            }
+
+            Assert.Equal(before, fetches());
+            Assert.Equal(content.Length + edit.Length, new FileInfo(path).Length);
+            Assert.True(CloudPlaceholderService.GetOnDiskSize(path) > 0, "The local write is gone.");
+
+            var hr = placeholders.UpdateFromRemote(path, content.Length, DateTimeOffset.UtcNow, discardLocalChanges: true, unchangedFrom: CloudPlaceholderService.LocalVersion(path));
+            output.WriteLine($"no longer open -> {HResult.Describe(hr)}, fetches {fetches() - before}");
+            Assert.True(CfApi.Succeeded(hr), $"UpdateFromRemote failed with {HResult.Describe(hr)}");
+            Assert.Equal(before, fetches());
+            Assert.Equal(content.Length, new FileInfo(path).Length);
+            Assert.Equal(0, CloudPlaceholderService.GetOnDiskSize(path));
+            Assert.True(placeholders.QueryState(path).InSync, "UpdateFromRemote did not leave the file in sync.");
+        });
+    }
+
     [SkippableTheory]
     [InlineData(true)]
     [InlineData(false)]
