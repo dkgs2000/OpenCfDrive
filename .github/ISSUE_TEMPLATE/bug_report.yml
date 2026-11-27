@@ -20,7 +20,7 @@ body:
     id: rclone-version
     attributes:
       label: rclone version
-      description: Shown on the app's About page, under rclone.
+      description: Shown on the app's About page, under Credits.
       placeholder: "v1.75.2"
     validations:
       required: true

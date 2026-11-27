@@ -18,4 +18,7 @@ internal static class AppVersion
     /// <summary>The GitHub repository (owner/name) the build updates from, or null.</summary>
     public static string? UpdateRepository =>
         App.GetCustomAttributes<AssemblyMetadataAttribute>().FirstOrDefault(a => a.Key == "UpdateRepository")?.Value;
+
+    /// <summary>The project's page on GitHub: the repository the build updates from, else the project's own.</summary>
+    public static string ProjectPage => $"https://github.com/{(string.IsNullOrWhiteSpace(UpdateRepository) ? "dkgs2000/OpenCfDrive" : UpdateRepository)}";
 }

@@ -5,8 +5,8 @@ using OpenCfDrive.Core.Storage;
 namespace OpenCfDrive.App;
 
 /// <summary>
-/// The Settings page: the drive (its remote and folder), how rclone runs,
-/// and the app's own choices. Changes wait for Save, which checks them and
+/// The Settings page: the drive (its remote and folder), the app's own
+/// choices, and how rclone runs. Changes wait for Save, which checks them and
 /// carries them out; the fields only show what rclone has to say about a
 /// choice before it is saved.
 /// </summary>
@@ -127,7 +127,8 @@ internal sealed partial class MainForm
         _autoUpdateHint.Margin = new Padding(20, 0, 0, 2); // under the box's text
         _overrides.Visible = false;
 
-        Add(column, Heading("Drive"), drive, Heading("rclone"), rclone, Heading("General"), general, _overrides);
+        // What most people change first; rclone, which most leave as it is, last.
+        Add(column, Heading("Drive"), drive, Heading("General"), general, Heading("rclone"), rclone, _overrides);
 
         // Save stays in view below the fields.
         _footer = new TableLayoutPanel

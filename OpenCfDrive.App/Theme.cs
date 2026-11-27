@@ -65,6 +65,7 @@ internal static class Theme
     public const string SyncGlyph = "";
     public const string SettingsGlyph = "";
     public const string InfoGlyph = "";
+    public const string RepairGlyph = "";
 
     public static Label Heading(string text, Font font) => new()
     {

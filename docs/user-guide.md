@@ -131,7 +131,7 @@ the state and what it's doing, for example "Sending 3 changes and downloading
   that keeps failing isn't announced again for 30 minutes. Click the
   notification to open the app, whose Recent activity has the details.
 
-The window has three pages, listed on its left. The drive's state icon and
+The window has four pages, listed on its left. The drive's state icon and
 remote sit at the top of the list. The window opens as big as its pages need
 on the screen where you clicked the icon. You can make it smaller: text wraps
 and pages scroll.
@@ -141,29 +141,39 @@ and pages scroll.
 - **How the drive is doing,** with the icon's picture, a sentence on what
   it's doing, and buttons to open the drive folder and to start, stop or
   restart syncing. Before a remote is chosen, or when rclone can't be found,
-  a button takes you to Settings. An update ready to install shows above it.
+  a button takes you to Settings; when something is wrong, another takes you
+  to Troubleshooting. An update ready to install shows above it.
 - **Drive:** the folder, the remote, what kind of storage it is and where it
   points (for example `s3 (AWS), region eu-west-1` or
-  `crypt over gdrive:secret`), and the space used and free, if the server
-  reports it. It never shows passwords, keys or tokens.
+  `crypt over gdrive:secret`), the space used and free, if the server
+  reports it, how many items the drive tracks and how much it has downloaded.
+  It never shows passwords, keys or tokens.
 - **Recent activity:** uploads, downloads, deletes and warnings, newest first.
   Point at a line to read all of it.
 
 **Settings** holds the settings below. Changes take effect when you press
 **Save**; **Discard changes** puts back what's saved.
 
-**About** shows:
+**Troubleshooting** shows:
 
-- **The version,** whether it's up to date, and the buttons to check for
-  updates and install one.
-- **Sync service:** whether it's running and since when, its version, whether
-  the drive is registered with Explorer and connected, how many items it
-  tracks, and how much it has downloaded.
+- **Sync service:** whether it's running and since when, its version, and
+  whether the drive is registered with Explorer and connected.
 - **rclone:** who runs it, which `rclone.exe` and version, where it listens,
   whether it's running (or being restarted, and why), and whether the chosen
   remote is in rclone's config.
 - **Logs and settings:** where the service's log, rclone's log and the
   settings file are, with buttons to open them.
+- **Report a problem,** which opens a new issue on GitHub.
+
+**About** shows:
+
+- **The version,** with links to the project on GitHub, its release notes and
+  this guide.
+- **Updates:** whether the version is up to date, and the buttons to check for
+  updates and install one.
+- **Credits:** rclone (and the version this PC runs), .NET, SQLite and
+  C#/WinRT, with their licenses and the full third-party notices.
+- **The license:** OpenCfDrive's MIT License.
 
 ## Settings
 
