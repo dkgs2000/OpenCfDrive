@@ -33,6 +33,14 @@ public sealed class SyncScheduler : IDisposable
     /// </summary>
     public const string RelistVariable = "OPENCFDRIVE_RELIST_SECONDS";
 
+    /// <summary>
+    /// The longest time a setting in seconds gives; a larger number comes out
+    /// as this. Far longer than any wait that is of use, and still one a timer
+    /// takes and that can be added to the clock: a number past what a TimeSpan
+    /// holds, or "Infinity", stopped the service as it started.
+    /// </summary>
+    public static readonly TimeSpan LongestConfigured = TimeSpan.FromDays(30);
+
     private readonly Func<bool, CancellationToken, Task> _run;
     private readonly ITimer _timer;
     private readonly ITimer _localTimer;
@@ -57,16 +65,20 @@ public sealed class SyncScheduler : IDisposable
     public TimeSpan Interval { get; }
 
     /// <summary>The interval from <see cref="IntervalVariable"/>, else the default.</summary>
-    public static TimeSpan ConfiguredInterval() =>
-        double.TryParse(Environment.GetEnvironmentVariable(IntervalVariable), System.Globalization.CultureInfo.InvariantCulture, out var seconds) && seconds > 0
-            ? TimeSpan.FromSeconds(seconds)
-            : DefaultInterval;
+    public static TimeSpan ConfiguredInterval() => SecondsFrom(IntervalVariable) ?? DefaultInterval;
 
     /// <summary>The relist age from <see cref="RelistVariable"/>, else the interval.</summary>
-    public static TimeSpan ConfiguredRelistAge() =>
-        double.TryParse(Environment.GetEnvironmentVariable(RelistVariable), System.Globalization.CultureInfo.InvariantCulture, out var seconds) && seconds >= 0
-            ? TimeSpan.FromSeconds(seconds)
-            : ConfiguredInterval();
+    public static TimeSpan ConfiguredRelistAge() => SecondsFrom(RelistVariable, zeroToo: true) ?? ConfiguredInterval();
+
+    /// <summary>
+    /// The time a variable gives in seconds, at most <see cref="LongestConfigured"/>;
+    /// null when it holds no number above zero (with <paramref name="zeroToo"/>, zero counts).
+    /// </summary>
+    internal static TimeSpan? SecondsFrom(string variable, bool zeroToo = false) =>
+        double.TryParse(Environment.GetEnvironmentVariable(variable), System.Globalization.CultureInfo.InvariantCulture, out var seconds) &&
+        (seconds > 0 || (zeroToo && seconds == 0))
+            ? TimeSpan.FromSeconds(Math.Min(seconds, LongestConfigured.TotalSeconds))
+            : null;
 
     /// <summary>The first full run, at once.</summary>
     public void Start() => _ = SyncNowAsync();

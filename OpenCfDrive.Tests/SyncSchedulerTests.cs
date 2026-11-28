@@ -224,6 +224,48 @@ public sealed class SyncSchedulerTests : IDisposable
         }
     }
 
+    /// <summary>Such a number stopped the service as it started: no TimeSpan holds it.</summary>
+    [Theory]
+    [InlineData("1e12")]
+    [InlineData("Infinity")]
+    public void AnIntervalNoTimeSpanHolds_IsTheLongestASettingGives(string value)
+    {
+        var before = Environment.GetEnvironmentVariable(SyncScheduler.IntervalVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(SyncScheduler.IntervalVariable, value);
+            Assert.Equal(SyncScheduler.LongestConfigured, SyncScheduler.ConfiguredInterval());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SyncScheduler.IntervalVariable, before);
+        }
+    }
+
+    [Fact]
+    public void TheRelistAge_CanBeZero_AndIsTheIntervalWhenNotSet()
+    {
+        var interval = Environment.GetEnvironmentVariable(SyncScheduler.IntervalVariable);
+        var relist = Environment.GetEnvironmentVariable(SyncScheduler.RelistVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(SyncScheduler.IntervalVariable, "7");
+            Environment.SetEnvironmentVariable(SyncScheduler.RelistVariable, "0");
+            Assert.Equal(TimeSpan.Zero, SyncScheduler.ConfiguredRelistAge());
+
+            Environment.SetEnvironmentVariable(SyncScheduler.RelistVariable, "-1");
+            Assert.Equal(TimeSpan.FromSeconds(7), SyncScheduler.ConfiguredRelistAge());
+
+            Environment.SetEnvironmentVariable(SyncScheduler.RelistVariable, null);
+            Assert.Equal(TimeSpan.FromSeconds(7), SyncScheduler.ConfiguredRelistAge());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SyncScheduler.IntervalVariable, interval);
+            Environment.SetEnvironmentVariable(SyncScheduler.RelistVariable, relist);
+        }
+    }
+
     public void Dispose()
     {
         _scheduler.Dispose();

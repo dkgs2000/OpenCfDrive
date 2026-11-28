@@ -9,10 +9,11 @@ namespace OpenCfDrive.App;
 /// <summary>
 /// The window the notification area icon opens, laid out as Windows 11's
 /// Settings and OneDrive's settings window are: a navigation pane with the
-/// drive's state and remote, and three pages. Status says how the drive is
+/// drive's state and remote, and four pages. Status says how the drive is
 /// doing and what it did lately; Settings chooses what it syncs with and how
-/// rclone runs; About has the version and updates, what the sync service and
-/// rclone report, and the logs. Closing it only hides it; the icon stays.
+/// rclone runs; Troubleshooting has what the sync service and rclone report,
+/// and the logs; About has the version and updates, the project's links, and
+/// the credits. Closing it only hides it; the icon stays.
 /// </summary>
 /// <remarks>
 /// No size in it is fixed. Text wraps to the width there is, cards grow with
@@ -40,6 +41,7 @@ internal sealed partial class MainForm : Form
 
     private readonly NavItem _statusNav = new("Status", Theme.SyncGlyph);
     private readonly NavItem _settingsNav = new("Settings", Theme.SettingsGlyph);
+    private readonly NavItem _troubleshootingNav = new("Troubleshooting", Theme.RepairGlyph);
     private readonly NavItem _aboutNav = new("About", Theme.InfoGlyph);
     private readonly PictureBox _driveIcon = new() { SizeMode = PictureBoxSizeMode.AutoSize, Margin = new Padding(0, 2, 10, 0) };
     private readonly Label _driveName = new() { Text = "OpenCfDrive", AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 1), UseMnemonic = false };
@@ -49,6 +51,7 @@ internal sealed partial class MainForm : Form
 
     private Panel _statusPage = null!;
     private Panel _settingsPage = null!;
+    private Panel _troubleshootingPage = null!;
     private Panel _aboutPage = null!;
     private DriveSnapshot? _snapshot;
     private string? _busy;
@@ -74,6 +77,7 @@ internal sealed partial class MainForm : Form
 
         _pages.Controls.Add(BuildStatusPage());
         _pages.Controls.Add(BuildSettingsPage());
+        _pages.Controls.Add(BuildTroubleshootingPage());
         _pages.Controls.Add(BuildAboutPage());
         BuildNav();
         Controls.Add(_pages);
@@ -123,7 +127,7 @@ internal sealed partial class MainForm : Form
         drive.Controls.Add(_driveName, 1, 0);
         drive.Controls.Add(_driveRemote, 1, 1);
 
-        Control[] rows = [drive, _statusNav, _settingsNav, _aboutNav];
+        Control[] rows = [drive, .. NavItems];
         _nav.RowCount = rows.Length + 1;
         foreach (var row in rows)
         {
@@ -133,14 +137,20 @@ internal sealed partial class MainForm : Form
 
         _nav.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
-        _statusNav.CheckedChanged += (_, _) => ShowPage();
-        _settingsNav.CheckedChanged += (_, _) => ShowPage();
-        _aboutNav.CheckedChanged += (_, _) => ShowPage();
+        foreach (var item in NavItems)
+        {
+            item.CheckedChanged += (_, _) => ShowPage();
+        }
     }
+
+    /// <summary>The pages in the navigation pane, in its order.</summary>
+    private NavItem[] NavItems => [_statusNav, _settingsNav, _troubleshootingNav, _aboutNav];
+
+    private Panel[] Pages => [_statusPage, _settingsPage, _troubleshootingPage, _aboutPage];
 
     private void ShowPage()
     {
-        var page = _settingsNav.Checked ? _settingsPage : _aboutNav.Checked ? _aboutPage : _statusPage;
+        var page = Pages[Math.Max(0, Array.FindIndex(NavItems, i => i.Checked))];
         _pages.SuspendLayout();
         foreach (Control other in _pages.Controls)
         {
@@ -165,7 +175,7 @@ internal sealed partial class MainForm : Form
         _metrics = (DeviceDpi, Font.Height);
         using var batch = Theme.OneLayout(this);
         var glyphs = Theme.Icons(Font);
-        foreach (var item in new[] { _statusNav, _settingsNav, _aboutNav })
+        foreach (var item in NavItems)
         {
             item.GlyphFont?.Dispose();
             item.GlyphFont = glyphs is null ? null : (Font)glyphs.Clone();
@@ -175,11 +185,11 @@ internal sealed partial class MainForm : Form
         glyphs?.Dispose();
 
         // Wide enough for the longest page name, and for a remote's name.
-        var items = new[] { _statusNav, _settingsNav, _aboutNav }.Max(i => i.GetPreferredSize(Size.Empty).Width);
+        var items = NavItems.Max(i => i.GetPreferredSize(Size.Empty).Width);
         _nav.Width = Math.Max(items, Font.Height * 10) + _nav.Padding.Horizontal;
 
         // Measured in this screen's pixels, so after the window scaled what it holds.
-        foreach (var page in new Control[] { _statusPage, _settingsPage, _aboutPage })
+        foreach (var page in Pages)
         {
             Theme.LineUpCaptions(page);
         }
@@ -288,6 +298,8 @@ internal sealed partial class MainForm : Form
 
     public void ShowSettingsPage() => _settingsNav.Checked = true;
 
+    public void ShowTroubleshootingPage() => _troubleshootingNav.Checked = true;
+
     /// <summary>Marks a start, stop or save in progress (or none).</summary>
     public void ShowBusy(string? what)
     {
@@ -308,6 +320,7 @@ internal sealed partial class MainForm : Form
         _tips.SetToolTip(_driveRemote, remote);
         ShowIndicator(snapshot);
         ShowStatus(snapshot);
+        ShowTroubleshooting(snapshot);
         ShowAbout(snapshot);
         ShowSettingsState(snapshot);
     }

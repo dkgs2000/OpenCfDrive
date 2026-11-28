@@ -89,7 +89,10 @@ set.
 | Start at sign-in | `StartAtSignIn` | | on for the installed app |
 | Check for updates | `CheckForUpdates` | | on |
 | Background sync interval | | `OPENCFDRIVE_REMOTE_POLL_SECONDS` | 30 s |
+| Longest wait between two listings of a folder whose listing does not change | | `OPENCFDRIVE_REMOTE_POLL_MAX_SECONDS` | 30 min |
 | Age at which a folder holding nothing local is marked to be listed on its next opening | | `OPENCFDRIVE_RELIST_SECONDS` | the sync interval |
+
+The three in seconds give at most 30 days: a larger number counts as that.
 
 `OPENCFDRIVE_SETTINGS` points both the app and the service at another
 settings file.

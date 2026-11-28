@@ -39,9 +39,10 @@ SQLite state in %LOCALAPPDATA%\OpenCfDrive\state
   and runs the background sync. It starts and supervises its own `rclone rcd`,
   unless the user runs one.
 - **`OpenCfDrive.App`** is the notification area app. It edits the settings,
-  starts and stops the service, shows its status over a named pipe, and
-  updates itself. Its icon shows the drive's state, which the service sends
-  over the same pipe as it changes (see [The notification area icon](#the-notification-area-icon)).
+  starts and stops the service, shows its status and asks it to sync now
+  over a named pipe, and updates itself. Its icon shows the drive's state,
+  which the service sends over the same pipe as it changes (see
+  [The notification area icon](#the-notification-area-icon)).
 - **`OpenCfDrive.Core`** holds everything shared: the interop, the sync
   engine, the rclone clients, the store and the settings.
 
@@ -58,7 +59,8 @@ folder on demand.
   time each folder is opened. Nothing is crawled.
 - A folder once listed stays fully populated until the poll interval passes.
   The background sync keeps it current: a folder that holds anything local is
-  listed every run; an online-only folder (nothing downloaded or kept in it)
+  listed by its runs, every run while it changes and less and less often
+  while it does not; an online-only folder (nothing downloaded or kept in it)
   is not re-listed - it is left for the next time it is opened, and once it is
   older than the poll interval it is marked for on-demand population again.
   Sync runs happen at start, right after the server is back, and on request.
@@ -101,7 +103,26 @@ The invariants below spell out how.
   is back, and one on the service's `sync` control request. A run first sends
   the deletes and renames kept from an offline spell, then lists the listed
   folders (the platform keeps that state on disk) one at a time, parents
-  first, never recursively. A folder that holds nothing local is online-only:
+  first, never recursively. Not all of them at every run. Nextcloud asks its
+  server for one ETag and stops when that has not changed; a plain WebDAV
+  server has no folder ETags (and no folder time that changes with what is
+  below it), so nothing short of listing a folder says whether it changed.
+  Listing every folder at every run is a request per folder every 30 s for
+  good, which a drive with many downloaded folders turns into a constant
+  stream. So each folder has its own wait (`FolderPollSchedule`): one whose
+  listing comes back the same waits twice as long as before, from the poll
+  interval up to 30 min (`OPENCFDRIVE_REMOTE_POLL_MAX_SECONDS`), each wait
+  spread by a tenth either way; one whose listing changed, or that still has
+  something to apply, or that is used here (a local change, a download),
+  waits one interval again. "The same" is a fingerprint of the listing: each
+  item's name, kind, size, time and hash, but not a folder's own time, which
+  rclone reports as the time of the listing on remotes that keep none. The
+  top folder is listed at every run. The `sync` request and coming back
+  online list every folder; a restart does too (the waits are kept in
+  memory). A folder the server answers "not found" for was deleted or renamed
+  there, or a folder above it was, and those above may not be due for a
+  while: they are listed at once, nearest first, until one is found, and its
+  listing removes what is gone. A folder that holds nothing local is online-only:
   it is not listed every run; once it is older than the poll interval it is
   given on-demand population again, and Windows lists it from the server when
   it is next opened. Folders never opened are not listed until they are. The
@@ -481,7 +502,10 @@ move exist on only some remotes, so they aren't used either.
   watcher.
 - Files added, changed or deleted on the remote show up in folders already
   opened within 30 s (the next background sync run), as with Nextcloud - but
-  only for folders that hold something local, which the sync lists every run.
+  only for folders that hold something local, and only while such a folder
+  keeps changing or is used here. One that has been quiet is listed less and
+  less often, so a change there can take up to 30 min to show (the price of a
+  server that cannot say cheaply that nothing changed).
   A purely online-only folder picks up server changes when it is next opened
   after the relist age (the poll interval; `OPENCFDRIVE_RELIST_SECONDS`
   overrides it): a sync run then marks it, and its next opening, F5 included,
@@ -490,8 +514,9 @@ move exist on only some remotes, so they aren't used either.
   indexer never brings the per-folder listings back. Folders never opened are
   listed when they are, and are empty while the server can't be reached.
 - The background sync lists every folder that was ever opened, one at a time,
-  every 30 s - but only while the folder holds something local (a downloaded,
-  kept or edited file, a pinned folder, or the root). A folder holding only
+  every 30 s at most - but only while the folder holds something local (a
+  downloaded, kept or edited file, a pinned folder, or the root), and less
+  and less often while its listing does not change. A folder holding only
   online-only placeholders is not re-listed; it is marked for on-demand
   population once the relist age passes, and listed from the server when
   opened. Which folders hold something local is worked out once per run, in

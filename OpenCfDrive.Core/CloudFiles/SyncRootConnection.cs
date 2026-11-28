@@ -48,7 +48,7 @@ public sealed class SyncRootConnection : IDisposable
     /// up but cannot reach the server, and it keeps retrying; without a limit
     /// the shell would wait for the platform's 60 s timeout and show an error.
     /// </summary>
-    internal static readonly TimeSpan ListingTimeout = TimeSpan.FromSeconds(10);
+    public static readonly TimeSpan ListingTimeout = TimeSpan.FromSeconds(10);
 
     /// <summary>A listing answered without the server this slowly is logged.</summary>
     private static readonly TimeSpan SlowAnswer = TimeSpan.FromSeconds(1);

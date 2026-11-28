@@ -80,6 +80,28 @@ public sealed class MainFormLayoutTests
         Assert.True(problems.Count == 0, string.Join(Environment.NewLine, problems.Distinct()));
     });
 
+    [Theory]
+    [InlineData(1240, 37, "1,240 folders kept current; 37 to check in the next minute")]
+    [InlineData(1, 1, "1 folder kept current; 1 to check in the next minute")]
+    [InlineData(0, 0, "-")] // it has not looked at the server yet
+    public void TheStatusPage_SaysHowManyFoldersTheServerIsAskedAbout(int kept, int soon, string expected)
+    {
+        var culture = System.Globalization.CultureInfo.CurrentCulture;
+        System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+        try
+        {
+            var status = new ServiceStatus(1, DateTimeOffset.Now, "1.0", @"C:\drive", "box:", "", ServiceState.Syncing, "", true, true, 0, 0, "", [],
+                FoldersKeptCurrent: kept, FoldersDueSoon: soon);
+
+            Assert.Equal(expected, MainForm.ServerChecksText(status));
+            Assert.Equal("-", MainForm.ServerChecksText(null));
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = culture;
+        }
+    }
+
     [Fact]
     public void TheWindow_FitsTheScreen_AndIsBiggerThanItsSmallest() => Sta.Run(() =>
     {
@@ -129,6 +151,56 @@ public sealed class MainFormLayoutTests
             Assert.InRange(caption.Margin.Right, (int)(16 * scale) - 1, (int)(16 * scale) + 1);
             Assert.InRange(form.Font.Height, (int)(15 * scale), (int)(17 * scale) + 1);
         }
+    });
+
+    /// <summary>
+    /// "Sync now" shows for a running drive. It can be pressed once the drive
+    /// is connected, offline too (asking then tries the server again), and
+    /// says that the server is being checked while it is.
+    /// </summary>
+    [Fact]
+    public void SyncNow_IsOfferedForAConnectedDrive_AndSaysWhileItChecks() => Sta.Run(() =>
+    {
+        static (bool Shown, bool Enabled, string Text) SyncNow(FakeApp app)
+        {
+            using var form = new MainForm(app) { Opacity = 0 };
+            form.PlaceOn(Screen.PrimaryScreen!);
+            form.ShowSnapshot(app.Latest!);
+            form.Show();
+            Application.DoEvents();
+            var button = Descendants(form).OfType<Button>().Single(b => b.Text is "Sync now" or "Checking the server...");
+            return (button.Visible, button.Enabled, button.Text);
+        }
+
+        Assert.Equal((true, true, "Sync now"), SyncNow(Samples.App("up to date")));
+        Assert.Equal((true, true, "Sync now"), SyncNow(Samples.App("offline")));
+        Assert.Equal((true, false, "Checking the server..."), SyncNow(Samples.App("checking the server")));
+        Assert.False(SyncNow(Samples.App("not set up")).Shown);
+        Assert.False(SyncNow(Samples.App("rclone not found")).Shown);
+
+        // Still starting: it looks at the server by itself as soon as it has.
+        var running = Samples.App("up to date");
+        var starting = running.Latest! with { Status = running.Latest!.Status! with { State = ServiceState.Starting } };
+        Assert.Equal((true, false, "Sync now"), SyncNow(new FakeApp(starting, running.UpdateStatus)));
+    });
+
+    /// <summary>
+    /// A running drive with a problem (its rclone stopped) offers what a
+    /// running drive has, "Sync now" among it, and "Troubleshoot" after it.
+    /// </summary>
+    [Fact]
+    public void ARunningDriveWithAProblem_OffersSyncNowAndTroubleshoot() => Sta.Run(() =>
+    {
+        var app = Samples.App("rclone stopped");
+        using var form = new MainForm(app) { Opacity = 0 };
+        form.PlaceOn(Screen.PrimaryScreen!);
+        form.ShowSnapshot(app.Latest!);
+        form.Show();
+        Application.DoEvents();
+
+        var row = Descendants(form).OfType<Button>().Single(b => b.Text == "Sync now").Parent!;
+        var offered = row.Controls.Cast<Control>().Where(c => c.Visible).Select(c => c.Text);
+        Assert.Equal(["Open folder", "Sync now", "Stop syncing", "Restart", "Troubleshoot"], offered);
     });
 
     /// <summary>A screen of each scale the PC has.</summary>
@@ -266,6 +338,7 @@ public sealed class MainFormLayoutTests
         public static readonly string[] Names =
         [
             "not set up", "up to date", "syncing", "offline", "rclone not found", "own rclone", "update ready", "long names",
+            "checking the server", "rclone stopped",
         ];
 
         private const string Root = @"C:\Users\someone\OpenCfDrive";
@@ -307,7 +380,7 @@ public sealed class MainFormLayoutTests
             {
                 "syncing" => new SyncActivity(Sending: 3, Downloading: 1),
                 "offline" => new SyncActivity(Waiting: 2),
-                "up to date" or "update ready" or "long names" => SyncActivity.None,
+                "up to date" or "update ready" or "long names" or "checking the server" => SyncActivity.None,
                 _ => new SyncActivity(Failing: 1),
             };
             var status = running
@@ -330,11 +403,17 @@ public sealed class MainFormLayoutTests
                     RecentActivity: Activity(state == "long names" ? 0 : 40),
                     Rclone: own
                         ? new RcloneStatus(false, DriveSettingsFile.DefaultRcUrl, null, null, "v1.75.2", null, "Running", "rclone v1.75.2 answers.", null)
-                        : new RcloneStatus(true, "http://127.0.0.1:24858", @"C:\Users\someone\AppData\Local\OpenCfDrive\rclone\rclone.exe",
-                            nameof(RcloneSource.Downloaded), "v1.75.2", 5151, "Running", "rclone v1.75.2 runs (process 5151).",
-                            @"C:\Users\someone\AppData\Local\OpenCfDrive\logs\rclone.log"),
+                        : state == "rclone stopped" // the service runs, its rclone does not: a running drive with a problem
+                            ? new RcloneStatus(true, "http://127.0.0.1:24858", @"C:\Users\someone\AppData\Local\OpenCfDrive\rclone\rclone.exe",
+                                nameof(RcloneSource.Downloaded), "v1.75.2", null, "Restarting", "rclone stopped (exit code 1). Starting it again in 30 s.",
+                                @"C:\Users\someone\AppData\Local\OpenCfDrive\logs\rclone.log")
+                            : new RcloneStatus(true, "http://127.0.0.1:24858", @"C:\Users\someone\AppData\Local\OpenCfDrive\rclone\rclone.exe",
+                                nameof(RcloneSource.Downloaded), "v1.75.2", 5151, "Running", "rclone v1.75.2 runs (process 5151).",
+                                @"C:\Users\someone\AppData\Local\OpenCfDrive\logs\rclone.log"),
                     Activity: activity,
-                    Revision: 3)
+                    Revision: 3,
+                    FoldersKeptCurrent: 1240,
+                    FoldersDueSoon: 37)
                 : null;
 
             var update = state == "update ready"
@@ -342,7 +421,10 @@ public sealed class MainFormLayoutTests
                     "https://github.com/owner/name/releases/tag/v1.4.0", DateTimeOffset.Now)
                 : new UpdateStatus(UpdateStage.UpToDate, "You have the latest version.", CheckedAt: DateTimeOffset.Now);
 
-            return new FakeApp(new DriveSnapshot(saved, null, settings, running, status, rclone, info), update);
+            return new FakeApp(new DriveSnapshot(saved, null, settings, running, status, rclone, info), update)
+            {
+                Checking = state == "checking the server", // a "Sync now" under way
+            };
         }
 
         private static List<ActivityEntry> Activity(int count) => Enumerable.Range(0, count)
@@ -361,6 +443,8 @@ public sealed class MainFormLayoutTests
 
         public bool Busy => false;
 
+        public bool Checking { get; init; }
+
         public Version CurrentVersion { get; } = new(1, 3, 0);
 
         public UpdateStatus UpdateStatus { get; } = update;
@@ -374,6 +458,8 @@ public sealed class MainFormLayoutTests
         public Task StopAsync() => Task.CompletedTask;
 
         public Task RestartAsync() => Task.CompletedTask;
+
+        public Task SyncNowAsync() => Task.CompletedTask;
 
         public Task<string?> ApplySettingsAsync(DriveSettings settings, DriveChange change) => Task.FromResult<string?>(null);
 

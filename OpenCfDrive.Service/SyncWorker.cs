@@ -96,7 +96,8 @@ public sealed class SyncWorker(
             lifetime.StopApplication,
             message => logger.LogInformation("{Message}", message),
             syncNow: () => _engine?.SyncNowAsync() ?? Task.CompletedTask,
-            pulse: BuildPulse);
+            pulse: BuildPulse,
+            scheduledSync: () => _engine?.ScheduledSyncAsync() ?? Task.CompletedTask);
         _control.Start();
 
         var endpoint = await ConnectRcloneAsync(settings, stoppingToken).ConfigureAwait(false);
@@ -296,7 +297,9 @@ public sealed class SyncWorker(
             _problems.Count,
             _problems.Recent(),
             _engine?.Activity ?? SyncActivity.None,
-            revision);
+            revision,
+            _engine?.FoldersKeptCurrent ?? 0,
+            _engine?.FoldersDueWithin(TimeSpan.FromMinutes(1)) ?? 0);
     }
 
     private static string Version =>

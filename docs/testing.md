@@ -22,7 +22,7 @@ dotnet test .\OpenCfDrive.slnx
 ```
 
 `OpenCfDrive.Tests` covers the interop layout, the SQLite store, settings, the
-sync scheduler, conflict copies, the updater, the app's window, and contract
+sync scheduler, how often each folder is listed, conflict copies, the updater, the app's window, and contract
 tests against the real Cloud Files API and a real rclone. The tests find `rclone.exe` next to the
 build output or in a parent folder (the repository root, for instance), else on
 `PATH`. A test that needs rclone or the Cloud Files API is skipped, with the
@@ -135,6 +135,15 @@ run, through the service's `sync` control request, which is answered once the
 run has finished. So each scenario sees exactly the server calls it caused. The
 30 s schedule itself is unit-tested (`SyncSchedulerTests`).
 
+That request lists every folder the client keeps current. The timer's own runs
+list only those that are due: a folder whose listing came back the same waits
+longer each time. How long, what brings a folder back, and what a run does
+about a folder the server no longer has are unit-tested against a server that
+counts what it is asked (`FolderPollScheduleTests`). The `sync-scheduled`
+control request starts a run as the timer does, so a scenario can show that
+such a run leaves an unchanged folder alone (S36); with the E2E's interval of
+a day no folder listed before is due.
+
 ## Scenario matrix
 
 **Two ways to save.** Programs save a file in one of two ways, and the
@@ -144,7 +153,7 @@ leaves a plain file. Others, Notepad among them, write into the same file,
 which stays a placeholder whose size Windows keeps a record of. The edit
 scenarios below are run both ways where the two take different paths.
 
-**Server side (`S01`–`S35`, cloud mode only).** Another app changes the server.
+**Server side (`S01`–`S36`, cloud mode only).** Another app changes the server.
 The scenario then has the client run its background sync, lists the folder as
 Explorer does, and expects the local side to match:
 
@@ -226,6 +235,9 @@ drive, after which the server is expected to match:
   online-only folder to be listed when next opened, and opening it shows what
   the server changed meanwhile (the E2E sets `OPENCFDRIVE_RELIST_SECONDS=0`,
   so every run marks them)
+- a scheduled sync run does not list again a folder holding a downloaded file
+  whose listing did not change, and a server change there waits; "sync now"
+  lists it and brings the change (S36)
 - Explorer item states cover waiting to upload (cleared after a successful
   upload), conflict copy (kept after it is uploaded), and a failed sync. A file
   that only came from the server never gets one

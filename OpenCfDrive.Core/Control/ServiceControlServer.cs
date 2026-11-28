@@ -13,13 +13,14 @@ public sealed class ServiceControlServer : IAsyncDisposable
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(5);
 
     /// <summary>How long a sync request may take before it is answered anyway.</summary>
-    private static readonly TimeSpan SyncTimeout = TimeSpan.FromMinutes(5);
+    internal static readonly TimeSpan SyncTimeout = TimeSpan.FromMinutes(5);
 
     private readonly string _pipeName;
     private readonly Func<ServiceStatus> _getStatus;
     private readonly Action _requestStop;
     private readonly Action<string>? _log;
     private readonly Func<Task>? _syncNow;
+    private readonly Func<Task>? _scheduledSync;
     private readonly Func<ServicePulse>? _pulse;
     private readonly List<SemaphoreSlim> _watchers = [];
     private readonly CancellationTokenSource _stopping = new();
@@ -27,19 +28,22 @@ public sealed class ServiceControlServer : IAsyncDisposable
 
     /// <param name="syncNow">A sync run with the server; the request is answered when it has finished.</param>
     /// <param name="pulse">What a watching app is sent, at once and after each <see cref="NotifyChanged"/>.</param>
+    /// <param name="scheduledSync">A sync run as the interval starts one; answered when it has finished.</param>
     public ServiceControlServer(
         string pipeName,
         Func<ServiceStatus> getStatus,
         Action requestStop,
         Action<string>? log = null,
         Func<Task>? syncNow = null,
-        Func<ServicePulse>? pulse = null)
+        Func<ServicePulse>? pulse = null,
+        Func<Task>? scheduledSync = null)
     {
         _pipeName = pipeName;
         _getStatus = getStatus;
         _requestStop = requestStop;
         _log = log;
         _syncNow = syncNow;
+        _scheduledSync = scheduledSync;
         _pulse = pulse;
     }
 
@@ -93,6 +97,12 @@ public sealed class ServiceControlServer : IAsyncDisposable
         }
     }
 
+    /// <summary>The sync run a request asks for, or null for any other request.</summary>
+    private Func<Task>? SyncFor(string? request) =>
+        string.Equals(request, ServiceControl.SyncRequest, StringComparison.OrdinalIgnoreCase) ? _syncNow
+        : string.Equals(request, ServiceControl.ScheduledSyncRequest, StringComparison.OrdinalIgnoreCase) ? _scheduledSync
+        : null;
+
     private async Task HandleAsync(NamedPipeServerStream pipe)
     {
         await using var _ = pipe;
@@ -119,10 +129,10 @@ public sealed class ServiceControlServer : IAsyncDisposable
             {
                 answer = JsonSerializer.Serialize(_getStatus(), ServiceControl.Json);
             }
-            else if (string.Equals(request, ServiceControl.SyncRequest, StringComparison.OrdinalIgnoreCase) && _syncNow is not null)
+            else if (SyncFor(request) is { } sync)
             {
                 // Answered once the run has finished, so the client can wait on it.
-                var run = _syncNow();
+                var run = sync();
                 var finished = await Task.WhenAny(run, Task.Delay(SyncTimeout, _stopping.Token)).ConfigureAwait(false) == run;
                 answer = finished && run.IsCompletedSuccessfully ? """{"synced":true}""" : """{"synced":false}""";
             }

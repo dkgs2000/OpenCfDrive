@@ -7,7 +7,8 @@ namespace OpenCfDrive.Core.Control;
 
 /// <summary>
 /// How the app reaches a running service: a named pipe per drive that only
-/// the same user can open. A request is one line ("status", "stop", "sync"),
+/// the same user can open. A request is one line ("status", "stop", "sync",
+/// "sync-scheduled"),
 /// the answer one line of JSON; "watch" is answered with a line at every
 /// change, as long as the connection stays open.
 /// </summary>
@@ -19,8 +20,29 @@ public static class ServiceControl
     /// <summary>Look at the server now; answered once that sync run has finished.</summary>
     public const string SyncRequest = "sync";
 
+    /// <summary>
+    /// A sync run as the interval starts one: only the folders that are due
+    /// are asked about (see FolderPollSchedule), where "sync" asks about all.
+    /// For scripts and tests; answered once the run has finished.
+    /// </summary>
+    public const string ScheduledSyncRequest = "sync-scheduled";
+
     /// <summary>A <see cref="ServicePulse"/> line now and at every change, until either side leaves.</summary>
     public const string WatchRequest = "watch";
+
+    /// <summary>
+    /// How long to give <see cref="RequestSyncAsync"/>: a little more than the
+    /// service lets a sync run take before it answers anyway, so that its own
+    /// answer comes first.
+    /// </summary>
+    public static readonly TimeSpan SyncRequestTimeout = ServiceControlServer.SyncTimeout + TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// How long a sync request waits for the service to take its connection.
+    /// A running service takes it at once, so no service is known long before
+    /// the time a sync run is given.
+    /// </summary>
+    private static readonly TimeSpan SyncConnectTimeout = TimeSpan.FromSeconds(5);
 
     internal static readonly JsonSerializerOptions Json = new()
     {
@@ -87,6 +109,37 @@ public static class ServiceControl
         await SendAsync(PipeName(syncRoot), StopRequest, timeout, cancellationToken).ConfigureAwait(false) is not null;
 
     /// <summary>
+    /// Asks the service to look at the server now, and waits for that sync
+    /// run; true once it has finished. False when no service answers, the run
+    /// failed, the service stopped meanwhile, or the run took longer than
+    /// <paramref name="timeout"/> (within <see cref="SyncRequestTimeout"/>
+    /// the service answers either way). A run that finished says nothing
+    /// about the server: a drive that could not reach it is offline, as its
+    /// status says.
+    /// </summary>
+    public static async Task<bool> RequestSyncAsync(
+        string syncRoot, TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        var answer = await SendAsync(PipeName(syncRoot), SyncRequest, timeout, cancellationToken, SyncConnectTimeout).ConfigureAwait(false);
+        if (answer is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var parsed = JsonDocument.Parse(answer);
+            return parsed.RootElement.ValueKind == JsonValueKind.Object &&
+                   parsed.RootElement.TryGetProperty("synced", out var synced) &&
+                   synced.ValueKind == JsonValueKind.True;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Watches the service: <paramref name="pulse"/> gets what it says at
     /// once, then each change, on the thread that read it. Returns once the
     /// service stops or is gone, or <paramref name="cancellationToken"/> is
@@ -142,8 +195,13 @@ public static class ServiceControl
         return any;
     }
 
+    /// <param name="timeout">For all of it: connecting, asking and the answer.</param>
+    /// <param name="connectTimeout">
+    /// For connecting alone, when the answer may take long: without a
+    /// service, connecting goes on trying for as long as it is given.
+    /// </param>
     internal static async Task<string?> SendAsync(
-        string pipeName, string request, TimeSpan timeout, CancellationToken cancellationToken)
+        string pipeName, string request, TimeSpan timeout, CancellationToken cancellationToken, TimeSpan? connectTimeout = null)
     {
         using var timer = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timer.CancelAfter(timeout);
@@ -151,7 +209,11 @@ public static class ServiceControl
         {
             await using var pipe = new NamedPipeClientStream(
                 ".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-            await pipe.ConnectAsync(timer.Token).ConfigureAwait(false);
+            using (var connecting = CancellationTokenSource.CreateLinkedTokenSource(timer.Token))
+            {
+                connecting.CancelAfter(connectTimeout ?? timeout);
+                await pipe.ConnectAsync(connecting.Token).ConfigureAwait(false);
+            }
 
             await using var writer = new StreamWriter(pipe, leaveOpen: true) { AutoFlush = true };
             await writer.WriteLineAsync(request.AsMemory(), timer.Token).ConfigureAwait(false);

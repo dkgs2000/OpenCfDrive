@@ -118,7 +118,8 @@ the state and what it's doing, for example "Sending 3 changes and downloading
 | Grey | Not set up yet: choose your remote in Settings. |
 
 - **Click the icon** to open the app.
-- **The icon's menu** opens the drive folder, starts, stops or restarts
+- **The icon's menu** opens the drive folder, checks the server at once
+  (**Sync now**, described under Status below), starts, stops or restarts
   syncing, and shows the log.
 - **Closing the window** only hides it. **Exit** in the icon's menu closes the
   app, and syncing carries on in the background.
@@ -131,7 +132,7 @@ the state and what it's doing, for example "Sending 3 changes and downloading
   that keeps failing isn't announced again for 30 minutes. Click the
   notification to open the app, whose Recent activity has the details.
 
-The window has three pages, listed on its left. The drive's state icon and
+The window has four pages, listed on its left. The drive's state icon and
 remote sit at the top of the list. The window opens as big as its pages need
 on the screen where you clicked the icon. You can make it smaller: text wraps
 and pages scroll.
@@ -139,31 +140,57 @@ and pages scroll.
 **Status** shows:
 
 - **How the drive is doing,** with the icon's picture, a sentence on what
-  it's doing, and buttons to open the drive folder and to start, stop or
+  it's doing, and buttons to open the drive folder, to check the server at
+  once (**Sync now**, described below), and to start, stop or
   restart syncing. Before a remote is chosen, or when rclone can't be found,
-  a button takes you to Settings. An update ready to install shows above it.
+  a button takes you to Settings; when something is wrong, another takes you
+  to Troubleshooting. An update ready to install shows above it.
 - **Drive:** the folder, the remote, what kind of storage it is and where it
   points (for example `s3 (AWS), region eu-west-1` or
-  `crypt over gdrive:secret`), and the space used and free, if the server
-  reports it. It never shows passwords, keys or tokens.
+  `crypt over gdrive:secret`), the space used and free, if the server
+  reports it, how many items the drive tracks and how much it has downloaded,
+  and how many folders it asks the server about in the background (those
+  holding something on this computer), with how many of them are due in the
+  next minute.
+  It never shows passwords, keys or tokens.
 - **Recent activity:** uploads, downloads, deletes and warnings, newest first.
   Point at a line to read all of it.
+
+**Sync now**, on the Status page and in the icon's menu, makes the drive send
+your changes and ask the server about every folder it keeps up to date, right
+away instead of at their next turn. Use it when you know something changed on
+the server and don't want to wait. You can press it while the sync service
+runs and the drive is connected. While it works, the button and the menu say
+**Checking the server...**, and so does the icon when you point at it; you can
+still stop syncing meanwhile. When it's done, what changed on the server shows
+in the folders and under Recent activity. If the server can't be reached, the
+drive goes offline and a notification says why, also when it was offline
+already: pressing **Sync now** then tries the server again at once. If the
+check itself couldn't finish, a message says so.
 
 **Settings** holds the settings below. Changes take effect when you press
 **Save**; **Discard changes** puts back what's saved.
 
-**About** shows:
+**Troubleshooting** shows:
 
-- **The version,** whether it's up to date, and the buttons to check for
-  updates and install one.
-- **Sync service:** whether it's running and since when, its version, whether
-  the drive is registered with Explorer and connected, how many items it
-  tracks, and how much it has downloaded.
+- **Sync service:** whether it's running and since when, its version, and
+  whether the drive is registered with Explorer and connected.
 - **rclone:** who runs it, which `rclone.exe` and version, where it listens,
   whether it's running (or being restarted, and why), and whether the chosen
   remote is in rclone's config.
 - **Logs and settings:** where the service's log, rclone's log and the
   settings file are, with buttons to open them.
+- **Report a problem,** which opens a new issue on GitHub.
+
+**About** shows:
+
+- **The version,** with links to the project on GitHub, its release notes and
+  this guide.
+- **Updates:** whether the version is up to date, and the buttons to check for
+  updates and install one.
+- **Credits:** rclone (and the version this PC runs), .NET, SQLite and
+  C#/WinRT, with their licenses and the full third-party notices.
+- **The license:** OpenCfDrive's MIT License.
 
 ## Settings
 
@@ -194,8 +221,15 @@ already downloaded.
 - **The server is the source of truth.** The first time you open a folder,
   OpenCfDrive lists it from the server. A folder that holds something local
   (a downloaded, kept or edited file, or a pinned folder) is then kept up to
-  date in the background, every 30 seconds and right after the server comes
-  back from being offline. An online-only folder - one whose files have not
+  date in the background, and right after the server comes back from being
+  offline. It is checked every 30 seconds while it keeps changing or you work
+  in it. Each time a check finds nothing new, the next one comes twice as
+  late, up to every 30 minutes, so a drive with many downloaded folders does
+  not question the server all day; a change there, or your own change or
+  download in it, brings it back to every 30 seconds. So a change someone
+  else makes in a folder that has been quiet can take up to 30 minutes to
+  show here, unless you press **Sync now** (above), which asks about all of
+  them right away. An online-only folder - one whose files have not
   been downloaded - is not re-listed every 30 seconds. Once 30 seconds have
   passed since it was last listed, the next time you open it OpenCfDrive
   lists it from the server, so it shows what changed there meanwhile.
@@ -320,14 +354,16 @@ sync service ends, and OpenCfDrive restarts it if it stops on its own.
   normal local files. Their edits are still uploaded. Windows can't turn an
   existing file into an online-only one.
 - **Pressing F5 in Explorer.** In a folder with something local in it, it
-  doesn't ask the server sooner: changes from the server arrive within 30
-  seconds anyway. In an online-only folder, F5 lists the folder from the
+  doesn't ask the server sooner: changes from the server arrive on their own,
+  within 30 seconds in a folder that is in use and within 30 minutes in one
+  that has been quiet. In an online-only folder, F5 lists the folder from the
   server once 30 seconds have passed since it was last listed; before that, it
   shows the same listing.
 - **Many opened folders do not mean many listings.** Only folders that hold
   something local (a downloaded, kept or edited file, or a pinned folder) are
-  listed every 30 seconds. Online-only folders are listed when you open them,
-  so opening many folders does not drive up per-folder polling.
+  listed in the background, and those that do not change less and less often
+  (see above). Online-only folders are listed when you open them, so opening
+  many folders does not drive up per-folder polling.
 - **On S3 and other bucket stores**, an empty folder exists only on this
   computer until you put a file in it, because those stores have no real
   folders.
