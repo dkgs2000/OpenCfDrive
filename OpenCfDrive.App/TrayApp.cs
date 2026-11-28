@@ -17,12 +17,20 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
     private static readonly TimeSpan VisibleRefresh = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan HiddenRefresh = TimeSpan.FromSeconds(15);
 
+    /// <summary>
+    /// How long an offline drive is given to say that the server answers
+    /// again, after a "Sync now" had it try: a little more than the service
+    /// gives the server (its check is a listing of the drive's top folder).
+    /// </summary>
+    private static readonly TimeSpan BackOnlineWait = SyncRootConnection.ListingTimeout + TimeSpan.FromSeconds(2);
+
     private readonly SingleInstance _instance;
     private readonly SynchronizationContext _ui;
     private readonly NotifyIcon _tray;
     private readonly ContextMenuStrip _menu;
     private readonly ToolStripMenuItem _headline;
     private readonly ToolStripMenuItem _openFolder;
+    private readonly ToolStripMenuItem _syncNow;
     private readonly ToolStripMenuItem _start;
     private readonly ToolStripMenuItem _stop;
     private readonly ToolStripMenuItem _restart;
@@ -40,6 +48,8 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
     private Action? _balloonClicked;
     private bool _watching;
     private bool _busy;
+    private bool _checking;
+    private int _actions;
     private bool _exiting;
 
     public TrayApp(SingleInstance instance, bool showWindow)
@@ -52,6 +62,7 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
         {
             Font = new Font(SystemFonts.MenuFont ?? Control.DefaultFont, FontStyle.Bold),
         };
+        _syncNow = new ToolStripMenuItem(SyncNowText, null, async (_, _) => await SyncNowAsync());
         _start = new ToolStripMenuItem("Start syncing", null, async (_, _) => await StartAsync());
         _stop = new ToolStripMenuItem("Stop syncing", null, async (_, _) => await StopAsync());
         _restart = new ToolStripMenuItem("Restart syncing", null, async (_, _) => await RestartAsync());
@@ -64,7 +75,7 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
         [
             _headline, new ToolStripSeparator(),
             _openFolder, openWindow, new ToolStripSeparator(),
-            _start, _stop, _restart, new ToolStripSeparator(),
+            _syncNow, _start, _stop, _restart, new ToolStripSeparator(),
             openLog, _installUpdate, _exit,
         ]);
         _menu.Opening += (_, _) => UpdateMenu();
@@ -118,6 +129,14 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
     public Updater Updates { get; }
 
     public bool Busy => _busy;
+
+    public bool Checking => _checking;
+
+    /// <summary>What "Sync now" is called, in the menu and on the window's button.</summary>
+    public const string SyncNowText = "Sync now";
+
+    /// <summary>What it says instead while the service looks at the server.</summary>
+    public const string CheckingText = "Checking the server...";
 
     public DriveSnapshot? Latest => Monitor.Latest;
 
@@ -200,7 +219,8 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
     /// <summary>
     /// The icon for the drive's state (see <see cref="TrayIcons"/>), and a
     /// tooltip with the headline and, while it syncs, is offline or has
-    /// files it could not sync, what it is doing.
+    /// files it could not sync, what it is doing. During a "Sync now", that
+    /// it is checking the server.
     /// </summary>
     private void ShowOnTray(DriveSnapshot snapshot)
     {
@@ -213,8 +233,12 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
 
         var (_, headline, _) = snapshot.Summary;
         var text = $"OpenCfDrive: {headline}";
-        if (indicator is DriveIndicator.Syncing or DriveIndicator.Offline or DriveIndicator.Warning &&
-            snapshot.Status?.Activity?.Describe() is { Length: > 0 } doing)
+        if (_checking)
+        {
+            text += "\n" + CheckingText;
+        }
+        else if (indicator is DriveIndicator.Syncing or DriveIndicator.Offline or DriveIndicator.Warning &&
+                 snapshot.Status?.Activity?.Describe() is { Length: > 0 } doing)
         {
             text += "\n" + doing;
         }
@@ -321,6 +345,8 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
         _openFolder.Enabled = latest is not null && Directory.Exists(latest.Settings.SyncRoot.Value);
 
         var running = latest?.Running ?? false;
+        _syncNow.Text = _checking ? CheckingText : SyncNowText;
+        _syncNow.Enabled = !_busy && !_checking && latest is { CanSyncNow: true };
         _start.Enabled = !_busy && latest is { Running: false, SettingsProblem: null } && latest.Settings.HasRemote;
         _stop.Enabled = !_busy && running;
         _restart.Enabled = !_busy && running;
@@ -480,6 +506,117 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
     }
 
     /// <summary>
+    /// "Sync now": the service looks at the server at once, at every folder
+    /// it keeps current, without waiting for each one's turn. Meanwhile the
+    /// icon's tooltip, its menu and the window's button say that it is
+    /// checking; syncing can still be stopped. A run that did not finish is
+    /// told. So is a drive that is offline afterwards (the server cannot be
+    /// reached), in the notification a drive going offline always gets.
+    /// </summary>
+    public async Task SyncNowAsync()
+    {
+        if (_busy || _checking || Monitor.Latest is not { CanSyncNow: true } latest)
+        {
+            return;
+        }
+
+        var root = latest.Settings.SyncRoot.Value;
+        var wasOffline = latest.Status?.State == ServiceState.Offline;
+        var (actions, told) = (_actions, _stateTold);
+        ShowChecking(true);
+        bool finished;
+        try
+        {
+            finished = await ServiceControl.RequestSyncAsync(root, ServiceControl.SyncRequestTimeout);
+
+            // Offline, the run only has the service try the server again,
+            // and is answered before the server is: whether it answers shows
+            // when the service says the drive is back online.
+            if (finished && wasOffline)
+            {
+                await BackOnlineAsync(BackOnlineWait);
+            }
+        }
+        finally
+        {
+            ShowChecking(false);
+        }
+
+        if (_exiting)
+        {
+            return;
+        }
+
+        // The user asked, so a drive in trouble is told again, even one that
+        // was offline before; not twice, when this run's result was told as
+        // it came.
+        if (finished && _stateTold == told)
+        {
+            _stateTold = null;
+        }
+
+        await RefreshAsync();
+
+        // A start, stop or save meanwhile ends the run: the user's own doing.
+        if (!finished && _actions == actions)
+        {
+            ShowProblem(ServiceControl.IsRunning(root)
+                ? "OpenCfDrive could not finish checking the server: the sync run failed or took too long. The log may say why."
+                : "OpenCfDrive could not check the server: the sync service stopped.");
+        }
+    }
+
+    /// <summary>
+    /// Waits until the service says its drive is no longer offline (it tells
+    /// a watching app each change); false if it has not within
+    /// <paramref name="wait"/>.
+    /// </summary>
+    private async Task<bool> BackOnlineAsync(TimeSpan wait)
+    {
+        var back = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        void Look(DriveSnapshot snapshot)
+        {
+            if (snapshot.Status?.State != ServiceState.Offline)
+            {
+                back.TrySetResult();
+            }
+        }
+
+        Monitor.Pulsed += Look;
+        Monitor.Updated += Look;
+        try
+        {
+            if (Monitor.Latest is { } latest)
+            {
+                Look(latest);
+            }
+
+            await back.Task.WaitAsync(wait, _closing.Token);
+            return true;
+        }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+        {
+            return false;
+        }
+        finally
+        {
+            Monitor.Pulsed -= Look;
+            Monitor.Updated -= Look;
+        }
+    }
+
+    /// <summary>Marks a "Sync now" under way (or over): the icon's tooltip and the window say so.</summary>
+    private void ShowChecking(bool checking)
+    {
+        _checking = checking;
+        if (!_exiting && Monitor.Latest is { } latest)
+        {
+            ShowOnTray(latest);
+            _window?.ShowSnapshot(latest);
+        }
+    }
+
+    /// <summary>
     /// Saves new settings and carries them out: a moved drive is unregistered
     /// from its old folder (left as an ordinary folder), and a running service
     /// restarts with them. Returns why it could not, or null.
@@ -595,6 +732,7 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
         }
 
         _busy = true;
+        _actions++;
         _window?.ShowBusy(what);
         string? problem;
         try

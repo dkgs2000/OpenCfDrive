@@ -118,7 +118,8 @@ the state and what it's doing, for example "Sending 3 changes and downloading
 | Grey | Not set up yet: choose your remote in Settings. |
 
 - **Click the icon** to open the app.
-- **The icon's menu** opens the drive folder, starts, stops or restarts
+- **The icon's menu** opens the drive folder, checks the server at once
+  (**Sync now**, described under Status below), starts, stops or restarts
   syncing, and shows the log.
 - **Closing the window** only hides it. **Exit** in the icon's menu closes the
   app, and syncing carries on in the background.
@@ -139,7 +140,8 @@ and pages scroll.
 **Status** shows:
 
 - **How the drive is doing,** with the icon's picture, a sentence on what
-  it's doing, and buttons to open the drive folder and to start, stop or
+  it's doing, and buttons to open the drive folder, to check the server at
+  once (**Sync now**, described below), and to start, stop or
   restart syncing. Before a remote is chosen, or when rclone can't be found,
   a button takes you to Settings; when something is wrong, another takes you
   to Troubleshooting. An update ready to install shows above it.
@@ -153,6 +155,18 @@ and pages scroll.
   It never shows passwords, keys or tokens.
 - **Recent activity:** uploads, downloads, deletes and warnings, newest first.
   Point at a line to read all of it.
+
+**Sync now**, on the Status page and in the icon's menu, makes the drive send
+your changes and ask the server about every folder it keeps up to date, right
+away instead of at their next turn. Use it when you know something changed on
+the server and don't want to wait. You can press it while the sync service
+runs and the drive is connected. While it works, the button and the menu say
+**Checking the server...**, and so does the icon when you point at it; you can
+still stop syncing meanwhile. When it's done, what changed on the server shows
+in the folders and under Recent activity. If the server can't be reached, the
+drive goes offline and a notification says why, also when it was offline
+already: pressing **Sync now** then tries the server again at once. If the
+check itself couldn't finish, a message says so.
 
 **Settings** holds the settings below. Changes take effect when you press
 **Save**; **Discard changes** puts back what's saved.

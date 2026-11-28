@@ -13,7 +13,7 @@ public sealed class ServiceControlServer : IAsyncDisposable
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(5);
 
     /// <summary>How long a sync request may take before it is answered anyway.</summary>
-    private static readonly TimeSpan SyncTimeout = TimeSpan.FromMinutes(5);
+    internal static readonly TimeSpan SyncTimeout = TimeSpan.FromMinutes(5);
 
     private readonly string _pipeName;
     private readonly Func<ServiceStatus> _getStatus;

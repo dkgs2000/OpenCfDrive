@@ -75,6 +75,14 @@ internal sealed record DriveSnapshot(
     public DriveIndicator Indicator =>
         DriveIndicators.Of(Summary.Health == Health.Problem, Running, Settings.HasRemote, Status);
 
+    /// <summary>
+    /// "Sync now" has a drive to ask: the service runs and connected it.
+    /// Offline too, where asking has it try the server again at once. Not
+    /// while it starts (it looks at the server as soon as it has), nor when
+    /// it could not start the drive.
+    /// </summary>
+    public bool CanSyncNow => Running && Status is { State: ServiceState.Syncing or ServiceState.Offline };
+
     /// <summary>A connected drive: syncing, up to date, or with files that could not be synced.</summary>
     private static (Health Health, string Headline, string Detail) Connected(ServiceStatus status)
     {

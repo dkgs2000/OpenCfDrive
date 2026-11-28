@@ -153,6 +153,37 @@ public sealed class MainFormLayoutTests
         }
     });
 
+    /// <summary>
+    /// "Sync now" shows for a running drive. It can be pressed once the drive
+    /// is connected, offline too (asking then tries the server again), and
+    /// says that the server is being checked while it is.
+    /// </summary>
+    [Fact]
+    public void SyncNow_IsOfferedForAConnectedDrive_AndSaysWhileItChecks() => Sta.Run(() =>
+    {
+        static (bool Shown, bool Enabled, string Text) SyncNow(FakeApp app)
+        {
+            using var form = new MainForm(app) { Opacity = 0 };
+            form.PlaceOn(Screen.PrimaryScreen!);
+            form.ShowSnapshot(app.Latest!);
+            form.Show();
+            Application.DoEvents();
+            var button = Descendants(form).OfType<Button>().Single(b => b.Text is "Sync now" or "Checking the server...");
+            return (button.Visible, button.Enabled, button.Text);
+        }
+
+        Assert.Equal((true, true, "Sync now"), SyncNow(Samples.App("up to date")));
+        Assert.Equal((true, true, "Sync now"), SyncNow(Samples.App("offline")));
+        Assert.Equal((true, false, "Checking the server..."), SyncNow(Samples.App("checking the server")));
+        Assert.False(SyncNow(Samples.App("not set up")).Shown);
+        Assert.False(SyncNow(Samples.App("rclone not found")).Shown);
+
+        // Still starting: it looks at the server by itself as soon as it has.
+        var running = Samples.App("up to date");
+        var starting = running.Latest! with { Status = running.Latest!.Status! with { State = ServiceState.Starting } };
+        Assert.Equal((true, false, "Sync now"), SyncNow(new FakeApp(starting, running.UpdateStatus)));
+    });
+
     /// <summary>A screen of each scale the PC has.</summary>
     private static IEnumerable<Screen> Scales() => Screen.AllScreens.DistinctBy(Dpi);
 
@@ -288,6 +319,7 @@ public sealed class MainFormLayoutTests
         public static readonly string[] Names =
         [
             "not set up", "up to date", "syncing", "offline", "rclone not found", "own rclone", "update ready", "long names",
+            "checking the server",
         ];
 
         private const string Root = @"C:\Users\someone\OpenCfDrive";
@@ -329,7 +361,7 @@ public sealed class MainFormLayoutTests
             {
                 "syncing" => new SyncActivity(Sending: 3, Downloading: 1),
                 "offline" => new SyncActivity(Waiting: 2),
-                "up to date" or "update ready" or "long names" => SyncActivity.None,
+                "up to date" or "update ready" or "long names" or "checking the server" => SyncActivity.None,
                 _ => new SyncActivity(Failing: 1),
             };
             var status = running
@@ -366,7 +398,10 @@ public sealed class MainFormLayoutTests
                     "https://github.com/owner/name/releases/tag/v1.4.0", DateTimeOffset.Now)
                 : new UpdateStatus(UpdateStage.UpToDate, "You have the latest version.", CheckedAt: DateTimeOffset.Now);
 
-            return new FakeApp(new DriveSnapshot(saved, null, settings, running, status, rclone, info), update);
+            return new FakeApp(new DriveSnapshot(saved, null, settings, running, status, rclone, info), update)
+            {
+                Checking = state == "checking the server", // a "Sync now" under way
+            };
         }
 
         private static List<ActivityEntry> Activity(int count) => Enumerable.Range(0, count)
@@ -385,6 +420,8 @@ public sealed class MainFormLayoutTests
 
         public bool Busy => false;
 
+        public bool Checking { get; init; }
+
         public Version CurrentVersion { get; } = new(1, 3, 0);
 
         public UpdateStatus UpdateStatus { get; } = update;
@@ -398,6 +435,8 @@ public sealed class MainFormLayoutTests
         public Task StopAsync() => Task.CompletedTask;
 
         public Task RestartAsync() => Task.CompletedTask;
+
+        public Task SyncNowAsync() => Task.CompletedTask;
 
         public Task<string?> ApplySettingsAsync(DriveSettings settings, DriveChange change) => Task.FromResult<string?>(null);
 

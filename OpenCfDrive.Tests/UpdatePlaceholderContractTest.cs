@@ -53,6 +53,75 @@ public class UpdatePlaceholderContractTest(ITestOutputHelper output)
         });
     }
 
+    /// <summary>
+    /// A read returns only once the whole file is here: on disk, and no
+    /// longer marked to be downloaded (RECALL_ON_DATA_ACCESS). The drive
+    /// registers FULL hydration, as Nextcloud and OneDrive do. With PARTIAL
+    /// (which Windows runs as PROGRESSIVE) the read was let through as soon
+    /// as its bytes arrived and the download finished a moment later, and a
+    /// write in between could lose the downloaded bytes: the file then read
+    /// back as zeros followed by what was written (seen on CI in the read and
+    /// append above, and in UpdateFromRemote_UnchangedFrom_RefusesAFileSavedSince).
+    /// So that the read itself is what downloads the file, nothing else may
+    /// download it first: an on-access scanner (Defender's, on a PC; CI
+    /// runners have it off) downloads a file when a program opens it for
+    /// reading, and after a write handle to it closes. So the read is through
+    /// a handle opened while the file was still on disk (as a program that
+    /// keeps a file open reads it again), and the file is freed up meanwhile
+    /// through a handle without data access.
+    /// </summary>
+    [SkippableFact]
+    public void ARead_ReturnsOnlyOnceTheWholeFileIsHere()
+    {
+        var content = Encoding.UTF8.GetBytes("old-content");
+
+        RunInSyncRoot(() => content, (syncRoot, placeholders, fetches) =>
+        {
+            var path = Path.Combine(syncRoot, "file.txt");
+            Assert.Equal("old-content", File.ReadAllText(path));
+
+            // One read call, checked at once: a second read (at the end of
+            // the file) gave the platform time to finish.
+            using var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufferSize: 0);
+            var hr = FreeUpWithoutDataAccess(path);
+            Assert.True(CfApi.Succeeded(hr), $"Freeing up space failed with {HResult.Describe(hr)}");
+            Assert.False(CloudPlaceholderService.HasLocalData(path), "Freeing up space left the file on disk.");
+
+            var before = fetches();
+            var buffer = new byte[64];
+            var read = reader.Read(buffer);
+            var finished = CloudPlaceholderService.HasLocalData(path);
+
+            Assert.Equal("old-content", Encoding.UTF8.GetString(buffer, 0, read));
+            Assert.Equal(before + 1, fetches());
+            Assert.True(finished, "The read returned before the platform finished downloading the file.");
+            Assert.False(placeholders.QueryState(path).Partial, "The file is not all on disk after a read of all of it.");
+        });
+    }
+
+    /// <summary>Frees up a file's space through a handle that has no data access (WRITE_DAC), which a scanner does not look at.</summary>
+    private static int FreeUpWithoutDataAccess(string path)
+    {
+        const uint writeDac = 0x00040000;
+        const uint shareAll = 7;
+        const uint openExisting = 3;
+        const uint backupSemantics = 0x02000000;
+        using var handle = CreateFileW(path, writeDac, shareAll, IntPtr.Zero, openExisting, backupSemantics, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            return Marshal.GetHRForLastWin32Error();
+        }
+
+        return CfApi.CfUpdatePlaceholder(
+            handle.DangerousGetHandle(), IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero, 0,
+            CF_UPDATE_FLAGS.CF_UPDATE_FLAG_DEHYDRATE, out _, IntPtr.Zero);
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(
+        string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes,
+        uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
     [SkippableFact]
     public void UpdateFromRemote_DiscardingLocalChanges_ReplacesAnEditedFile()
     {
@@ -404,10 +473,11 @@ public class UpdatePlaceholderContractTest(ITestOutputHelper output)
 
     /// <summary>
     /// A file that is not fully on disk (online-only, or a download that broke
-    /// off) can hold local writes too: a program can write to it without
-    /// reading the rest, and nothing is downloaded. Replacing it is refused
-    /// while another program has it open, as for a file that is fully on
-    /// disk, and it downloads nothing either way.
+    /// off) holds nothing local (see AWrite_ToAFileNotFullyOnDisk_DownloadsAllOfItFirst),
+    /// but a program that has it open can have a write waiting for the
+    /// download that write starts, which could land between the check and the
+    /// replace. So replacing it is refused while another program has it open,
+    /// as for a file that is fully on disk, and it downloads nothing either way.
     /// </summary>
     [SkippableTheory]
     [InlineData(false)]
@@ -428,15 +498,11 @@ public class UpdatePlaceholderContractTest(ITestOutputHelper output)
                 limit = long.MaxValue;
             }
 
-            var edit = Encoding.UTF8.GetBytes("-edited");
             var before = fetches();
-            using (var program = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+            var looked = CloudPlaceholderService.LocalVersion(path)!.Value;
+            using (new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
             {
-                program.Seek(0, SeekOrigin.End);
-                program.Write(edit);
-                program.Flush();
-                Assert.True(placeholders.QueryState(path).Partial, "Writing to the file downloaded all of it.");
-                var looked = CloudPlaceholderService.LocalVersion(path)!.Value;
+                Assert.True(placeholders.QueryState(path).Partial, "Opening the file for writing downloaded all of it.");
 
                 var inUse = placeholders.UpdateFromRemote(path, content.Length, DateTimeOffset.UtcNow, discardLocalChanges: true, unchangedFrom: looked);
                 output.WriteLine($"open in another program -> {HResult.Describe(inUse)}");
@@ -445,16 +511,56 @@ public class UpdatePlaceholderContractTest(ITestOutputHelper output)
             }
 
             Assert.Equal(before, fetches());
-            Assert.Equal(content.Length + edit.Length, new FileInfo(path).Length);
-            Assert.True(CloudPlaceholderService.GetOnDiskSize(path) > 0, "The local write is gone.");
+            Assert.True(placeholders.QueryState(path).Partial, "The file was downloaded.");
 
-            var hr = placeholders.UpdateFromRemote(path, content.Length, DateTimeOffset.UtcNow, discardLocalChanges: true, unchangedFrom: CloudPlaceholderService.LocalVersion(path));
+            var hr = placeholders.UpdateFromRemote(path, content.Length, DateTimeOffset.UtcNow, discardLocalChanges: true, unchangedFrom: looked);
             output.WriteLine($"no longer open -> {HResult.Describe(hr)}, fetches {fetches() - before}");
             Assert.True(CfApi.Succeeded(hr), $"UpdateFromRemote failed with {HResult.Describe(hr)}");
             Assert.Equal(before, fetches());
             Assert.Equal(content.Length, new FileInfo(path).Length);
             Assert.Equal(0, CloudPlaceholderService.GetOnDiskSize(path));
             Assert.True(placeholders.QueryState(path).InSync, "UpdateFromRemote did not leave the file in sync.");
+        });
+    }
+
+    /// <summary>
+    /// Why a file that is not fully on disk holds nothing local: a program's
+    /// write to it makes Windows download all of it first (FULL hydration,
+    /// see SyncRootRegistrar), and the write then lands on the whole file.
+    /// With PARTIAL the write went in with nothing downloaded, and for a
+    /// file of 70 KB the written bytes were lost once it was read.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AWrite_ToAFileNotFullyOnDisk_DownloadsAllOfItFirst(bool brokenOff)
+    {
+        var content = new byte[1024 * 1024];
+        Random.Shared.NextBytes(content);
+        var limit = long.MaxValue;
+
+        RunInSyncRoot(() => content, deliverAtMost: () => limit, test: (syncRoot, placeholders, fetches) =>
+        {
+            var path = Path.Combine(syncRoot, "file.txt");
+            if (brokenOff)
+            {
+                limit = 64 * 1024;
+                Assert.ThrowsAny<IOException>(() => File.ReadAllBytes(path));
+                limit = long.MaxValue;
+            }
+
+            Assert.True(placeholders.QueryState(path).Partial, "The file is already all on disk.");
+            var edit = Encoding.UTF8.GetBytes("-edited");
+            using (var program = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+            {
+                program.Seek(0, SeekOrigin.End);
+                program.Write(edit);
+                program.Flush();
+                Assert.False(placeholders.QueryState(path).Partial, "The write went in without the file being downloaded.");
+                Assert.True(CloudPlaceholderService.HasLocalData(path), "The write went in before the download finished.");
+            }
+
+            Assert.Equal(content.Concat(edit).ToArray(), File.ReadAllBytes(path));
         });
     }
 

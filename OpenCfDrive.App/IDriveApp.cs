@@ -12,6 +12,9 @@ internal interface IDriveApp
     /// <summary>A start, stop or save is under way.</summary>
     bool Busy { get; }
 
+    /// <summary>A "Sync now" is under way: the service is looking at the server.</summary>
+    bool Checking { get; }
+
     Version CurrentVersion { get; }
 
     UpdateStatus UpdateStatus { get; }
@@ -25,6 +28,9 @@ internal interface IDriveApp
     Task StopAsync();
 
     Task RestartAsync();
+
+    /// <summary>Has the service look at the server now; tells the user if it could not.</summary>
+    Task SyncNowAsync();
 
     /// <summary>Saves and carries out new settings; returns why it could not, or null.</summary>
     Task<string?> ApplySettingsAsync(DriveSettings settings, DriveChange change);

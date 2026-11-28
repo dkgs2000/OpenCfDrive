@@ -5,8 +5,9 @@ namespace OpenCfDrive.Tests;
 
 /// <summary>
 /// The pipe between the app and the running service: status comes back
-/// whole, a stop request reaches the service, a watching app is told each
-/// change, and nothing answering means "not running" rather than a hang.
+/// whole, a stop request reaches the service, a sync request is answered
+/// when its run has finished, a watching app is told each change, and
+/// nothing answering means "not running" rather than a hang.
 /// </summary>
 public sealed class ServiceControlTests
 {
@@ -114,6 +115,90 @@ public sealed class ServiceControlTests
 
         Assert.False(ServiceControl.IsRunning(root));
         Assert.Null(await ServiceControl.GetStatusAsync(root, TimeSpan.FromMilliseconds(300)));
+    }
+
+    [Fact]
+    public async Task RequestSync_IsAnsweredOnceTheRunHasFinished()
+    {
+        var root = UniqueRoot();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var server = new ServiceControlServer(
+            ServiceControl.PipeName(root), () => SampleStatus(root), () => { },
+            syncNow: () =>
+            {
+                started.TrySetResult();
+                return finish.Task;
+            });
+        server.Start();
+
+        // Given as long as the app gives it: only the run's end answers it here.
+        var synced = ServiceControl.RequestSyncAsync(root, ServiceControl.SyncRequestTimeout);
+        await started.Task.WaitAsync(Timeout);
+        Assert.False(synced.IsCompleted);
+
+        finish.SetResult();
+        Assert.True(await synced.WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task RequestSync_OfARunThatFails_ReturnsFalse()
+    {
+        var root = UniqueRoot();
+        await using var server = new ServiceControlServer(
+            ServiceControl.PipeName(root), () => SampleStatus(root), () => { },
+            syncNow: () => Task.FromException(new IOException("The run failed.")));
+        server.Start();
+
+        Assert.False(await ServiceControl.RequestSyncAsync(root, ServiceControl.SyncRequestTimeout).WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task RequestSync_ReturnsFalse_WhenTheServiceStopsMeanwhile()
+    {
+        var root = UniqueRoot();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var never = new TaskCompletionSource();
+        var server = new ServiceControlServer(
+            ServiceControl.PipeName(root), () => SampleStatus(root), () => { },
+            syncNow: () =>
+            {
+                started.TrySetResult();
+                return never.Task;
+            });
+        server.Start();
+        var synced = ServiceControl.RequestSyncAsync(root, ServiceControl.SyncRequestTimeout);
+        await started.Task.WaitAsync(Timeout);
+
+        await server.DisposeAsync();
+
+        Assert.False(await synced.WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task RequestSync_OfAServiceThatDoesNotKnowIt_ReturnsFalse()
+    {
+        var root = UniqueRoot();
+        await using var server = new ServiceControlServer(ServiceControl.PipeName(root), () => SampleStatus(root), () => { });
+        server.Start();
+
+        Assert.False(await ServiceControl.RequestSyncAsync(root, ServiceControl.SyncRequestTimeout).WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task RequestSync_WithoutAService_ReturnsFalse()
+    {
+        Assert.False(await ServiceControl.RequestSyncAsync(UniqueRoot(), TimeSpan.FromMilliseconds(300)).WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task ARequestWhoseAnswerMayTakeLong_StillLearnsSoonThatNoServiceIsThere()
+    {
+        var answer = ServiceControl.SendAsync(
+            ServiceControl.PipeName(UniqueRoot()), ServiceControl.SyncRequest, ServiceControl.SyncRequestTimeout, CancellationToken.None,
+            connectTimeout: TimeSpan.FromMilliseconds(300));
+
+        Assert.Null(await answer.WaitAsync(Timeout));
     }
 
     [Fact]
