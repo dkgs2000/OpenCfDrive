@@ -817,7 +817,10 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         // something to apply: what cannot be applied now (the file is open, or
         // the client's own change is still on its way) is left to the next
         // listing. With nothing to apply and the same listing as before, it
-        // asks less and less often.
+        // asks less and less often. An item that could not be shown here does
+        // not count: each listing hands it out again, so it is tried again at
+        // every one, less and less often too, and one that never can be shown
+        // does not keep its folder asked about at every run.
         _pollSchedule.Listed(
             relativeDirectory,
             fingerprint,
@@ -961,7 +964,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
         // The item itself in case it is a folder, and the folder it is in.
         _pollSchedule.Touch(relative.Trim('/'));
-        _pollSchedule.Touch(ParentOf(relative));
+        _pollSchedule.Touch(FolderPollSchedule.ParentOf(relative));
     }
 
     /// <summary>
@@ -1018,11 +1021,13 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
 
         // Where something was really changed here (not the client's own
-        // writes, which the plan dropped), the folder is in use.
+        // writes, which the plan dropped), the folder is in use. Asked of the
+        // disk once per file: the same uploads are marked as waiting below.
+        var changedUploads = plan.Uploads.Where(u => HasUnsyncedLocalChanges(u.LocalPath)).ToList();
         foreach (var path in plan.Moves.SelectMany(m => new[] { m.OldLocalPath, m.NewLocalPath })
                      .Concat(plan.Deletes.Select(d => d.LocalPath))
                      .Concat(plan.Folders.Select(f => f.LocalPath))
-                     .Concat(plan.Uploads.Where(u => HasUnsyncedLocalChanges(u.LocalPath)).Select(u => u.LocalPath)))
+                     .Concat(changedUploads.Select(u => u.LocalPath)))
         {
             TouchFolderOf(path);
         }
@@ -1050,7 +1055,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             _itemStates.WaitingToUpload(folder.LocalPath);
         }
 
-        foreach (var upload in plan.Uploads.Where(u => HasUnsyncedLocalChanges(u.LocalPath)))
+        foreach (var upload in changedUploads)
         {
             _itemStates.WaitingToUpload(upload.LocalPath);
         }
@@ -1335,6 +1340,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         _keptCurrent = keptCurrent;
         _pollSchedule.Retain(listed.ToHashSet(StringComparer.OrdinalIgnoreCase));
 
+        // A folder the server no longer had is not listed any more once the
+        // folder above removed it here: forgotten, so one of that name that
+        // comes back and goes again is not said to be a problem at once.
+        _notFound.IntersectWith(listed);
+
         // Those that are due; one whose listing has not changed for a while
         // waits longer each time (see FolderPollSchedule).
         if (!await _pollSchedule.RunAsync(keptCurrent, RefreshDirectoryAsync, cancellationToken).ConfigureAwait(false))
@@ -1418,7 +1428,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             known.Add(row.LocalPath);
             if ((row.IsHydrated && File.Exists(row.LocalPath)) || hasLocalData(row.LocalPath))
             {
-                AddWithParents(local, ParentOf(row.RemotePath));
+                AddWithParents(local, FolderPollSchedule.ParentOf(row.RemotePath));
             }
         }
 
@@ -1428,7 +1438,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             {
                 foreach (var file in Directory.EnumerateFiles(syncRootPath, "*", SearchOption.AllDirectories).Where(f => !known.Contains(f)))
                 {
-                    AddWithParents(local, ParentOf(Path.GetRelativePath(syncRootPath, file).Replace('\\', '/')));
+                    AddWithParents(local, FolderPollSchedule.ParentOf(Path.GetRelativePath(syncRootPath, file).Replace('\\', '/')));
                 }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1474,17 +1484,9 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     private static void AddWithParents(HashSet<string> folders, string relative)
     {
         // A folder already there came with its parents.
-        for (var folder = relative.Trim('/'); folders.Add(folder) && folder.Length > 0; folder = ParentOf(folder))
+        for (var folder = relative.Trim('/'); folders.Add(folder) && folder.Length > 0; folder = FolderPollSchedule.ParentOf(folder))
         {
         }
-    }
-
-    /// <summary>The folder a server path is in: "a/b" for "a/b/c.txt", "" at the top.</summary>
-    private static string ParentOf(string remotePath)
-    {
-        var path = remotePath.TrimEnd('/');
-        var slash = path.LastIndexOf('/');
-        return slash < 0 ? string.Empty : path[..slash];
     }
 
     /// <summary>

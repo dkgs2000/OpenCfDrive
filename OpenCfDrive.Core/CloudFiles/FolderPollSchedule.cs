@@ -69,11 +69,11 @@ public sealed class FolderPollSchedule
 
     public TimeSpan MaxInterval { get; }
 
-    /// <summary>The longest wait from <see cref="MaxIntervalVariable"/>, else the default.</summary>
-    public static TimeSpan ConfiguredMaxInterval() =>
-        double.TryParse(Environment.GetEnvironmentVariable(MaxIntervalVariable), System.Globalization.CultureInfo.InvariantCulture, out var seconds) && seconds > 0
-            ? TimeSpan.FromSeconds(seconds)
-            : DefaultMaxInterval;
+    /// <summary>
+    /// The longest wait from <see cref="MaxIntervalVariable"/> (at most
+    /// <see cref="SyncScheduler.LongestConfigured"/>), else the default.
+    /// </summary>
+    public static TimeSpan ConfiguredMaxInterval() => SyncScheduler.SecondsFrom(MaxIntervalVariable) ?? DefaultMaxInterval;
 
     /// <summary>
     /// Whether a run starting now lists the folder: never listed, or its wait
@@ -131,7 +131,7 @@ public sealed class FolderPollSchedule
         return true;
     }
 
-    /// <summary>The folder a server path is in: "a/b" for "a/b/c", "" at the top.</summary>
+    /// <summary>The folder a server path is in: "a/b" for "a/b/c" and for "a/b/c.txt", "" at the top.</summary>
     internal static string ParentOf(string path)
     {
         var trimmed = path.TrimEnd('/');
@@ -239,13 +239,18 @@ public sealed class FolderPollSchedule
         }
     }
 
-    /// <summary>How many of <paramref name="directories"/> fall due within <paramref name="within"/> from now.</summary>
+    /// <summary>
+    /// How many of <paramref name="directories"/> are listed within
+    /// <paramref name="within"/> from now: those never listed, those whose
+    /// wait ends by then, and the top folder (""), which every run lists
+    /// whatever its wait (see <see cref="RunAsync"/>).
+    /// </summary>
     public int CountDueWithin(IEnumerable<string> directories, TimeSpan within)
     {
         lock (_gate)
         {
             var until = _time.GetUtcNow() + within;
-            return directories.Count(d => !_entries.TryGetValue(d, out var entry) || entry.Next <= until);
+            return directories.Count(d => d.Length == 0 || !_entries.TryGetValue(d, out var entry) || entry.Next <= until);
         }
     }
 

@@ -229,6 +229,20 @@ public sealed class FolderPollScheduleTests
     }
 
     [Fact]
+    public void CountDueWithin_CountsTheTopFolder_WhichEveryRunLists()
+    {
+        var schedule = NewSchedule();
+        for (var i = 0; i < 6; i++)
+        {
+            schedule.Listed("", "x"); // its wait grows like any folder's: 16 min by now
+            schedule.Listed("quiet", "x");
+        }
+
+        Assert.Equal(TimeSpan.FromMinutes(16), schedule.WaitOf(""));
+        Assert.Equal(1, schedule.CountDueWithin(["", "quiet"], TimeSpan.FromMinutes(1)));
+    }
+
+    [Fact]
     public void ACapBelowTheInterval_IsTheInterval()
     {
         var schedule = new FolderPollSchedule(Interval, TimeSpan.FromSeconds(5), _clock, () => 0.5);
@@ -252,6 +266,35 @@ public sealed class FolderPollScheduleTests
 
             Environment.SetEnvironmentVariable(FolderPollSchedule.MaxIntervalVariable, null);
             Assert.Equal(TimeSpan.FromMinutes(30), FolderPollSchedule.ConfiguredMaxInterval());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(FolderPollSchedule.MaxIntervalVariable, before);
+        }
+    }
+
+    /// <summary>Such a number stopped the service as it started: no TimeSpan holds it.</summary>
+    [Theory]
+    [InlineData("1e12")]
+    [InlineData("Infinity")]
+    public void ACapNoTimeSpanHolds_IsTheLongestASettingGives(string value)
+    {
+        var before = Environment.GetEnvironmentVariable(FolderPollSchedule.MaxIntervalVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(FolderPollSchedule.MaxIntervalVariable, value);
+            var cap = FolderPollSchedule.ConfiguredMaxInterval();
+            Assert.Equal(SyncScheduler.LongestConfigured, cap);
+
+            // And a schedule works with it: the wait doubles and the next listing has a time.
+            var schedule = new FolderPollSchedule(Interval, cap, _clock, () => 0.999);
+            for (var i = 0; i < 40; i++)
+            {
+                schedule.Listed("a", "x");
+            }
+
+            Assert.Equal(cap, schedule.WaitOf("a"));
+            Assert.False(schedule.IsDue("a"));
         }
         finally
         {
