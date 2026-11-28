@@ -39,9 +39,10 @@ SQLite state in %LOCALAPPDATA%\OpenCfDrive\state
   and runs the background sync. It starts and supervises its own `rclone rcd`,
   unless the user runs one.
 - **`OpenCfDrive.App`** is the notification area app. It edits the settings,
-  starts and stops the service, shows its status over a named pipe, and
-  updates itself. Its icon shows the drive's state, which the service sends
-  over the same pipe as it changes (see [The notification area icon](#the-notification-area-icon)).
+  starts and stops the service, shows its status and asks it to sync now
+  over a named pipe, and updates itself. Its icon shows the drive's state,
+  which the service sends over the same pipe as it changes (see
+  [The notification area icon](#the-notification-area-icon)).
 - **`OpenCfDrive.Core`** holds everything shared: the interop, the sync
   engine, the rclone clients, the store and the settings.
 

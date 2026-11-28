@@ -15,6 +15,7 @@ internal sealed partial class MainForm
     private readonly Label _headline = new() { AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 2), UseMnemonic = false };
     private readonly Label _headlineDetail = Theme.Text();
     private readonly Button _openFolder = Theme.Button("Open folder");
+    private readonly Button _syncNow = Theme.Button(TrayApp.SyncNowText);
     private readonly Button _start = Theme.Button("Start syncing");
     private readonly Button _stop = Theme.Button("Stop syncing");
     private readonly Button _restart = Theme.Button("Restart");
@@ -50,6 +51,7 @@ internal sealed partial class MainForm
 
         _folder.LinkClicked += (_, _) => _app.OpenFolder();
         _openFolder.Click += (_, _) => _app.OpenFolder();
+        _syncNow.Click += async (_, _) => await _app.SyncNowAsync();
         _start.Click += async (_, _) => await _app.StartAsync();
         _stop.Click += async (_, _) => await _app.StopAsync();
         _restart.Click += async (_, _) => await _app.RestartAsync();
@@ -72,7 +74,7 @@ internal sealed partial class MainForm
         hero.AddRow(_heroIcon, _headline);
         hero.SetRowSpan(_heroIcon, 3);
         hero.AddRow(null, _headlineDetail);
-        hero.AddRow(null, Theme.ButtonRow(_setUp, _openFolder, _start, _stop, _restart));
+        hero.AddRow(null, Theme.ButtonRow(_setUp, _openFolder, _syncNow, _start, _stop, _restart));
         _headlineDetail.Margin = new Padding(0, 0, 0, 6);
 
         var drive = new Card(2);
@@ -149,6 +151,11 @@ internal sealed partial class MainForm
         _setUp.Text = setUp ? "Open Settings" : "Choose a remote";
         _openFolder.Visible = setUp || snapshot.Running;
         _openFolder.Enabled = Directory.Exists(snapshot.Settings.SyncRoot.Value);
+
+        // Sync now, for a running drive; while the server is checked, it says so.
+        _syncNow.Visible = snapshot.Running;
+        _syncNow.Text = _app.Checking ? TrayApp.CheckingText : TrayApp.SyncNowText;
+        _syncNow.Enabled = idle && !_app.Checking && snapshot.CanSyncNow;
         _start.Visible = setUp && !snapshot.Running;
         _start.Enabled = idle && snapshot.SettingsProblem is null;
         _stop.Visible = _restart.Visible = snapshot.Running;
