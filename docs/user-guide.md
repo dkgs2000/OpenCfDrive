@@ -228,7 +228,8 @@ already downloaded.
   not question the server all day; a change there, or your own change or
   download in it, brings it back to every 30 seconds. So a change someone
   else makes in a folder that has been quiet can take up to 30 minutes to
-  show here. An online-only folder - one whose files have not
+  show here, unless you press **Sync now** (above), which asks about all of
+  them right away. An online-only folder - one whose files have not
   been downloaded - is not re-listed every 30 seconds. Once 30 seconds have
   passed since it was last listed, the next time you open it OpenCfDrive
   lists it from the server, so it shows what changed there meanwhile.

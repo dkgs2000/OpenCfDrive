@@ -184,6 +184,25 @@ public sealed class MainFormLayoutTests
         Assert.Equal((true, false, "Sync now"), SyncNow(new FakeApp(starting, running.UpdateStatus)));
     });
 
+    /// <summary>
+    /// A running drive with a problem (its rclone stopped) offers what a
+    /// running drive has, "Sync now" among it, and "Troubleshoot" after it.
+    /// </summary>
+    [Fact]
+    public void ARunningDriveWithAProblem_OffersSyncNowAndTroubleshoot() => Sta.Run(() =>
+    {
+        var app = Samples.App("rclone stopped");
+        using var form = new MainForm(app) { Opacity = 0 };
+        form.PlaceOn(Screen.PrimaryScreen!);
+        form.ShowSnapshot(app.Latest!);
+        form.Show();
+        Application.DoEvents();
+
+        var row = Descendants(form).OfType<Button>().Single(b => b.Text == "Sync now").Parent!;
+        var offered = row.Controls.Cast<Control>().Where(c => c.Visible).Select(c => c.Text);
+        Assert.Equal(["Open folder", "Sync now", "Stop syncing", "Restart", "Troubleshoot"], offered);
+    });
+
     /// <summary>A screen of each scale the PC has.</summary>
     private static IEnumerable<Screen> Scales() => Screen.AllScreens.DistinctBy(Dpi);
 
@@ -319,7 +338,7 @@ public sealed class MainFormLayoutTests
         public static readonly string[] Names =
         [
             "not set up", "up to date", "syncing", "offline", "rclone not found", "own rclone", "update ready", "long names",
-            "checking the server",
+            "checking the server", "rclone stopped",
         ];
 
         private const string Root = @"C:\Users\someone\OpenCfDrive";
@@ -384,9 +403,13 @@ public sealed class MainFormLayoutTests
                     RecentActivity: Activity(state == "long names" ? 0 : 40),
                     Rclone: own
                         ? new RcloneStatus(false, DriveSettingsFile.DefaultRcUrl, null, null, "v1.75.2", null, "Running", "rclone v1.75.2 answers.", null)
-                        : new RcloneStatus(true, "http://127.0.0.1:24858", @"C:\Users\someone\AppData\Local\OpenCfDrive\rclone\rclone.exe",
-                            nameof(RcloneSource.Downloaded), "v1.75.2", 5151, "Running", "rclone v1.75.2 runs (process 5151).",
-                            @"C:\Users\someone\AppData\Local\OpenCfDrive\logs\rclone.log"),
+                        : state == "rclone stopped" // the service runs, its rclone does not: a running drive with a problem
+                            ? new RcloneStatus(true, "http://127.0.0.1:24858", @"C:\Users\someone\AppData\Local\OpenCfDrive\rclone\rclone.exe",
+                                nameof(RcloneSource.Downloaded), "v1.75.2", null, "Restarting", "rclone stopped (exit code 1). Starting it again in 30 s.",
+                                @"C:\Users\someone\AppData\Local\OpenCfDrive\logs\rclone.log")
+                            : new RcloneStatus(true, "http://127.0.0.1:24858", @"C:\Users\someone\AppData\Local\OpenCfDrive\rclone\rclone.exe",
+                                nameof(RcloneSource.Downloaded), "v1.75.2", 5151, "Running", "rclone v1.75.2 runs (process 5151).",
+                                @"C:\Users\someone\AppData\Local\OpenCfDrive\logs\rclone.log"),
                     Activity: activity,
                     Revision: 3,
                     FoldersKeptCurrent: 1240,
