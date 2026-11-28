@@ -28,7 +28,9 @@ public sealed class ServiceControlTests
         LogPath: @"C:\logs\OpenCfDrive.log",
         RecentActivity: [new ActivityEntry(new DateTimeOffset(2026, 11, 2, 10, 1, 0, TimeSpan.Zero), "Information", "Uploaded 'a.txt'")],
         Activity: new SyncActivity(Sending: 2, Downloading: 1, Failing: 1),
-        Revision: 7);
+        Revision: 7,
+        FoldersKeptCurrent: 40,
+        FoldersDueSoon: 3);
 
     private static ServicePulse Pulse(long revision, SyncActivity? activity = null) =>
         new(4242, revision, ServiceState.Syncing, "Connected.", activity ?? SyncActivity.None, ProblemsReported: 0);
@@ -60,6 +62,37 @@ public sealed class ServiceControlTests
 
         Assert.True(await ServiceControl.RequestStopAsync(root, Timeout));
         await stopped.Task.WaitAsync(Timeout);
+    }
+
+    [Theory]
+    [InlineData(ServiceControl.SyncRequest, "now")]
+    [InlineData(ServiceControl.ScheduledSyncRequest, "scheduled")]
+    public async Task ASyncRequest_RunsItsKindOfSyncRun_AndIsAnsweredWhenThatHasFinished(string request, string expected)
+    {
+        var root = UniqueRoot();
+        var ran = new List<string>();
+        var finish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task Run(string kind)
+        {
+            ran.Add(kind);
+            started.TrySetResult();
+            return finish.Task;
+        }
+
+        await using var server = new ServiceControlServer(
+            ServiceControl.PipeName(root), () => SampleStatus(root), () => { },
+            syncNow: () => Run("now"),
+            scheduledSync: () => Run("scheduled"));
+        server.Start();
+
+        var answer = ServiceControl.SendAsync(ServiceControl.PipeName(root), request, Timeout, CancellationToken.None);
+        await started.Task.WaitAsync(Timeout);
+        Assert.False(answer.IsCompleted);
+        finish.SetResult();
+
+        Assert.Equal("""{"synced":true}""", await answer.WaitAsync(Timeout));
+        Assert.Equal([expected], ran);
     }
 
     [Fact]

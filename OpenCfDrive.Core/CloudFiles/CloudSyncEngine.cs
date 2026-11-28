@@ -56,6 +56,25 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     private readonly ConcurrentDictionary<string, DateTimeOffset> _listedAt =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// When each folder the background sync keeps current is next listed: one
+    /// whose listing keeps coming back the same is asked less and less often
+    /// (see <see cref="FolderPollSchedule"/>).
+    /// </summary>
+    private readonly FolderPollSchedule _pollSchedule =
+        new(SyncScheduler.ConfiguredInterval(), FolderPollSchedule.ConfiguredMaxInterval());
+
+    /// <summary>The folders the last full run kept current, for <see cref="FoldersKeptCurrent"/>.</summary>
+    private volatile IReadOnlyList<string> _keptCurrent = [];
+
+    /// <summary>
+    /// Folders whose last listing the server answered with "not found". The
+    /// first time is expected (deleted or renamed there) and only logged: the
+    /// folder above is listed and removes it. A second time in a row means
+    /// the folder above still lists it, which is reported as a problem.
+    /// </summary>
+    private readonly HashSet<string> _notFound = new(StringComparer.OrdinalIgnoreCase);
+
     private volatile bool _populating;
 
     /// <summary>
@@ -387,6 +406,9 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                     OnActivityChanged();
                     if (online)
                     {
+                        // What changed on the server meanwhile is not known:
+                        // every folder kept current is looked at once.
+                        _pollSchedule.MakeAllDue();
                         _ = _scheduler?.SyncNowAsync();
                     }
                 };
@@ -406,7 +428,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 // What a listing found changed on the server is applied by
                 // the next run, after its local changes.
                 _connection.DirectoryListed += _ => _scheduler.RequestLocalRun();
-                _connection.DownloadStarted += _ => OnActivityChanged();
+                _connection.DownloadStarted += path =>
+                {
+                    OnActivityChanged();
+                    TouchFolderOf(path);
+                };
 
                 // A change that waited for a download can go now, whether it
                 // was sent or failed.
@@ -666,6 +692,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         // is new or changed is asked for its time.
         var withoutTimes = _capabilities.ListsWithoutTimes && known.Count > 0;
         var items = await _rc.ListDirectoryAsync(_remote, relativeDirectory, Listing(withTimes: !withoutTimes), cancellationToken).ConfigureAwait(false);
+        var fingerprint = FolderPollSchedule.Fingerprint(items, withTimes: !_capabilities.ListsWithoutTimes);
         if (withoutTimes)
         {
             items = await WithTimesWhereNeededAsync(relativeDirectory, items, known, cancellationToken).ConfigureAwait(false);
@@ -786,6 +813,16 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             _pendingDiffs[relativeDirectory] = new DirectoryDiff(listedAt, deleted, changed);
         }
 
+        // The background sync asks again after one interval while there is
+        // something to apply: what cannot be applied now (the file is open, or
+        // the client's own change is still on its way) is left to the next
+        // listing. With nothing to apply and the same listing as before, it
+        // asks less and less often.
+        _pollSchedule.Listed(
+            relativeDirectory,
+            fingerprint,
+            changed: changed.Count > 0 || deleted.Any(r => !IsEmptyFolderTheServerCannotKeep(r)));
+
         // A folder listed from the server is not marked for population again
         // until the interval has passed (see SyncRemoteAsync). A folder
         // renamed here was listed where the server still had it; the folder
@@ -889,9 +926,43 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
     /// <summary>
     /// Syncs now (the app's or a script's "sync now"): the local changes, then
-    /// a look at the server. Completes once that run has finished.
+    /// a look at the server, at every folder it keeps current however long
+    /// each was to wait. Completes once that run has finished.
     /// </summary>
-    public Task SyncNowAsync() => _scheduler?.SyncNowAsync() ?? Task.CompletedTask;
+    public Task SyncNowAsync()
+    {
+        _pollSchedule.MakeAllDue();
+        return _scheduler?.SyncNowAsync() ?? Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// A sync run as the interval starts one, now: the local changes, then a
+    /// look at the folders that are due. Completes once that run has finished.
+    /// </summary>
+    public Task ScheduledSyncAsync() => _scheduler?.SyncNowAsync() ?? Task.CompletedTask;
+
+    /// <summary>How many folders the background sync keeps current (as of its last run).</summary>
+    public int FoldersKeptCurrent => _keptCurrent.Count;
+
+    /// <summary>How many of those it lists within <paramref name="within"/> from now.</summary>
+    public int FoldersDueWithin(TimeSpan within) => _pollSchedule.CountDueWithin(_keptCurrent, within);
+
+    /// <summary>
+    /// The folders that hold what was changed or downloaded here are in use:
+    /// the background sync looks at them every interval again.
+    /// </summary>
+    private void TouchFolderOf(string localPath)
+    {
+        var relative = Path.IsPathRooted(localPath) ? RelativeOf(localPath) : localPath.Replace('\\', '/');
+        if (relative.StartsWith("..", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        // The item itself in case it is a folder, and the folder it is in.
+        _pollSchedule.Touch(relative.Trim('/'));
+        _pollSchedule.Touch(ParentOf(relative));
+    }
 
     /// <summary>
     /// One sync run, as Nextcloud's: the local changes since the last run go
@@ -944,6 +1015,16 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             // folder): no state stays on the file for it.
             ClearStates(dropped.Changes);
             _changes.Complete(dropped.Changes);
+        }
+
+        // Where something was really changed here (not the client's own
+        // writes, which the plan dropped), the folder is in use.
+        foreach (var path in plan.Moves.SelectMany(m => new[] { m.OldLocalPath, m.NewLocalPath })
+                     .Concat(plan.Deletes.Select(d => d.LocalPath))
+                     .Concat(plan.Folders.Select(f => f.LocalPath))
+                     .Concat(plan.Uploads.Where(u => HasUnsyncedLocalChanges(u.LocalPath)).Select(u => u.LocalPath)))
+        {
+            TouchFolderOf(path);
         }
 
         if (_server is { IsOnline: false })
@@ -1222,10 +1303,15 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     /// One background sync run, the counterpart of a Nextcloud sync run's
     /// remote discovery for the folders this PC has listed. A folder that
     /// holds something local (the root, a pinned folder, a downloaded, kept or
-    /// edited file) is listed every run, parents first, one at a time, never
-    /// recursively, and what changed on the server is applied: new items
+    /// edited file) is kept current: listed, parents first, one at a time,
+    /// never recursively, and what changed on the server is applied: new items
     /// appear, changed files take the new version (keeping a local edit as a
-    /// conflict copy), and deleted ones go. A folder that holds nothing local
+    /// conflict copy), and deleted ones go. Not every one at every run: the
+    /// server has no cheap way to say that nothing changed (Nextcloud asks for
+    /// one ETag), so a folder whose listing keeps coming back the same is
+    /// listed less and less often, and at every run again once it changes or
+    /// is used here (<see cref="FolderPollSchedule"/>). "Sync now" and coming
+    /// back online list them all. A folder that holds nothing local
     /// is online-only: it is not listed; once it is older than the poll
     /// interval it is given on-demand population again, and Windows lists it
     /// from the server when it is next opened. Folders never opened are left
@@ -1244,19 +1330,21 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         // what they change for the server's current state.
         var relistAge = SyncScheduler.ConfiguredRelistAge();
         var local = LocalDirectories();
-        foreach (var directory in ListedDirectories().ToList())
+        var listed = ListedDirectories().ToList();
+        var keptCurrent = listed.Where(directory => local.Contains(directory) || IsPinnedFolder(directory)).ToList();
+        _keptCurrent = keptCurrent;
+        _pollSchedule.Retain(listed.ToHashSet(StringComparer.OrdinalIgnoreCase));
+
+        // Those that are due; one whose listing has not changed for a while
+        // waits longer each time (see FolderPollSchedule).
+        if (!await _pollSchedule.RunAsync(keptCurrent, RefreshDirectoryAsync, cancellationToken).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        foreach (var directory in listed.Except(keptCurrent, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            if (local.Contains(directory) || IsPinnedFolder(directory))
-            {
-                if (!await RefreshDirectoryAsync(directory, cancellationToken).ConfigureAwait(false))
-                {
-                    return;
-                }
-
-                continue;
-            }
 
             // Online-only: nothing here would be lost by asking the server
             // only when it is opened. Leave it fully populated until it is
@@ -1421,14 +1509,18 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
             : Path.Combine(_syncRootPath, relative.TrimEnd('/').Replace('/', Path.DirectorySeparatorChar));
 
     /// <summary>
-    /// Lists one listed folder and applies what changed. False when the
-    /// server could not be reached: the drive is offline and the run stops.
+    /// Lists one listed folder and applies what changed.
+    /// <see cref="FolderCheck.Unreachable"/> when the server could not be
+    /// reached: the drive is offline and the run stops.
+    /// <see cref="FolderCheck.NotFound"/> when the server has no such folder
+    /// any more: the run then lists the folder above, which removes it here.
     /// </summary>
-    private async Task<bool> RefreshDirectoryAsync(string directory, CancellationToken cancellationToken)
+    private async Task<FolderCheck> RefreshDirectoryAsync(string directory, CancellationToken cancellationToken)
     {
         if (!Directory.Exists(LocalPathOf(directory)))
         {
-            return true; // removed by its parent's changes in this run
+            _notFound.Remove(directory);
+            return FolderCheck.Gone; // removed by a listing above it in this run
         }
 
         IReadOnlyList<PlaceholderEntry> entries;
@@ -1448,15 +1540,26 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
                 if (timeout.IsCancellationRequested || ServerConnection.IsUnreachable(ex))
                 {
                     _server?.Failed(reason);
-                    return false;
+                    return FolderCheck.Unreachable;
                 }
 
-                // Typically a folder the server removed since its parent was
-                // listed; the parent's next listing removes it here.
+                // Deleted or renamed on the server since the folder above was
+                // last listed (which can be a while ago: see
+                // FolderPollSchedule): the run lists that one now, and its
+                // listing removes this folder here. Said as a problem only
+                // if the folder above still lists it.
+                if (directory.Length > 0 && IsNotFound(ex) && _notFound.Add(directory))
+                {
+                    _log?.Invoke($"The server no longer has '{directory}'; looking at the folder above it.");
+                    return FolderCheck.NotFound;
+                }
+
                 ReportProblem($"Background sync could not list '{directory}' ({reason}); the next run tries again.");
-                return true;
+                return IsNotFound(ex) && directory.Length > 0 ? FolderCheck.NotFound : FolderCheck.Failed;
             }
         }
+
+        _notFound.Remove(directory);
 
         if (entries.Count > 0)
         {
@@ -1475,8 +1578,13 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
 
         await ApplyServerChangesAsync(directory).ConfigureAwait(false);
-        return true;
+        return FolderCheck.Listed;
     }
+
+    /// <summary>rclone's answer for a folder the server does not have (404).</summary>
+    private static bool IsNotFound(Exception ex) =>
+        ex is System.Net.Http.HttpRequestException { StatusCode: System.Net.HttpStatusCode.NotFound } ||
+        (ex.InnerException is { } inner && IsNotFound(inner));
 
     /// <summary>
     /// True when the server's copy is not the one this client last saw: a
@@ -1574,6 +1682,23 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     }
 
     /// <summary>
+    /// A remote without empty folders never lists one: an empty folder here
+    /// that is absent there was not deleted.
+    /// </summary>
+    private bool IsEmptyFolderTheServerCannotKeep(FileRecord record)
+    {
+        try
+        {
+            return record.IsDirectory && !_remoteKeepsEmptyFolders && Directory.Exists(record.LocalPath) &&
+                   !Directory.EnumerateFileSystemEntries(record.LocalPath).Any();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// The folder is gone from the server, so it goes locally too. Files in
     /// it with local changes the server never got stay, with the folders
     /// they are in, and are uploaded again (as Nextcloud keeps them); only
@@ -1584,9 +1709,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     {
         var prefix = record.RemotePath.TrimEnd('/') + "/";
 
-        // A remote without empty folders never lists one: absent is not deleted.
-        if (!_remoteKeepsEmptyFolders && Directory.Exists(record.LocalPath) &&
-            !Directory.EnumerateFileSystemEntries(record.LocalPath).Any())
+        if (IsEmptyFolderTheServerCannotKeep(record))
         {
             return;
         }

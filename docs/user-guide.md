@@ -146,7 +146,10 @@ and pages scroll.
 - **Drive:** the folder, the remote, what kind of storage it is and where it
   points (for example `s3 (AWS), region eu-west-1` or
   `crypt over gdrive:secret`), the space used and free, if the server
-  reports it, how many items the drive tracks and how much it has downloaded.
+  reports it, how many items the drive tracks and how much it has downloaded,
+  and how many folders it asks the server about in the background (those
+  holding something on this computer), with how many of them are due in the
+  next minute.
   It never shows passwords, keys or tokens.
 - **Recent activity:** uploads, downloads, deletes and warnings, newest first.
   Point at a line to read all of it.
@@ -204,8 +207,14 @@ already downloaded.
 - **The server is the source of truth.** The first time you open a folder,
   OpenCfDrive lists it from the server. A folder that holds something local
   (a downloaded, kept or edited file, or a pinned folder) is then kept up to
-  date in the background, every 30 seconds and right after the server comes
-  back from being offline. An online-only folder - one whose files have not
+  date in the background, and right after the server comes back from being
+  offline. It is checked every 30 seconds while it keeps changing or you work
+  in it. Each time a check finds nothing new, the next one comes twice as
+  late, up to every 30 minutes, so a drive with many downloaded folders does
+  not question the server all day; a change there, or your own change or
+  download in it, brings it back to every 30 seconds. So a change someone
+  else makes in a folder that has been quiet can take up to 30 minutes to
+  show here. An online-only folder - one whose files have not
   been downloaded - is not re-listed every 30 seconds. Once 30 seconds have
   passed since it was last listed, the next time you open it OpenCfDrive
   lists it from the server, so it shows what changed there meanwhile.
@@ -330,14 +339,16 @@ sync service ends, and OpenCfDrive restarts it if it stops on its own.
   normal local files. Their edits are still uploaded. Windows can't turn an
   existing file into an online-only one.
 - **Pressing F5 in Explorer.** In a folder with something local in it, it
-  doesn't ask the server sooner: changes from the server arrive within 30
-  seconds anyway. In an online-only folder, F5 lists the folder from the
+  doesn't ask the server sooner: changes from the server arrive on their own,
+  within 30 seconds in a folder that is in use and within 30 minutes in one
+  that has been quiet. In an online-only folder, F5 lists the folder from the
   server once 30 seconds have passed since it was last listed; before that, it
   shows the same listing.
 - **Many opened folders do not mean many listings.** Only folders that hold
   something local (a downloaded, kept or edited file, or a pinned folder) are
-  listed every 30 seconds. Online-only folders are listed when you open them,
-  so opening many folders does not drive up per-folder polling.
+  listed in the background, and those that do not change less and less often
+  (see above). Online-only folders are listed when you open them, so opening
+  many folders does not drive up per-folder polling.
 - **On S3 and other bucket stores**, an empty folder exists only on this
   computer until you put a file in it, because those stores have no real
   folders.

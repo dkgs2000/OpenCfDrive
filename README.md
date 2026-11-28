@@ -27,8 +27,9 @@
   you open it. **Free up space** and **Always keep on this device** are in the
   right-click menu.
 - **Two-way sync.** Your adds, edits, renames, moves and deletes go to the
-  server. Changes made on the server show up within 30 seconds in folders
-  holding files you downloaded or keep on this device, and in other folders
+  server. Changes made on the server show up in folders holding files you
+  downloaded or keep on this device (within 30 seconds where you are working,
+  within 30 minutes in folders that have been quiet), and in other folders
   when you next open them.
 - **Works offline.** Files you downloaded still open. Edits, renames and
   deletes you make offline go to the server when it's back.

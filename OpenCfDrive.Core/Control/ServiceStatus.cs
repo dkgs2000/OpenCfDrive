@@ -24,7 +24,12 @@ public sealed record ServiceStatus(
     // What the drive is doing now, and the number of the change it was last
     // told (see ServicePulse).
     SyncActivity? Activity = null,
-    long Revision = 0)
+    long Revision = 0,
+    // How many folders the background sync keeps current (those holding
+    // something local), and how many of them it lists within the next minute:
+    // one whose listing does not change is listed less and less often.
+    int FoldersKeptCurrent = 0,
+    int FoldersDueSoon = 0)
 {
     /// <summary>
     /// This status with what <paramref name="pulse"/> says, if the pulse is

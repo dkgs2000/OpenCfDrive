@@ -192,7 +192,7 @@ function Stop-StaleProcesses {
 # sync does every 30 s, and returns once that run has finished (the service
 # answers on its control pipe only then). Mock mode never looks at the server.
 $script:E2ESyncRoot = ""
-function Sync-Remote([int]$TimeoutSeconds = 120) {
+function Sync-Remote([int]$TimeoutSeconds = 120, [string]$Request = "sync") {
     if (-not $script:E2EIsCloud) { return }
     $pipeName = [System.IO.Path]::GetFileNameWithoutExtension((Get-StateDbPath $script:E2ESyncRoot))
     $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
@@ -200,7 +200,7 @@ function Sync-Remote([int]$TimeoutSeconds = 120) {
         $pipe.Connect(10000)
         $writer = New-Object System.IO.StreamWriter($pipe)
         $writer.AutoFlush = $true
-        $writer.WriteLine("sync")
+        $writer.WriteLine($Request)
         $reader = New-Object System.IO.StreamReader($pipe)
         $answer = $reader.ReadLineAsync()
         if (-not $answer.Wait($TimeoutSeconds * 1000)) { throw "The service did not finish a sync run within $TimeoutSeconds s." }
@@ -208,6 +208,14 @@ function Sync-Remote([int]$TimeoutSeconds = 120) {
     } finally {
         $pipe.Dispose()
     }
+}
+
+# A sync run as the service's timer starts one: where Sync-Remote ("sync now")
+# asks the server about every folder the client keeps current, this asks only
+# about those that are due. A folder whose listing came back the same waits
+# longer each time; with the E2E's interval of a day, none listed before is due.
+function Sync-Scheduled([int]$TimeoutSeconds = 120) {
+    Sync-Remote -TimeoutSeconds $TimeoutSeconds -Request "sync-scheduled"
 }
 
 # Watches the cloud service the way the app does for its notification area

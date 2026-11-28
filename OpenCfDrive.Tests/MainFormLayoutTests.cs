@@ -80,6 +80,28 @@ public sealed class MainFormLayoutTests
         Assert.True(problems.Count == 0, string.Join(Environment.NewLine, problems.Distinct()));
     });
 
+    [Theory]
+    [InlineData(1240, 37, "1,240 folders kept current; 37 to check in the next minute")]
+    [InlineData(1, 1, "1 folder kept current; 1 to check in the next minute")]
+    [InlineData(0, 0, "-")] // it has not looked at the server yet
+    public void TheStatusPage_SaysHowManyFoldersTheServerIsAskedAbout(int kept, int soon, string expected)
+    {
+        var culture = System.Globalization.CultureInfo.CurrentCulture;
+        System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+        try
+        {
+            var status = new ServiceStatus(1, DateTimeOffset.Now, "1.0", @"C:\drive", "box:", "", ServiceState.Syncing, "", true, true, 0, 0, "", [],
+                FoldersKeptCurrent: kept, FoldersDueSoon: soon);
+
+            Assert.Equal(expected, MainForm.ServerChecksText(status));
+            Assert.Equal("-", MainForm.ServerChecksText(null));
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = culture;
+        }
+    }
+
     [Fact]
     public void TheWindow_FitsTheScreen_AndIsBiggerThanItsSmallest() => Sta.Run(() =>
     {
@@ -334,7 +356,9 @@ public sealed class MainFormLayoutTests
                             nameof(RcloneSource.Downloaded), "v1.75.2", 5151, "Running", "rclone v1.75.2 runs (process 5151).",
                             @"C:\Users\someone\AppData\Local\OpenCfDrive\logs\rclone.log"),
                     Activity: activity,
-                    Revision: 3)
+                    Revision: 3,
+                    FoldersKeptCurrent: 1240,
+                    FoldersDueSoon: 37)
                 : null;
 
             var update = state == "update ready"

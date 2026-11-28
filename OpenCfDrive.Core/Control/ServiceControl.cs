@@ -7,7 +7,8 @@ namespace OpenCfDrive.Core.Control;
 
 /// <summary>
 /// How the app reaches a running service: a named pipe per drive that only
-/// the same user can open. A request is one line ("status", "stop", "sync"),
+/// the same user can open. A request is one line ("status", "stop", "sync",
+/// "sync-scheduled"),
 /// the answer one line of JSON; "watch" is answered with a line at every
 /// change, as long as the connection stays open.
 /// </summary>
@@ -18,6 +19,13 @@ public static class ServiceControl
 
     /// <summary>Look at the server now; answered once that sync run has finished.</summary>
     public const string SyncRequest = "sync";
+
+    /// <summary>
+    /// A sync run as the interval starts one: only the folders that are due
+    /// are asked about (see FolderPollSchedule), where "sync" asks about all.
+    /// For scripts and tests; answered once the run has finished.
+    /// </summary>
+    public const string ScheduledSyncRequest = "sync-scheduled";
 
     /// <summary>A <see cref="ServicePulse"/> line now and at every change, until either side leaves.</summary>
     public const string WatchRequest = "watch";

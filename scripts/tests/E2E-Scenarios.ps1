@@ -992,6 +992,39 @@ function Get-E2EScenarios {
             Assert-Local "s35-dir/f.txt" "s35-version-two"
         }
 
+        # A folder holding a downloaded file is kept current, but not asked
+        # about at every scheduled run once its listing has come back the
+        # same: on a server without folder ETags that would be a request per
+        # such folder every 30 s for good. "Sync now" asks about it at once.
+        New-E2EScenario "S36" "a scheduled sync run does not list again a downloaded-file folder that did not change; sync now does" -Budget @{ DownloadBytes = 21 } -CloudOnly {
+            Set-RemoteFile "s36-dir/f.txt" "s36-v1"
+            Wait-Local "" { Test-Local "s36-dir" } "s36-dir did not appear locally."
+            Wait-Local "s36-dir" { Test-Local "s36-dir/f.txt" } "s36-dir\f.txt did not appear locally."
+            Assert-Local "s36-dir/f.txt" "s36-v1"
+            # Holding a downloaded file now, it is listed by this run.
+            $from = Get-LogLength $script:E2ERcloneLog
+            Sync-Remote
+            if (@(Get-RcloneListings $from "s36-dir").Count -eq 0) { throw "Sync now did not list s36-dir, which holds a downloaded file." }
+
+            $from = Get-LogLength $script:E2ERcloneLog
+            Sync-Scheduled
+            Sync-Scheduled
+            $listings = @(Get-RcloneListings $from "s36-dir")
+            if ($listings.Count -gt 0) { throw "Scheduled sync runs listed the unchanged s36-dir $($listings.Count) time(s): $($listings -join ' | ')" }
+            $all = @((Read-LogSlice $script:E2ERcloneLog $from (Get-LogLength $script:E2ERcloneLog)) -split "`r?`n" | Where-Object { $_ -match 'rc: "operations/list"' })
+            if ($all.Count -eq 0) { throw "The scheduled sync runs listed nothing, not even the drive's top folder." }
+
+            # What changes there meanwhile waits for the folder's turn, or for "sync now".
+            Set-RemoteFile "s36-dir/f.txt" "s36-version-two"
+            Sync-Scheduled
+            if ((Get-LocalLength "s36-dir/f.txt") -ne 6) { throw "A scheduled sync run took the server's change to s36-dir\f.txt, though s36-dir was not due." }
+            $from = Get-LogLength $script:E2ERcloneLog
+            Sync-Remote
+            if (@(Get-RcloneListings $from "s36-dir").Count -eq 0) { throw "Sync now did not list s36-dir." }
+            Wait-Local "s36-dir" { (Get-LocalLength "s36-dir/f.txt") -eq 15 } "Sync now did not bring the server's change to s36-dir\f.txt."
+            Assert-Local "s36-dir/f.txt" "s36-version-two"
+        }
+
         # ---------------- client side -> server ----------------
         New-E2EScenario "C01" "client adds a file" -Budget @{ Uploads = 1; Lookups = 2 } {
             Write-Local "c01.txt" "c01"

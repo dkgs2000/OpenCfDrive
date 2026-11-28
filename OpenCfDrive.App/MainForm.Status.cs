@@ -28,6 +28,7 @@ internal sealed partial class MainForm
     private readonly Label _storage = Theme.Text();
     private readonly Label _space = Theme.Text();
     private readonly Label _items = Theme.Text();
+    private readonly Label _serverChecks = Theme.Text();
     private readonly Card _activityCard = new() { Padding = new Padding(1, 4, 1, 4) };
     private readonly ListView _activity = new()
     {
@@ -84,6 +85,7 @@ internal sealed partial class MainForm
         drive.AddRow(Theme.Caption("Storage"), _storage);
         drive.AddRow(Theme.Caption("Space"), _space);
         drive.AddRow(Theme.Caption("Items"), _items);
+        drive.AddRow(Theme.Caption("Server checks"), _serverChecks);
 
         _activity.Columns.Add("Time");
         _activity.Columns.Add("What happened");
@@ -170,6 +172,7 @@ internal sealed partial class MainForm
                 : ("-", "-");
         _storage.ForeColor = snapshot.RemoteInfo?.Problem is null ? SystemColors.ControlText : Theme.Problem;
         _items.Text = ItemsText(snapshot.Status);
+        _serverChecks.Text = ServerChecksText(snapshot.Status);
 
         ShowActivity(snapshot.Status?.RecentActivity ?? []);
     }
@@ -183,6 +186,21 @@ internal sealed partial class MainForm
             status.ItemsTracked,
             status.ItemsTracked == 1 ? "item" : "items",
             FormatBytes(status.BytesDownloaded));
+
+    /// <summary>
+    /// "1,240 folders kept current; 37 to check in the next minute", or "-"
+    /// while the service isn't running or has not looked at the server yet.
+    /// The folders are those holding something on this PC; one that does not
+    /// change on the server is checked less and less often.
+    /// </summary>
+    internal static string ServerChecksText(ServiceStatus? status) => status is not { FoldersKeptCurrent: > 0 }
+        ? "-"
+        : string.Format(
+            CultureInfo.CurrentCulture,
+            "{0:N0} {1} kept current; {2:N0} to check in the next minute",
+            status.FoldersKeptCurrent,
+            status.FoldersKeptCurrent == 1 ? "folder" : "folders",
+            status.FoldersDueSoon);
 
     /// <summary>An update ready to install, offered at the top of the Status page.</summary>
     private void ShowUpdateBar(UpdateStatus status)
